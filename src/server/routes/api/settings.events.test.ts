@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { eq } from 'drizzle-orm';
+import { resetRequestRateLimitStore } from '../../middleware/requestRateLimit.js';
 
 type DbModule = typeof import('../../db/index.js');
 type ConfigModule = typeof import('../../config.js');
@@ -35,6 +36,7 @@ describe('settings and auth events', () => {
   });
 
   beforeEach(async () => {
+    resetRequestRateLimitStore();
     await db.delete(schema.events).run();
     await db.delete(schema.settings).run();
 
@@ -49,6 +51,10 @@ describe('settings and auth events', () => {
     config.logCleanupProgramLogsEnabled = false;
     config.logCleanupRetentionDays = 30;
     config.routingFallbackUnitCost = 1;
+    (config as any).telegramEnabled = false;
+    (config as any).telegramApiBaseUrl = 'https://api.telegram.org';
+    (config as any).telegramBotToken = '';
+    (config as any).telegramChatId = '';
   });
 
   afterAll(async () => {
@@ -168,6 +174,49 @@ describe('settings and auth events', () => {
     expect(response.statusCode).toBe(400);
     const body = response.json() as { message?: string };
     expect(body.message).toContain('Telegram Chat ID');
+  });
+
+  it('persists and returns telegram api base url from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        telegramApiBaseUrl: 'https://tg-proxy.example.com/custom/',
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as { telegramApiBaseUrl?: string };
+    expect(updated.telegramApiBaseUrl).toBe('https://tg-proxy.example.com/custom');
+    expect((config as any).telegramApiBaseUrl).toBe('https://tg-proxy.example.com/custom');
+
+    const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'telegram_api_base_url')).get();
+    expect(saved?.value).toBe(JSON.stringify('https://tg-proxy.example.com/custom'));
+
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: '/api/settings/runtime',
+    });
+    expect(getResponse.statusCode).toBe(200);
+    const runtime = getResponse.json() as { telegramApiBaseUrl?: string };
+    expect(runtime.telegramApiBaseUrl).toBe('https://tg-proxy.example.com/custom');
+  });
+
+  it('rejects invalid telegram api base url when telegram is enabled', async () => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        telegramEnabled: true,
+        telegramBotToken: '123456:telegram-token',
+        telegramChatId: '-1001234567890',
+        telegramApiBaseUrl: 'not-a-url',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = response.json() as { message?: string };
+    expect(body.message).toContain('Telegram API Base URL');
   });
 
   it('persists and returns routing fallback unit cost from runtime settings', async () => {
@@ -384,6 +433,38 @@ describe('settings and auth events', () => {
       type: 'token',
       title: '管理员登录令牌已更新',
       relatedType: 'settings',
+    });
+  });
+
+  it('rate limits repeated admin auth token changes from the same client ip', async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/settings/auth/change',
+        remoteAddress: '198.51.100.12',
+        payload: {
+          oldToken: config.authToken,
+          newToken: `new-admin-token-${attempt}-456`,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    }
+
+    const limited = await app.inject({
+      method: 'POST',
+      url: '/api/settings/auth/change',
+      remoteAddress: '198.51.100.12',
+      payload: {
+        oldToken: config.authToken,
+        newToken: 'new-admin-token-rate-limit',
+      },
+    });
+
+    expect(limited.statusCode).toBe(429);
+    expect(limited.json()).toMatchObject({
+      success: false,
+      message: '请求过于频繁，请稍后再试',
     });
   });
 });

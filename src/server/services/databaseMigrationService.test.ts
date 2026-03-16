@@ -1,9 +1,14 @@
+import currentContract from '../db/generated/schemaContract.json' with { type: 'json' };
 import { describe, expect, it } from 'vitest';
 import {
   __databaseMigrationServiceTestUtils,
   maskConnectionString,
   normalizeMigrationInput,
 } from './databaseMigrationService.js';
+
+function cloneContract<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
 
 describe('databaseMigrationService', () => {
   it('accepts postgres migration input with normalized url', () => {
@@ -103,8 +108,14 @@ describe('databaseMigrationService', () => {
 
   it.each(['postgres', 'mysql', 'sqlite'] as const)('creates or patches sites schema with use_system_proxy and custom_headers for %s', async (dialect) => {
     const executedSql: string[] = [];
+    const liveContract = cloneContract(currentContract);
+    delete liveContract.tables.sites.columns.use_system_proxy;
+    delete liveContract.tables.sites.columns.custom_headers;
+
     await __databaseMigrationServiceTestUtils.ensureSchema({
       dialect,
+      connectionString: dialect === 'sqlite' ? ':memory:' : `${dialect}://example.invalid/metapi`,
+      ssl: false,
       begin: async () => {},
       commit: async () => {},
       rollback: async () => {},
@@ -112,17 +123,11 @@ describe('databaseMigrationService', () => {
         executedSql.push(sqlText);
         return [];
       },
-      queryScalar: async (sqlText, params = []) => {
-        if (sqlText.includes('sqlite_master') || sqlText.includes('information_schema.tables')) {
-          return 1;
-        }
-        if (sqlText.includes('pragma_table_info') || sqlText.includes('information_schema.columns')) {
-          const columnName = String(params[1] ?? sqlText.match(/name = '([^']+)'/)?.[1] ?? '');
-          return columnName === 'use_system_proxy' || columnName === 'custom_headers' ? 0 : 1;
-        }
-        return 0;
-      },
+      queryScalar: async () => 1,
       close: async () => {},
+    }, {
+      currentContract,
+      liveContract,
     });
 
     const useSystemProxySql = executedSql.find((sqlText) => sqlText.includes('use_system_proxy'));
@@ -134,8 +139,13 @@ describe('databaseMigrationService', () => {
 
   it.each(['postgres', 'mysql'] as const)('patches token_routes decision snapshot columns for %s', async (dialect) => {
     const executedSql: string[] = [];
+    const liveContract = cloneContract(currentContract);
+    delete liveContract.tables.token_routes.columns.decision_snapshot;
+
     await __databaseMigrationServiceTestUtils.ensureSchema({
       dialect,
+      connectionString: `${dialect}://example.invalid/metapi`,
+      ssl: false,
       begin: async () => {},
       commit: async () => {},
       rollback: async () => {},
@@ -143,17 +153,11 @@ describe('databaseMigrationService', () => {
         executedSql.push(sqlText);
         return [];
       },
-      queryScalar: async (sqlText, params = []) => {
-        if (sqlText.includes('information_schema.tables')) {
-          return 1;
-        }
-        if (sqlText.includes('information_schema.columns')) {
-          const columnName = String(params[1] ?? '');
-          return columnName === 'decision_snapshot' ? 0 : 1;
-        }
-        return 0;
-      },
+      queryScalar: async () => 1,
       close: async () => {},
+    }, {
+      currentContract,
+      liveContract,
     });
 
     expect(
@@ -175,6 +179,7 @@ describe('databaseMigrationService', () => {
           customHeaders: '{"x-site-scope":"internal"}',
           status: 'active',
         }],
+        siteDisabledModels: [],
         accounts: [],
         accountTokens: [],
         checkinLogs: [],
@@ -183,6 +188,8 @@ describe('databaseMigrationService', () => {
         tokenRoutes: [],
         routeChannels: [],
         proxyLogs: [],
+        proxyVideoTasks: [],
+        proxyFiles: [],
         downstreamApiKeys: [],
         events: [],
       },
@@ -199,5 +206,70 @@ describe('databaseMigrationService', () => {
     expect(siteStatement?.values[useSystemProxyIndex]).toBe(true);
     expect(customHeadersIndex).toBeGreaterThanOrEqual(0);
     expect(siteStatement?.values[customHeadersIndex]).toBe('{"x-site-scope":"internal"}');
+  });
+
+  it('includes disabled models, proxy video tasks, and proxy files in migration statements', () => {
+    const statements = __databaseMigrationServiceTestUtils.buildStatements({
+      version: 'test',
+      timestamp: Date.now(),
+      accounts: {
+        sites: [],
+        siteDisabledModels: [{
+          id: 3,
+          siteId: 12,
+          modelName: 'claude-opus-4-6',
+          createdAt: '2026-03-14T00:00:00.000Z',
+        }],
+        accounts: [],
+        accountTokens: [],
+        checkinLogs: [],
+        modelAvailability: [],
+        tokenModelAvailability: [],
+        tokenRoutes: [],
+        routeChannels: [],
+        proxyLogs: [],
+        proxyVideoTasks: [{
+          id: 5,
+          publicId: 'video-public-id',
+          upstreamVideoId: 'upstream-video-id',
+          siteUrl: 'https://example.com',
+          tokenValue: 'sk-video',
+          requestedModel: 'veo-3',
+          actualModel: 'veo-3',
+          channelId: 7,
+          accountId: 9,
+          statusSnapshot: '{"status":"done"}',
+          upstreamResponseMeta: '{"id":"video"}',
+          lastUpstreamStatus: 200,
+          lastPolledAt: '2026-03-14T01:00:00.000Z',
+          createdAt: '2026-03-14T00:00:00.000Z',
+          updatedAt: '2026-03-14T01:00:00.000Z',
+        }],
+        proxyFiles: [{
+          id: 8,
+          publicId: 'file-public-id',
+          ownerType: 'downstream_key',
+          ownerId: 'key-1',
+          filename: 'demo.txt',
+          mimeType: 'text/plain',
+          purpose: 'assistants',
+          byteSize: 4,
+          sha256: 'abcd',
+          contentBase64: 'ZGVtbw==',
+          createdAt: '2026-03-14T00:00:00.000Z',
+          updatedAt: '2026-03-14T01:00:00.000Z',
+          deletedAt: null,
+        }],
+        downstreamApiKeys: [],
+        events: [],
+      },
+      preferences: {
+        settings: [],
+      },
+    } as any);
+
+    expect(statements.some((statement) => statement.table === 'site_disabled_models')).toBe(true);
+    expect(statements.some((statement) => statement.table === 'proxy_video_tasks')).toBe(true);
+    expect(statements.some((statement) => statement.table === 'proxy_files')).toBe(true);
   });
 });

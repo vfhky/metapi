@@ -5,6 +5,7 @@ export type RouteSortBy = 'modelPattern' | 'channelCount';
 export type RouteSortDir = 'asc' | 'desc';
 export type GroupFilter = null | '__all__' | number;
 export type RouteRoutingStrategy = 'weighted' | 'round_robin';
+export type RouteRowKind = 'persisted' | 'zero_channel';
 
 export type RouteChannelDraft = {
   accountId: number;
@@ -67,6 +68,9 @@ export type RouteSummaryRow = {
   siteNames: string[];
   decisionSnapshot: RouteDecision | null;
   decisionRefreshedAt: string | null;
+  kind?: RouteRowKind;
+  readOnly?: boolean;
+  isVirtual?: boolean;
 };
 
 export type RouteDecisionCandidate = {
@@ -122,6 +126,17 @@ export type MissingTokenRouteSiteActionItem = {
   siteName: string;
   accountId: number;
   accountLabel: string;
+};
+
+export type MissingTokenGroupRouteSiteActionItem = {
+  key: string;
+  siteName: string;
+  accountId: number;
+  accountLabel: string;
+  missingGroups: string[];
+  requiredGroups: string[];
+  availableGroups: string[];
+  groupCoverageUncertain?: boolean;
 };
 
 export type SortableChannelRowProps = {

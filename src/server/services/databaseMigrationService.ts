@@ -28,6 +28,7 @@ type BackupSnapshot = {
   timestamp: number;
   accounts: {
     sites: Array<Record<string, unknown>>;
+    siteDisabledModels: Array<Record<string, unknown>>;
     accounts: Array<Record<string, unknown>>;
     accountTokens: Array<Record<string, unknown>>;
     checkinLogs: Array<Record<string, unknown>>;
@@ -36,6 +37,8 @@ type BackupSnapshot = {
     tokenRoutes: Array<Record<string, unknown>>;
     routeChannels: Array<Record<string, unknown>>;
     proxyLogs: Array<Record<string, unknown>>;
+    proxyVideoTasks: Array<Record<string, unknown>>;
+    proxyFiles: Array<Record<string, unknown>>;
     downstreamApiKeys: Array<Record<string, unknown>>;
     events: Array<Record<string, unknown>>;
   };
@@ -52,6 +55,7 @@ export interface DatabaseMigrationSummary {
   timestamp: number;
   rows: {
     sites: number;
+    siteDisabledModels: number;
     accounts: number;
     accountTokens: number;
     tokenRoutes: number;
@@ -60,6 +64,8 @@ export interface DatabaseMigrationSummary {
     modelAvailability: number;
     tokenModelAvailability: number;
     proxyLogs: number;
+    proxyVideoTasks: number;
+    proxyFiles: number;
     downstreamApiKeys: number;
     events: number;
     settings: number;
@@ -204,6 +210,7 @@ async function toBackupSnapshot(): Promise<BackupSnapshot> {
     timestamp: Date.now(),
     accounts: {
       sites: await db.select().from(schema.sites).all() as Array<Record<string, unknown>>,
+      siteDisabledModels: await db.select().from(schema.siteDisabledModels).all() as Array<Record<string, unknown>>,
       accounts: await db.select().from(schema.accounts).all() as Array<Record<string, unknown>>,
       accountTokens: await db.select().from(schema.accountTokens).all() as Array<Record<string, unknown>>,
       checkinLogs: await db.select().from(schema.checkinLogs).all() as Array<Record<string, unknown>>,
@@ -212,6 +219,8 @@ async function toBackupSnapshot(): Promise<BackupSnapshot> {
       tokenRoutes: await db.select().from(schema.tokenRoutes).all() as Array<Record<string, unknown>>,
       routeChannels: await db.select().from(schema.routeChannels).all() as Array<Record<string, unknown>>,
       proxyLogs: await db.select().from(schema.proxyLogs).all() as Array<Record<string, unknown>>,
+      proxyVideoTasks: await db.select().from(schema.proxyVideoTasks).all() as Array<Record<string, unknown>>,
+      proxyFiles: await db.select().from(schema.proxyFiles).all() as Array<Record<string, unknown>>,
       downstreamApiKeys: await db.select().from(schema.downstreamApiKeys).all() as Array<Record<string, unknown>>,
       events: await db.select().from(schema.events).all() as Array<Record<string, unknown>>,
     },
@@ -240,8 +249,11 @@ async function clearTargetData(client: SqlClient): Promise<void> {
     'model_availability',
     'checkin_logs',
     'proxy_logs',
+    'proxy_video_tasks',
+    'proxy_files',
     'account_tokens',
     'accounts',
+    'site_disabled_models',
     'token_routes',
     'sites',
     'downstream_api_keys',
@@ -280,6 +292,19 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
     });
   }
 
+  for (const row of snapshot.accounts.siteDisabledModels) {
+    statements.push({
+      table: 'site_disabled_models',
+      columns: ['id', 'site_id', 'model_name', 'created_at'],
+      values: [
+        asNumber(row.id, 0),
+        asNumber(row.siteId, 0),
+        asNullableString(row.modelName),
+        asNullableString(row.createdAt),
+      ],
+    });
+  }
+
   for (const row of snapshot.accounts.accounts) {
     statements.push({
       table: 'accounts',
@@ -311,13 +336,14 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
   for (const row of snapshot.accounts.accountTokens) {
     statements.push({
       table: 'account_tokens',
-      columns: ['id', 'account_id', 'name', 'token', 'token_group', 'source', 'enabled', 'is_default', 'created_at', 'updated_at'],
+      columns: ['id', 'account_id', 'name', 'token', 'token_group', 'value_status', 'source', 'enabled', 'is_default', 'created_at', 'updated_at'],
       values: [
         asNumber(row.id, 0),
         asNumber(row.accountId, 0),
         asNullableString(row.name),
         asNullableString(row.token),
         asNullableString(row.tokenGroup),
+        asNullableString((row as { valueStatus?: unknown }).valueStatus) ?? 'ready',
         asNullableString(row.source) ?? 'manual',
         asBoolean(row.enabled, true),
         asBoolean(row.isDefault, false),
@@ -423,12 +449,13 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
   for (const row of snapshot.accounts.proxyLogs) {
     statements.push({
       table: 'proxy_logs',
-      columns: ['id', 'route_id', 'channel_id', 'account_id', 'model_requested', 'model_actual', 'status', 'http_status', 'latency_ms', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'estimated_cost', 'billing_details', 'error_message', 'retry_count', 'created_at'],
+      columns: ['id', 'route_id', 'channel_id', 'account_id', 'downstream_api_key_id', 'model_requested', 'model_actual', 'status', 'http_status', 'latency_ms', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'estimated_cost', 'billing_details', 'error_message', 'retry_count', 'created_at'],
       values: [
         asNumber(row.id, 0),
         asNumber(row.routeId, null),
         asNumber(row.channelId, null),
         asNumber(row.accountId, null),
+        asNumber((row as any).downstreamApiKeyId ?? (row as any).downstream_api_key_id, null),
         asNullableString(row.modelRequested),
         asNullableString(row.modelActual),
         asNullableString(row.status),
@@ -442,6 +469,52 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asNullableString(row.errorMessage),
         asNumber(row.retryCount, 0),
         asNullableString(row.createdAt),
+      ],
+    });
+  }
+
+  for (const row of snapshot.accounts.proxyVideoTasks) {
+    statements.push({
+      table: 'proxy_video_tasks',
+      columns: ['id', 'public_id', 'upstream_video_id', 'site_url', 'token_value', 'requested_model', 'actual_model', 'channel_id', 'account_id', 'status_snapshot', 'upstream_response_meta', 'last_upstream_status', 'last_polled_at', 'created_at', 'updated_at'],
+      values: [
+        asNumber(row.id, 0),
+        asNullableString(row.publicId),
+        asNullableString(row.upstreamVideoId),
+        asNullableString(row.siteUrl),
+        asNullableString(row.tokenValue),
+        asNullableString(row.requestedModel),
+        asNullableString(row.actualModel),
+        asNumber(row.channelId, null),
+        asNumber(row.accountId, null),
+        asNullableString(row.statusSnapshot),
+        asNullableString(row.upstreamResponseMeta),
+        asNumber(row.lastUpstreamStatus, null),
+        asNullableString(row.lastPolledAt),
+        asNullableString(row.createdAt),
+        asNullableString(row.updatedAt),
+      ],
+    });
+  }
+
+  for (const row of snapshot.accounts.proxyFiles) {
+    statements.push({
+      table: 'proxy_files',
+      columns: ['id', 'public_id', 'owner_type', 'owner_id', 'filename', 'mime_type', 'purpose', 'byte_size', 'sha256', 'content_base64', 'created_at', 'updated_at', 'deleted_at'],
+      values: [
+        asNumber(row.id, 0),
+        asNullableString(row.publicId),
+        asNullableString(row.ownerType),
+        asNullableString(row.ownerId),
+        asNullableString(row.filename),
+        asNullableString(row.mimeType),
+        asNullableString(row.purpose),
+        asNumber(row.byteSize, 0),
+        asNullableString(row.sha256),
+        asNullableString(row.contentBase64),
+        asNullableString(row.createdAt),
+        asNullableString(row.updatedAt),
+        asNullableString(row.deletedAt),
       ],
     });
   }
@@ -527,6 +600,7 @@ async function syncPostgresSequences(client: SqlClient): Promise<void> {
   if (client.dialect !== 'postgres') return;
   const tables = [
     'sites',
+    'site_disabled_models',
     'accounts',
     'account_tokens',
     'checkin_logs',
@@ -535,6 +609,8 @@ async function syncPostgresSequences(client: SqlClient): Promise<void> {
     'token_routes',
     'route_channels',
     'proxy_logs',
+    'proxy_video_tasks',
+    'proxy_files',
     'downstream_api_keys',
     'events',
   ];
@@ -590,6 +666,7 @@ export async function migrateCurrentDatabase(input: DatabaseMigrationInput): Pro
     timestamp: snapshot.timestamp,
     rows: {
       sites: snapshot.accounts.sites.length,
+      siteDisabledModels: snapshot.accounts.siteDisabledModels.length,
       accounts: snapshot.accounts.accounts.length,
       accountTokens: snapshot.accounts.accountTokens.length,
       tokenRoutes: snapshot.accounts.tokenRoutes.length,
@@ -598,6 +675,8 @@ export async function migrateCurrentDatabase(input: DatabaseMigrationInput): Pro
       modelAvailability: snapshot.accounts.modelAvailability.length,
       tokenModelAvailability: snapshot.accounts.tokenModelAvailability.length,
       proxyLogs: snapshot.accounts.proxyLogs.length,
+      proxyVideoTasks: snapshot.accounts.proxyVideoTasks.length,
+      proxyFiles: snapshot.accounts.proxyFiles.length,
       downstreamApiKeys: snapshot.accounts.downstreamApiKeys.length,
       events: snapshot.accounts.events.length,
       settings: snapshot.preferences.settings.length,

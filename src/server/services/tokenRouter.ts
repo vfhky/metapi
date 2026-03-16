@@ -9,6 +9,7 @@ import {
   type RouteRoutingStrategy,
 } from './routeRoutingStrategy.js';
 import { type DownstreamRoutingPolicy, EMPTY_DOWNSTREAM_ROUTING_POLICY } from './downstreamPolicyTypes.js';
+import { isUsableAccountToken } from './accountTokenService.js';
 
 interface RouteMatch {
   route: typeof schema.tokenRoutes.$inferSelect;
@@ -269,6 +270,13 @@ export function matchesModelPattern(model: string, pattern: string): boolean {
   }
 
   return minimatch(model, normalizedPattern);
+}
+
+function isExactRouteModelPattern(pattern: string): boolean {
+  const normalizedPattern = (pattern || '').trim();
+  if (!normalizedPattern) return false;
+  if (isRegexModelPattern(normalizedPattern)) return false;
+  return !/[\*\?\[]/.test(normalizedPattern);
 }
 
 function normalizeRouteDisplayName(displayName: string | null | undefined): string {
@@ -993,10 +1001,12 @@ export class TokenRouter {
       routes = routes.filter((route) => allowSet.has(route.id));
     }
 
-    // Find matching route by model pattern or display alias.
-    const matchedRoute = routes.find((r) => {
-      return matchesRouteRequestModel(model, r);
-    });
+    const matchedRoute = routes.find((route) => (
+      isExactRouteModelPattern(route.modelPattern)
+      && (route.modelPattern || '').trim() === model
+    ))
+      || routes.find((route) => isRouteDisplayNameMatch(model, route.displayName))
+      || routes.find((route) => matchesModelPattern(model, route.modelPattern));
 
     if (!matchedRoute) return null;
 
@@ -1026,7 +1036,7 @@ export class TokenRouter {
   }): string | null {
     if (candidate.channel.tokenId) {
       if (!candidate.token) return null;
-      if (!candidate.token.enabled) return null;
+      if (!isUsableAccountToken(candidate.token)) return null;
       const token = candidate.token.token?.trim();
       return token ? token : null;
     }

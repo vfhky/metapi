@@ -100,6 +100,42 @@ describe('refreshModelsForAccount credential discovery', () => {
     expect(tokenRows).toHaveLength(0);
   });
 
+  it('deduplicates discovered model names before writing availability rows', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockResolvedValue(['? ', '?', 'GPT-4.1', 'gpt-4.1']);
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-dedupe',
+      url: 'https://site-dedupe.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'dedupe-user',
+      accessToken: 'session-token',
+      apiToken: null,
+      status: 'active',
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+      modelCount: 2,
+      modelsPreview: ['?', 'GPT-4.1'],
+    });
+
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+
+    expect(rows.map((row) => row.modelName).sort()).toEqual(['?', 'GPT-4.1']);
+  });
+
   it('marks runtime health unhealthy when model discovery fails', async () => {
     getApiTokenMock.mockResolvedValue(null);
     getModelsMock.mockRejectedValue(new Error('HTTP 401: invalid token'));
@@ -215,5 +251,53 @@ describe('refreshModelsForAccount credential discovery', () => {
       modelsPreview: [],
       reason: 'adapter_or_status',
     });
+  });
+
+  it('does not scan masked_pending placeholders as token credentials', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockImplementation(async (_baseUrl: string, token: string) => (
+      token === 'sk-mask***tail' ? ['gpt-5.2-codex'] : []
+    ));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-placeholder',
+      url: 'https://site-placeholder.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'placeholder-user',
+      accessToken: '',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const placeholder = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'masked-token',
+      token: 'sk-mask***tail',
+      source: 'sync',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'masked_pending' as any,
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'failed',
+      tokenScanned: 0,
+    });
+
+    const placeholderModels = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, placeholder.id))
+      .all();
+    expect(placeholderModels).toEqual([]);
+    expect(getModelsMock).not.toHaveBeenCalledWith(site.url, 'sk-mask***tail', account.username);
   });
 });

@@ -33,6 +33,7 @@ import { normalizeLogCleanupRetentionDays } from './services/logCleanupService.j
 import {
   db,
   ensureProxyFileCompatibilityColumns,
+  ensureProxyLogDownstreamApiKeyIdColumn,
   ensureProxyLogBillingDetailsColumn,
   ensureRouteGroupingCompatibilityColumns,
   ensureSiteCompatibilityColumns,
@@ -175,6 +176,11 @@ function applyRuntimeSettings(settingsMap: Map<string, string>) {
   const telegramEnabled = parseSettingFromMap<boolean>(settingsMap, 'telegram_enabled');
   if (typeof telegramEnabled === 'boolean') config.telegramEnabled = telegramEnabled;
 
+  const telegramApiBaseUrl = parseSettingFromMap<string>(settingsMap, 'telegram_api_base_url');
+  if (typeof telegramApiBaseUrl === 'string' && telegramApiBaseUrl.trim()) {
+    config.telegramApiBaseUrl = telegramApiBaseUrl.trim().replace(/\/+$/, '');
+  }
+
   const telegramBotToken = parseSettingFromMap<string>(settingsMap, 'telegram_bot_token');
   if (typeof telegramBotToken === 'string') config.telegramBotToken = telegramBotToken;
 
@@ -259,6 +265,7 @@ try {
   await ensureSiteCompatibilityColumns();
   await ensureRouteGroupingCompatibilityColumns();
   await ensureProxyFileCompatibilityColumns();
+  await ensureProxyLogDownstreamApiKeyIdColumn();
   const finalRows = await db.select().from(schema.settings).all();
   const finalMap = toSettingsMap(finalRows);
   applyRuntimeSettings(finalMap);
