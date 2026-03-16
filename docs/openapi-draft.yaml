@@ -1,0 +1,2958 @@
+openapi: 3.0.3
+info:
+  title: Metapi API 草案
+  version: "draft-2026-03-16"
+  description: |
+    该文档用于迁移前冻结接口行为与字段结构。
+    与运行时实现可能存在细节差异，以服务端实现为准。
+servers:
+  - url: /
+tags:
+  - name: Sites
+    description: 站点管理
+  - name: Accounts
+    description: 账号管理
+  - name: AccountTokens
+    description: 账号令牌管理
+  - name: Routes
+    description: 路由与通道
+  - name: Checkin
+    description: 签到
+  - name: Stats
+    description: 统计与模型
+  - name: Events
+    description: 事件
+  - name: Tasks
+    description: 后台任务
+  - name: Settings
+    description: 系统设置
+  - name: DownstreamKeys
+    description: 下游托管 Key
+  - name: Monitor
+    description: 监控
+  - name: Test
+    description: 调试工具
+  - name: Proxy
+    description: 代理接口
+  - name: Gemini
+    description: Gemini 兼容接口
+
+components:
+  securitySchemes:
+    adminBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: 管理端 AUTH_TOKEN
+    proxyBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: 代理端 proxy_token 或下游托管 key
+    proxyApiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+    proxyGoogApiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-goog-api-key
+    proxyApiKeyQuery:
+      type: apiKey
+      in: query
+      name: key
+  schemas:
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+          nullable: true
+      required:
+        - success
+    FailedItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        message:
+          type: string
+      required:
+        - id
+        - message
+    BatchActionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        successIds:
+          type: array
+          items:
+            type: integer
+        failedItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailedItem'
+      required:
+        - success
+        - successIds
+        - failedItems
+    Site:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        url:
+          type: string
+        externalCheckinUrl:
+          type: string
+          nullable: true
+        platform:
+          type: string
+        proxyUrl:
+          type: string
+          nullable: true
+        useSystemProxy:
+          type: boolean
+        customHeaders:
+          type: string
+          nullable: true
+        status:
+          type: string
+        isPinned:
+          type: boolean
+        sortOrder:
+          type: integer
+        globalWeight:
+          type: number
+        apiKey:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+      required:
+        - id
+        - name
+        - url
+        - platform
+        - status
+    SiteWithBalance:
+      allOf:
+        - $ref: '#/components/schemas/Site'
+        - type: object
+          properties:
+            totalBalance:
+              type: number
+    Account:
+      type: object
+      properties:
+        id:
+          type: integer
+        siteId:
+          type: integer
+        username:
+          type: string
+          nullable: true
+        accessToken:
+          type: string
+          nullable: true
+        apiToken:
+          type: string
+          nullable: true
+        balance:
+          type: number
+          nullable: true
+        balanceUsed:
+          type: number
+          nullable: true
+        quota:
+          type: number
+          nullable: true
+        unitCost:
+          type: number
+          nullable: true
+        valueScore:
+          type: number
+          nullable: true
+        status:
+          type: string
+        isPinned:
+          type: boolean
+        sortOrder:
+          type: integer
+        checkinEnabled:
+          type: boolean
+        lastCheckinAt:
+          type: string
+          nullable: true
+        lastBalanceRefresh:
+          type: string
+          nullable: true
+        extraConfig:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+      required:
+        - id
+        - siteId
+        - status
+    AccountCapabilities:
+      type: object
+      properties:
+        canCheckin:
+          type: boolean
+        canRefreshBalance:
+          type: boolean
+        proxyOnly:
+          type: boolean
+      required:
+        - canCheckin
+        - canRefreshBalance
+        - proxyOnly
+    RuntimeHealth:
+      type: object
+      properties:
+        state:
+          type: string
+        reason:
+          type: string
+        source:
+          type: string
+        checkedAt:
+          type: string
+          nullable: true
+      required:
+        - state
+        - reason
+        - source
+    AccountSummary:
+      allOf:
+        - $ref: '#/components/schemas/Account'
+        - type: object
+          properties:
+            site:
+              $ref: '#/components/schemas/Site'
+            credentialMode:
+              type: string
+            capabilities:
+              $ref: '#/components/schemas/AccountCapabilities'
+            todaySpend:
+              type: number
+            todayReward:
+              type: number
+            runtimeHealth:
+              $ref: '#/components/schemas/RuntimeHealth'
+    AccountToken:
+      type: object
+      properties:
+        id:
+          type: integer
+        accountId:
+          type: integer
+        name:
+          type: string
+        token:
+          type: string
+        tokenGroup:
+          type: string
+          nullable: true
+        source:
+          type: string
+        enabled:
+          type: boolean
+        isDefault:
+          type: boolean
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+    TokenRoute:
+      type: object
+      properties:
+        id:
+          type: integer
+        modelPattern:
+          type: string
+        displayName:
+          type: string
+          nullable: true
+        displayIcon:
+          type: string
+          nullable: true
+        modelMapping:
+          type: string
+          nullable: true
+        decisionSnapshot:
+          type: object
+          nullable: true
+        decisionRefreshedAt:
+          type: string
+          nullable: true
+        routingStrategy:
+          type: string
+        enabled:
+          type: boolean
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+      required:
+        - id
+        - modelPattern
+    RouteSummary:
+      allOf:
+        - $ref: '#/components/schemas/TokenRoute'
+        - type: object
+          properties:
+            channelCount:
+              type: integer
+            enabledChannelCount:
+              type: integer
+            siteNames:
+              type: array
+              items:
+                type: string
+    RouteChannel:
+      type: object
+      properties:
+        id:
+          type: integer
+        routeId:
+          type: integer
+        accountId:
+          type: integer
+        tokenId:
+          type: integer
+          nullable: true
+        sourceModel:
+          type: string
+          nullable: true
+        priority:
+          type: integer
+        weight:
+          type: integer
+        enabled:
+          type: boolean
+        manualOverride:
+          type: boolean
+        successCount:
+          type: integer
+        failCount:
+          type: integer
+        totalLatencyMs:
+          type: integer
+        totalCost:
+          type: number
+        lastUsedAt:
+          type: string
+          nullable: true
+        lastSelectedAt:
+          type: string
+          nullable: true
+        lastFailAt:
+          type: string
+          nullable: true
+        consecutiveFailCount:
+          type: integer
+        cooldownLevel:
+          type: integer
+        cooldownUntil:
+          type: string
+          nullable: true
+    ProxyLogListItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        createdAt:
+          type: string
+        modelRequested:
+          type: string
+        modelActual:
+          type: string
+        status:
+          type: string
+        latencyMs:
+          type: integer
+        totalTokens:
+          type: integer
+          nullable: true
+        retryCount:
+          type: integer
+        accountId:
+          type: integer
+          nullable: true
+        siteId:
+          type: integer
+          nullable: true
+        username:
+          type: string
+          nullable: true
+        siteName:
+          type: string
+          nullable: true
+        siteUrl:
+          type: string
+          nullable: true
+        errorMessage:
+          type: string
+          nullable: true
+        promptTokens:
+          type: integer
+          nullable: true
+        completionTokens:
+          type: integer
+          nullable: true
+        estimatedCost:
+          type: number
+          nullable: true
+    ProxyLogDetail:
+      allOf:
+        - $ref: '#/components/schemas/ProxyLogListItem'
+        - type: object
+          properties:
+            routeId:
+              type: integer
+              nullable: true
+            channelId:
+              type: integer
+              nullable: true
+            httpStatus:
+              type: integer
+              nullable: true
+            billingDetails:
+              type: object
+              nullable: true
+    DownstreamApiKey:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        key:
+          type: string
+        keyMasked:
+          type: string
+        description:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        expiresAt:
+          type: string
+          nullable: true
+        maxCost:
+          type: number
+          nullable: true
+        usedCost:
+          type: number
+        maxRequests:
+          type: integer
+          nullable: true
+        usedRequests:
+          type: integer
+        supportedModels:
+          type: array
+          items:
+            type: string
+        allowedRouteIds:
+          type: array
+          items:
+            type: integer
+        siteWeightMultipliers:
+          type: object
+          additionalProperties:
+            type: number
+        lastUsedAt:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+    Event:
+      type: object
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+        title:
+          type: string
+        message:
+          type: string
+          nullable: true
+        level:
+          type: string
+        read:
+          type: boolean
+        relatedId:
+          type: integer
+          nullable: true
+        relatedType:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          nullable: true
+    BackgroundTask:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+        message:
+          type: string
+        error:
+          type: string
+          nullable: true
+        result:
+          type: object
+          nullable: true
+        dedupeKey:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        startedAt:
+          type: string
+          nullable: true
+        finishedAt:
+          type: string
+          nullable: true
+        expiresAtMs:
+          type: integer
+    CheckinLogRow:
+      type: object
+      properties:
+        checkin_logs:
+          type: object
+        accounts:
+          type: object
+        sites:
+          type: object
+        failureReason:
+          type: string
+          nullable: true
+
+paths:
+  /api/sites:
+    get:
+      tags: [Sites]
+      summary: 获取站点列表
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 站点列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SiteWithBalance'
+    post:
+      tags: [Sites]
+      summary: 创建站点
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                url:
+                  type: string
+                platform:
+                  type: string
+                useSystemProxy:
+                  type: boolean
+                customHeaders:
+                  type: string
+                  nullable: true
+                externalCheckinUrl:
+                  type: string
+                  nullable: true
+                status:
+                  type: string
+                isPinned:
+                  type: boolean
+                sortOrder:
+                  type: integer
+                globalWeight:
+                  type: number
+      responses:
+        '200':
+          description: 站点对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Site'
+  /api/sites/{id}:
+    put:
+      tags: [Sites]
+      summary: 更新站点
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 站点对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Site'
+    delete:
+      tags: [Sites]
+      summary: 删除站点
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/sites/batch:
+    post:
+      tags: [Sites]
+      summary: 站点批量操作
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: integer
+                action:
+                  type: string
+      responses:
+        '200':
+          description: 批量操作结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchActionResponse'
+  /api/sites/detect:
+    post:
+      tags: [Sites]
+      summary: 探测站点平台
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+      responses:
+        '200':
+          description: 探测结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/accounts:
+    get:
+      tags: [Accounts]
+      summary: 获取账号列表
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 账号列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountSummary'
+    post:
+      tags: [Accounts]
+      summary: 新建账号
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 新建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/accounts/login:
+    post:
+      tags: [Accounts]
+      summary: 账号密码登录
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                siteId:
+                  type: integer
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: 登录结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/accounts/verify-token:
+    post:
+      tags: [Accounts]
+      summary: 验证 Token
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                siteId:
+                  type: integer
+                accessToken:
+                  type: string
+                platformUserId:
+                  type: integer
+                credentialMode:
+                  type: string
+      responses:
+        '200':
+          description: 验证结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/accounts/{id}/rebind-session:
+    post:
+      tags: [Accounts]
+      summary: 重新绑定 Session Token
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 绑定结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/accounts/{id}:
+    put:
+      tags: [Accounts]
+      summary: 更新账号
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新后的账号
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+    delete:
+      tags: [Accounts]
+      summary: 删除账号
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/accounts/batch:
+    post:
+      tags: [Accounts]
+      summary: 账号批量操作
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchActionResponse'
+  /api/accounts/health/refresh:
+    post:
+      tags: [Accounts]
+      summary: 刷新账号运行健康状态
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 直接执行结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '202':
+          description: 后台任务已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/accounts/{id}/balance:
+    post:
+      tags: [Accounts]
+      summary: 刷新账号余额
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 余额信息
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/account-tokens:
+    get:
+      tags: [AccountTokens]
+      summary: 获取账号 Token 列表
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: accountId
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Token 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountToken'
+    post:
+      tags: [AccountTokens]
+      summary: 新建账号 Token
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 创建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/account-tokens/{id}:
+    put:
+      tags: [AccountTokens]
+      summary: 更新账号 Token
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [AccountTokens]
+      summary: 删除账号 Token
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/account-tokens/batch:
+    post:
+      tags: [AccountTokens]
+      summary: 账号 Token 批量操作
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchActionResponse'
+  /api/account-tokens/{id}/default:
+    post:
+      tags: [AccountTokens]
+      summary: 设置默认 Token
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 设置结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/account-tokens/{id}/value:
+    get:
+      tags: [AccountTokens]
+      summary: 获取 Token 明文
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Token 信息
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/account-tokens/groups/{accountId}:
+    get:
+      tags: [AccountTokens]
+      summary: 获取 Token 分组
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 分组列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/account-tokens/sync/{accountId}:
+    post:
+      tags: [AccountTokens]
+      summary: 同步账号 Token
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 同步结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/account-tokens/sync-all:
+    post:
+      tags: [AccountTokens]
+      summary: 同步全部账号 Token
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 同步结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/checkin/trigger:
+    post:
+      tags: [Checkin]
+      summary: 触发全部账号签到
+      security:
+        - adminBearerAuth: []
+      responses:
+        '202':
+          description: 任务已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/checkin/trigger/{id}:
+    post:
+      tags: [Checkin]
+      summary: 触发单账号签到
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 签到结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/checkin/logs:
+    get:
+      tags: [Checkin]
+      summary: 获取签到日志
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: accountId
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 日志列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CheckinLogRow'
+  /api/checkin/schedule:
+    put:
+      tags: [Checkin]
+      summary: 更新签到 Cron
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cron:
+                  type: string
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/routes/lite:
+    get:
+      tags: [Routes]
+      summary: 路由简版列表
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 路由列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TokenRoute'
+  /api/routes/summary:
+    get:
+      tags: [Routes]
+      summary: 路由摘要
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 路由摘要
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RouteSummary'
+  /api/routes:
+    get:
+      tags: [Routes]
+      summary: 路由列表（含通道）
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 路由列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+    post:
+      tags: [Routes]
+      summary: 创建路由
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 路由对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRoute'
+  /api/routes/{id}:
+    put:
+      tags: [Routes]
+      summary: 更新路由
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 路由对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRoute'
+    delete:
+      tags: [Routes]
+      summary: 删除路由
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/routes/{id}/channels:
+    get:
+      tags: [Routes]
+      summary: 获取路由通道
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 通道列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+    post:
+      tags: [Routes]
+      summary: 新增路由通道
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 通道对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteChannel'
+  /api/routes/{id}/channels/batch:
+    post:
+      tags: [Routes]
+      summary: 批量新增通道
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 创建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/channels/batch:
+    put:
+      tags: [Routes]
+      summary: 批量更新通道优先级
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/channels/{channelId}:
+    put:
+      tags: [Routes]
+      summary: 更新通道
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: channelId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 通道对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteChannel'
+    delete:
+      tags: [Routes]
+      summary: 删除通道
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: channelId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/routes/decision:
+    get:
+      tags: [Routes]
+      summary: 获取路由决策解释
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: model
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 决策结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/routes/decision/batch:
+    post:
+      tags: [Routes]
+      summary: 批量决策解释
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/routes/decision/by-route/batch:
+    post:
+      tags: [Routes]
+      summary: 按路由批量决策解释
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/routes/decision/route-wide/batch:
+    post:
+      tags: [Routes]
+      summary: 路由级决策解释
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/routes/rebuild:
+    post:
+      tags: [Routes]
+      summary: 刷新模型并重建路由
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 同步重建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '202':
+          description: 任务已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/stats/dashboard:
+    get:
+      tags: [Stats]
+      summary: 仪表盘数据
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: Dashboard 统计
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/stats/proxy-logs:
+    get:
+      tags: [Stats]
+      summary: 代理日志列表
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: siteId
+          in: query
+          schema:
+            type: integer
+        - name: from
+          in: query
+          schema:
+            type: string
+        - name: to
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 日志分页
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/stats/proxy-logs/{id}:
+    get:
+      tags: [Stats]
+      summary: 代理日志详情
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 日志详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxyLogDetail'
+  /api/models/marketplace:
+    get:
+      tags: [Stats]
+      summary: 模型广场
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+        - name: includePricing
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/models/token-candidates:
+    get:
+      tags: [Stats]
+      summary: Token 候选
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 候选列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/models/check/{accountId}:
+    post:
+      tags: [Stats]
+      summary: 刷新账号模型
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 刷新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/stats/site-distribution:
+    get:
+      tags: [Stats]
+      summary: 站点分布
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 分布数据
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/stats/site-trend:
+    get:
+      tags: [Stats]
+      summary: 站点趋势
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: days
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 趋势数据
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/stats/model-by-site:
+    get:
+      tags: [Stats]
+      summary: 站点模型消耗
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: siteId
+          in: query
+          schema:
+            type: integer
+        - name: days
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 模型消耗
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/search:
+    post:
+      tags: [Stats]
+      summary: 搜索
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 搜索结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/events:
+    get:
+      tags: [Events]
+      summary: 事件列表
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: read
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 事件列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Event'
+    delete:
+      tags: [Events]
+      summary: 清空事件
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 清空结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/events/count:
+    get:
+      tags: [Events]
+      summary: 未读事件数量
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 数量
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+  /api/events/{id}/read:
+    post:
+      tags: [Events]
+      summary: 标记事件已读
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 标记结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/events/read-all:
+    post:
+      tags: [Events]
+      summary: 全部标记已读
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 标记结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/tasks:
+    get:
+      tags: [Tasks]
+      summary: 获取任务列表
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BackgroundTask'
+  /api/tasks/{id}:
+    get:
+      tags: [Tasks]
+      summary: 获取任务详情
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 任务详情
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/settings/auth/info:
+    get:
+      tags: [Settings]
+      summary: 获取管理员 Token 掩码
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 掩码信息
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  masked:
+                    type: string
+  /api/settings/auth/change:
+    post:
+      tags: [Settings]
+      summary: 修改管理员 Token
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 修改结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/runtime:
+    get:
+      tags: [Settings]
+      summary: 获取运行时配置
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 配置对象
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    put:
+      tags: [Settings]
+      summary: 更新运行时配置
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/database/runtime:
+    get:
+      tags: [Settings]
+      summary: 获取运行时数据库配置
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 数据库配置
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    put:
+      tags: [Settings]
+      summary: 更新运行时数据库配置
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/database/test-connection:
+    post:
+      tags: [Settings]
+      summary: 测试数据库连接
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/database/migrate:
+    post:
+      tags: [Settings]
+      summary: 迁移数据库
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 迁移结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/backup/export:
+    get:
+      tags: [Settings]
+      summary: 导出备份
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: type
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 备份数据
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/backup/import:
+    post:
+      tags: [Settings]
+      summary: 导入备份
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 导入结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/settings/notify/test:
+    post:
+      tags: [Settings]
+      summary: 测试通知
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/settings/maintenance/clear-cache:
+    post:
+      tags: [Settings]
+      summary: 清理缓存
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 清理结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/settings/maintenance/clear-usage:
+    post:
+      tags: [Settings]
+      summary: 清理使用日志
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 清理结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/settings/maintenance/factory-reset:
+    post:
+      tags: [Settings]
+      summary: 恢复出厂
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 恢复结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/downstream-keys:
+    get:
+      tags: [DownstreamKeys]
+      summary: 获取下游 Key 列表
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: Key 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DownstreamApiKey'
+    post:
+      tags: [DownstreamKeys]
+      summary: 创建下游 Key
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 创建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/downstream-keys/{id}:
+    put:
+      tags: [DownstreamKeys]
+      summary: 更新下游 Key
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [DownstreamKeys]
+      summary: 删除下游 Key
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/downstream-keys/{id}/reset-usage:
+    post:
+      tags: [DownstreamKeys]
+      summary: 重置下游 Key 使用量
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 重置结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/monitor/config:
+    get:
+      tags: [Monitor]
+      summary: 获取监控配置
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 配置
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    put:
+      tags: [Monitor]
+      summary: 更新监控配置
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/monitor/session:
+    post:
+      tags: [Monitor]
+      summary: 初始化监控会话
+      security:
+        - adminBearerAuth: []
+      responses:
+        '200':
+          description: 初始化结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/test/proxy:
+    post:
+      tags: [Test]
+      summary: 代理测试（同步）
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 测试响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/test/proxy/stream:
+    post:
+      tags: [Test]
+      summary: 代理测试（流式）
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: SSE 流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /api/test/proxy/jobs:
+    post:
+      tags: [Test]
+      summary: 代理测试任务
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '202':
+          description: 任务创建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/test/proxy/jobs/{jobId}:
+    get:
+      tags: [Test]
+      summary: 获取代理测试任务
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 任务详情
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [Test]
+      summary: 删除代理测试任务
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+  /api/test/chat:
+    post:
+      tags: [Test]
+      summary: Chat 测试（同步）
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 测试响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/test/chat/stream:
+    post:
+      tags: [Test]
+      summary: Chat 测试（流式）
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: SSE 流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /api/test/chat/jobs:
+    post:
+      tags: [Test]
+      summary: Chat 测试任务
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '202':
+          description: 任务创建结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/test/chat/jobs/{jobId}:
+    get:
+      tags: [Test]
+      summary: 获取 Chat 测试任务
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 任务详情
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [Test]
+      summary: 删除 Chat 测试任务
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /v1/chat/completions:
+    post:
+      tags: [Proxy]
+      summary: OpenAI Chat Completions
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: OpenAI Chat 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+  /v1/messages:
+    post:
+      tags: [Proxy]
+      summary: Claude Messages
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Claude 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+  /v1/responses:
+    post:
+      tags: [Proxy]
+      summary: OpenAI Responses
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Responses 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+  /v1/responses/compact:
+    post:
+      tags: [Proxy]
+      summary: Responses compact
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Responses 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/completions:
+    post:
+      tags: [Proxy]
+      summary: OpenAI Completions
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Completions 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/embeddings:
+    post:
+      tags: [Proxy]
+      summary: Embeddings
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Embeddings 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/search:
+    post:
+      tags: [Proxy]
+      summary: Search
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Search 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/models:
+    get:
+      tags: [Proxy]
+      summary: Models
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/files:
+    post:
+      tags: [Proxy]
+      summary: Files 上传
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: File 对象
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    get:
+      tags: [Proxy]
+      summary: Files 列表
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: Files 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/files/{fileId}:
+    get:
+      tags: [Proxy]
+      summary: File 详情
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File 对象
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [Proxy]
+      summary: 删除 File
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/files/{fileId}/content:
+    get:
+      tags: [Proxy]
+      summary: File 内容
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 二进制内容
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+  /v1/images/generations:
+    post:
+      tags: [Proxy]
+      summary: 图片生成
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: 图片结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/images/edits:
+    post:
+      tags: [Proxy]
+      summary: 图片编辑
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: 图片结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/images/variations:
+    post:
+      tags: [Proxy]
+      summary: 图片变体
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: 图片结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/videos:
+    post:
+      tags: [Proxy]
+      summary: 视频生成
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: 视频任务对象
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/videos/{id}:
+    get:
+      tags: [Proxy]
+      summary: 获取视频任务
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 视频任务
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [Proxy]
+      summary: 删除视频任务
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /v1beta/models:
+    get:
+      tags: [Gemini]
+      summary: Gemini 模型列表
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      responses:
+        '200':
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /gemini/{geminiApiVersion}/models:
+    get:
+      tags: [Gemini]
+      summary: Gemini 模型列表（版本化）
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: geminiApiVersion
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1beta/models/{path}:
+    post:
+      tags: [Gemini]
+      summary: Gemini generateContent
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Gemini 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /gemini/{geminiApiVersion}/models/{path}:
+    post:
+      tags: [Gemini]
+      summary: Gemini generateContent（版本化）
+      security:
+        - proxyBearerAuth: []
+        - proxyApiKeyHeader: []
+        - proxyGoogApiKeyHeader: []
+        - proxyApiKeyQuery: []
+      parameters:
+        - name: geminiApiVersion
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Gemini 响应
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true

@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metapi-api-schemas.json",
+  "title": "Metapi API 资源 JSON Schema 草案",
+  "type": "object",
+  "$defs": {
+    "Site": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "url": { "type": "string" },
+        "externalCheckinUrl": { "type": ["string", "null"] },
+        "platform": { "type": "string" },
+        "proxyUrl": { "type": ["string", "null"] },
+        "useSystemProxy": { "type": "boolean" },
+        "customHeaders": { "type": ["string", "null"] },
+        "status": { "type": "string" },
+        "isPinned": { "type": "boolean" },
+        "sortOrder": { "type": "integer" },
+        "globalWeight": { "type": "number" },
+        "apiKey": { "type": ["string", "null"] },
+        "createdAt": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["string", "null"] }
+      },
+      "required": ["id", "name", "url", "platform", "status"]
+    },
+    "SiteWithBalance": {
+      "allOf": [
+        { "$ref": "#/$defs/Site" },
+        {
+          "type": "object",
+          "properties": {
+            "totalBalance": { "type": "number" }
+          }
+        }
+      ]
+    },
+    "Account": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "siteId": { "type": "integer" },
+        "username": { "type": ["string", "null"] },
+        "accessToken": { "type": ["string", "null"] },
+        "apiToken": { "type": ["string", "null"] },
+        "balance": { "type": ["number", "null"] },
+        "balanceUsed": { "type": ["number", "null"] },
+        "quota": { "type": ["number", "null"] },
+        "unitCost": { "type": ["number", "null"] },
+        "valueScore": { "type": ["number", "null"] },
+        "status": { "type": "string" },
+        "isPinned": { "type": "boolean" },
+        "sortOrder": { "type": "integer" },
+        "checkinEnabled": { "type": "boolean" },
+        "lastCheckinAt": { "type": ["string", "null"] },
+        "lastBalanceRefresh": { "type": ["string", "null"] },
+        "extraConfig": { "type": ["string", "null"] },
+        "createdAt": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["string", "null"] }
+      },
+      "required": ["id", "siteId", "status"]
+    },
+    "AccountCapabilities": {
+      "type": "object",
+      "properties": {
+        "canCheckin": { "type": "boolean" },
+        "canRefreshBalance": { "type": "boolean" },
+        "proxyOnly": { "type": "boolean" }
+      },
+      "required": ["canCheckin", "canRefreshBalance", "proxyOnly"]
+    },
+    "RuntimeHealth": {
+      "type": "object",
+      "properties": {
+        "state": { "type": "string" },
+        "reason": { "type": "string" },
+        "source": { "type": "string" },
+        "checkedAt": { "type": ["string", "null"] }
+      },
+      "required": ["state", "reason", "source"]
+    },
+    "AccountSummary": {
+      "allOf": [
+        { "$ref": "#/$defs/Account" },
+        {
+          "type": "object",
+          "properties": {
+            "site": { "$ref": "#/$defs/Site" },
+            "credentialMode": { "type": "string" },
+            "capabilities": { "$ref": "#/$defs/AccountCapabilities" },
+            "todaySpend": { "type": "number" },
+            "todayReward": { "type": "number" },
+            "runtimeHealth": { "$ref": "#/$defs/RuntimeHealth" }
+          }
+        }
+      ]
+    },
+    "AccountToken": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "accountId": { "type": "integer" },
+        "name": { "type": "string" },
+        "token": { "type": "string" },
+        "tokenGroup": { "type": ["string", "null"] },
+        "source": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "isDefault": { "type": "boolean" },
+        "createdAt": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["string", "null"] }
+      },
+      "required": ["id", "accountId", "name"]
+    },
+    "TokenRoute": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "modelPattern": { "type": "string" },
+        "displayName": { "type": ["string", "null"] },
+        "displayIcon": { "type": ["string", "null"] },
+        "modelMapping": { "type": ["string", "null"] },
+        "decisionSnapshot": { "type": ["object", "null"] },
+        "decisionRefreshedAt": { "type": ["string", "null"] },
+        "routingStrategy": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "createdAt": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["string", "null"] }
+      },
+      "required": ["id", "modelPattern"]
+    },
+    "RouteChannel": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "routeId": { "type": "integer" },
+        "accountId": { "type": "integer" },
+        "tokenId": { "type": ["integer", "null"] },
+        "sourceModel": { "type": ["string", "null"] },
+        "priority": { "type": "integer" },
+        "weight": { "type": "integer" },
+        "enabled": { "type": "boolean" },
+        "manualOverride": { "type": "boolean" },
+        "successCount": { "type": "integer" },
+        "failCount": { "type": "integer" },
+        "totalLatencyMs": { "type": "integer" },
+        "totalCost": { "type": "number" },
+        "lastUsedAt": { "type": ["string", "null"] },
+        "lastSelectedAt": { "type": ["string", "null"] },
+        "lastFailAt": { "type": ["string", "null"] },
+        "consecutiveFailCount": { "type": "integer" },
+        "cooldownLevel": { "type": "integer" },
+        "cooldownUntil": { "type": ["string", "null"] }
+      }
+    },
+    "ProxyLogListItem": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "createdAt": { "type": "string" },
+        "modelRequested": { "type": "string" },
+        "modelActual": { "type": "string" },
+        "status": { "type": "string" },
+        "latencyMs": { "type": "integer" },
+        "totalTokens": { "type": ["integer", "null"] },
+        "retryCount": { "type": "integer" },
+        "accountId": { "type": ["integer", "null"] },
+        "siteId": { "type": ["integer", "null"] },
+        "username": { "type": ["string", "null"] },
+        "siteName": { "type": ["string", "null"] },
+        "siteUrl": { "type": ["string", "null"] },
+        "errorMessage": { "type": ["string", "null"] },
+        "promptTokens": { "type": ["integer", "null"] },
+        "completionTokens": { "type": ["integer", "null"] },
+        "estimatedCost": { "type": ["number", "null"] }
+      }
+    },
+    "DownstreamApiKey": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "key": { "type": "string" },
+        "keyMasked": { "type": "string" },
+        "description": { "type": ["string", "null"] },
+        "enabled": { "type": "boolean" },
+        "expiresAt": { "type": ["string", "null"] },
+        "maxCost": { "type": ["number", "null"] },
+        "usedCost": { "type": "number" },
+        "maxRequests": { "type": ["integer", "null"] },
+        "usedRequests": { "type": "integer" },
+        "supportedModels": { "type": "array", "items": { "type": "string" } },
+        "allowedRouteIds": { "type": "array", "items": { "type": "integer" } },
+        "siteWeightMultipliers": { "type": "object", "additionalProperties": { "type": "number" } },
+        "lastUsedAt": { "type": ["string", "null"] },
+        "createdAt": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["string", "null"] }
+      }
+    },
+    "Event": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "type": { "type": "string" },
+        "title": { "type": "string" },
+        "message": { "type": ["string", "null"] },
+        "level": { "type": "string" },
+        "read": { "type": "boolean" },
+        "relatedId": { "type": ["integer", "null"] },
+        "relatedType": { "type": ["string", "null"] },
+        "createdAt": { "type": ["string", "null"] }
+      }
+    },
+    "BackgroundTask": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "title": { "type": "string" },
+        "status": { "type": "string" },
+        "message": { "type": "string" },
+        "error": { "type": ["string", "null"] },
+        "result": { "type": ["object", "null"] },
+        "dedupeKey": { "type": ["string", "null"] },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "startedAt": { "type": ["string", "null"] },
+        "finishedAt": { "type": ["string", "null"] },
+        "expiresAtMs": { "type": "integer" }
+      }
+    }
+  }
+}
