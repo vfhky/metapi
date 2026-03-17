@@ -21,6 +21,16 @@ export const sites = sqliteTable('sites', {
   statusIdx: index('sites_status_idx').on(table.status),
 }));
 
+export const siteDisabledModels = sqliteTable('site_disabled_models', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  siteId: integer('site_id').notNull().references(() => sites.id, { onDelete: 'cascade' }),
+  modelName: text('model_name').notNull(),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  siteModelUnique: uniqueIndex('site_disabled_models_site_model_unique').on(table.siteId, table.modelName),
+  siteIdIdx: index('site_disabled_models_site_id_idx').on(table.siteId),
+}));
+
 export const accounts = sqliteTable('accounts', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   siteId: integer('site_id').notNull().references(() => sites.id, { onDelete: 'cascade' }),
@@ -53,6 +63,7 @@ export const accountTokens = sqliteTable('account_tokens', {
   name: text('name').notNull(),
   token: text('token').notNull(),
   tokenGroup: text('token_group'),
+  valueStatus: text('value_status').notNull().default('ready'),
   source: text('source').default('manual'), // 'manual' | 'sync' | 'legacy'
   enabled: integer('enabled', { mode: 'boolean' }).default(true),
   isDefault: integer('is_default', { mode: 'boolean' }).default(false),
@@ -82,6 +93,7 @@ export const modelAvailability = sqliteTable('model_availability', {
   accountId: integer('account_id').notNull().references(() => accounts.id, { onDelete: 'cascade' }),
   modelName: text('model_name').notNull(),
   available: integer('available', { mode: 'boolean' }),
+  isManual: integer('is_manual', { mode: 'boolean' }).default(false),
   latencyMs: integer('latency_ms'),
   checkedAt: text('checked_at').default(sql`(datetime('now'))`),
 }, (table) => ({
@@ -154,6 +166,7 @@ export const proxyLogs = sqliteTable('proxy_logs', {
   routeId: integer('route_id'),
   channelId: integer('channel_id'),
   accountId: integer('account_id'),
+  downstreamApiKeyId: integer('downstream_api_key_id'),
   modelRequested: text('model_requested'),
   modelActual: text('model_actual'),
   status: text('status'), // 'success' | 'failed' | 'retried'
@@ -172,6 +185,7 @@ export const proxyLogs = sqliteTable('proxy_logs', {
   accountCreatedIdx: index('proxy_logs_account_created_at_idx').on(table.accountId, table.createdAt),
   statusCreatedIdx: index('proxy_logs_status_created_at_idx').on(table.status, table.createdAt),
   modelActualCreatedIdx: index('proxy_logs_model_actual_created_at_idx').on(table.modelActual, table.createdAt),
+  downstreamKeyCreatedIdx: index('proxy_logs_downstream_api_key_created_at_idx').on(table.downstreamApiKeyId, table.createdAt),
 }));
 
 export const proxyVideoTasks = sqliteTable('proxy_video_tasks', {
@@ -225,6 +239,8 @@ export const downstreamApiKeys = sqliteTable('downstream_api_keys', {
   name: text('name').notNull(),
   key: text('key').notNull(),
   description: text('description'),
+  groupName: text('group_name'),
+  tags: text('tags'), // JSON array<string>
   enabled: integer('enabled', { mode: 'boolean' }).default(true),
   expiresAt: text('expires_at'),
   maxCost: real('max_cost'),

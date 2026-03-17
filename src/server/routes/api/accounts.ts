@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { db, schema } from '../../db/index.js';
+import { db, schema, runtimeDbDialect } from '../../db/index.js';
 import { and, eq, gte, lt, sql } from 'drizzle-orm';
 import { refreshBalance } from '../../services/balanceService.js';
 import { getAdapter } from '../../services/platforms/index.js';
@@ -26,6 +26,7 @@ import {
 } from '../../services/accountHealthService.js';
 import { appendSessionTokenRebindHint } from '../../services/alertRules.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
+import { createRateLimitGuard } from '../../middleware/requestRateLimit.js';
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -48,6 +49,18 @@ type AccountCapabilities = {
 };
 
 type VerifyFailureReason = 'needs-user-id' | 'invalid-user-id' | 'shield-blocked' | null;
+
+const limitAccountLogin = createRateLimitGuard({
+  bucket: 'accounts-login',
+  max: 5,
+  windowMs: 60_000,
+});
+
+const limitAccountVerifyToken = createRateLimitGuard({
+  bucket: 'accounts-verify-token',
+  max: 5,
+  windowMs: 60_000,
+});
 
 function hasSessionTokenValue(value: string | null | undefined): boolean {
   return typeof value === 'string' && value.trim().length > 0;
@@ -421,7 +434,10 @@ export async function accountsRoutes(app: FastifyInstance) {
   });
 
   // Login to a site and auto-create account
-  app.post<{ Body: { siteId: number; username: string; password: string } }>('/api/accounts/login', async (request) => {
+  app.post<{ Body: { siteId: number; username: string; password: string } }>(
+    '/api/accounts/login',
+    { preHandler: [limitAccountLogin] },
+    async (request) => {
     const { siteId, username, password } = request.body;
 
     // Get site info
@@ -529,10 +545,14 @@ export async function accountsRoutes(app: FastifyInstance) {
       tokenCount: apiTokens.length,
       reusedAccount: !!existing,
     };
-  });
+    },
+  );
 
   // Verify credentials against a site.
-  app.post<{ Body: { siteId: number; accessToken: string; platformUserId?: number; credentialMode?: AccountCredentialMode } }>('/api/accounts/verify-token', async (request) => {
+  app.post<{ Body: { siteId: number; accessToken: string; platformUserId?: number; credentialMode?: AccountCredentialMode } }>(
+    '/api/accounts/verify-token',
+    { preHandler: [limitAccountVerifyToken] },
+    async (request) => {
     const { siteId, platformUserId } = request.body;
     const accessToken = (request.body.accessToken || '').trim();
     const credentialMode = resolveRequestedCredentialMode(request.body.credentialMode);
@@ -831,7 +851,8 @@ export async function accountsRoutes(app: FastifyInstance) {
         ? 'Session Token 验证失败'
         : 'Token invalid: cannot use it as session cookie or API key',
     };
-  });
+    },
+  );
 
   app.post<{ Params: { id: string }; Body: { accessToken: string; platformUserId?: number; refreshToken?: string; tokenExpiresAt?: number | string } }>(
     '/api/accounts/:id/rebind-session',
@@ -954,7 +975,7 @@ export async function accountsRoutes(app: FastifyInstance) {
   );
 
   // Add an account (manual credential input)
-  app.post<{ Body: { siteId: number; username?: string; accessToken: string; apiToken?: string; platformUserId?: number; checkinEnabled?: boolean; credentialMode?: AccountCredentialMode; refreshToken?: string; tokenExpiresAt?: number | string } }>('/api/accounts', async (request, reply) => {
+  app.post<{ Body: { siteId: number; username?: string; accessToken: string; apiToken?: string; platformUserId?: number; checkinEnabled?: boolean; credentialMode?: AccountCredentialMode; refreshToken?: string; tokenExpiresAt?: number | string; skipModelFetch?: boolean } }>('/api/accounts', async (request, reply) => {
     const body = request.body;
     const site = await db.select().from(schema.sites).where(eq(schema.sites.id, body.siteId)).get();
     if (!site) {
@@ -979,29 +1000,35 @@ export async function accountsRoutes(app: FastifyInstance) {
     let verifiedModels: string[] = [];
 
     if (credentialMode === 'apikey') {
-      try {
-        const models = await adapter.getModels(site.url, rawAccessToken, body.platformUserId);
-        verifiedModels = Array.isArray(models)
-          ? models.filter((item) => typeof item === 'string' && item.trim().length > 0)
-          : [];
-      } catch (err: any) {
-        return reply.code(400).send({
-          success: false,
-          message: err?.message || 'API Key 验证失败',
-        });
-      }
+      if (body.skipModelFetch === true) {
+        tokenType = 'apikey';
+        accessToken = '';
+        if (!apiToken) apiToken = rawAccessToken;
+      } else {
+        try {
+          const models = await adapter.getModels(site.url, rawAccessToken, body.platformUserId);
+          verifiedModels = Array.isArray(models)
+            ? models.filter((item) => typeof item === 'string' && item.trim().length > 0)
+            : [];
+        } catch (err: any) {
+          return reply.code(400).send({
+            success: false,
+            message: err?.message || 'API Key 验证失败',
+          });
+        }
 
-      if (verifiedModels.length === 0) {
-        return reply.code(400).send({
-          success: false,
-          requiresVerification: true,
-          message: 'API Key 验证失败：未获取到可用模型',
-        });
-      }
+        if (verifiedModels.length === 0) {
+          return reply.code(400).send({
+            success: false,
+            requiresVerification: true,
+            message: 'API Key 验证失败：未获取到可用模型',
+          });
+        }
 
-      tokenType = 'apikey';
-      accessToken = '';
-      if (!apiToken) apiToken = rawAccessToken;
+        tokenType = 'apikey';
+        accessToken = '';
+        if (!apiToken) apiToken = rawAccessToken;
+      }
     } else {
       let verifyResult: any;
       try {
@@ -1098,10 +1125,14 @@ export async function accountsRoutes(app: FastifyInstance) {
     if (tokenType === 'session') {
       try { await refreshBalance(result.id); } catch { }
     }
-    try {
-      await refreshModelsForAccount(result.id);
-      await rebuildTokenRoutesFromAvailability();
-    } catch { }
+
+    // Try to refresh models only if not skipping.
+    if (body.skipModelFetch !== true) {
+      try {
+        await refreshModelsForAccount(result.id);
+        await rebuildTokenRoutesFromAvailability();
+      } catch { }
+    }
 
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, result.id)).get();
     const finalCredentialMode = account ? resolveStoredCredentialMode(account) : resolvedCredentialMode;
@@ -1343,4 +1374,146 @@ export async function accountsRoutes(app: FastifyInstance) {
       return { message: err?.message || 'failed to fetch balance' };
     }
   });
+
+  // Get model list for an account (available models + disabled status at site level)
+  app.get<{ Params: { id: string } }>('/api/accounts/:id/models', async (request, reply) => {
+    const accountId = parseInt(request.params.id, 10);
+    if (!Number.isFinite(accountId) || accountId <= 0) {
+      return reply.code(400).send({ message: '账号 ID 无效' });
+    }
+
+    const account = await db.select().from(schema.accounts)
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(eq(schema.accounts.id, accountId))
+      .get();
+
+    if (!account) {
+      return reply.code(404).send({ message: '账号不存在' });
+    }
+
+    const siteId = account.accounts.siteId;
+
+    // Get available models for this account
+    const modelRows = await db.select({
+      modelName: schema.modelAvailability.modelName,
+      available: schema.modelAvailability.available,
+      latencyMs: schema.modelAvailability.latencyMs,
+      isManual: schema.modelAvailability.isManual,
+    }).from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, accountId))
+      .all();
+
+    // Get disabled models for this site
+    const disabledRows = await db.select({
+      modelName: schema.siteDisabledModels.modelName,
+    }).from(schema.siteDisabledModels)
+      .where(eq(schema.siteDisabledModels.siteId, siteId))
+      .all();
+
+    const disabledSet = new Set(disabledRows.map((r) => r.modelName));
+
+    const models = modelRows
+      .filter((r) => r.available)
+      .map((r) => ({
+        name: r.modelName,
+        latencyMs: r.latencyMs,
+        disabled: disabledSet.has(r.modelName),
+        isManual: !!r.isManual,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return {
+      siteId,
+      siteName: account.sites.name,
+      models,
+      totalCount: models.length,
+      disabledCount: models.filter((m) => m.disabled).length,
+    };
+  });
+
+  // Add models manually to an account
+  app.post<{ Params: { id: string }; Body: { models: string[] } }>('/api/accounts/:id/models/manual', async (request, reply) => {
+    const accountId = parseInt(request.params.id, 10);
+    if (!Number.isFinite(accountId) || accountId <= 0) {
+      return reply.code(400).send({ message: '账号 ID 无效' });
+    }
+
+    const { models } = request.body;
+    if (!Array.isArray(models) || models.length === 0) {
+      return reply.code(400).send({ message: '模型列表不能为空' });
+    }
+
+    const normalizedModels = Array.from(new Set(models.map(m => String(m).trim()).filter(m => m.length > 0)));
+    if (normalizedModels.length === 0) {
+      return reply.code(400).send({ message: '模型列表不能为空' });
+    }
+
+    const account = await db.select().from(schema.accounts)
+      .where(eq(schema.accounts.id, accountId))
+      .get();
+
+    if (!account) {
+      return reply.code(404).send({ message: '账号不存在' });
+    }
+
+    try {
+      await db.transaction(async (tx) => {
+        const checkedAt = new Date().toISOString();
+        for (const modelName of normalizedModels) {
+          if (runtimeDbDialect === 'mysql') {
+            const existing = await tx.select()
+              .from(schema.modelAvailability)
+              .where(and(eq(schema.modelAvailability.accountId, accountId), eq(schema.modelAvailability.modelName, modelName)))
+              .get();
+
+            if (existing) {
+              await tx.update(schema.modelAvailability)
+                .set({ available: true, latencyMs: null, isManual: true, checkedAt })
+                .where(eq(schema.modelAvailability.id, existing.id))
+                .run();
+            } else {
+              await tx.insert(schema.modelAvailability).values({
+                accountId,
+                modelName,
+                available: true,
+                isManual: true,
+                latencyMs: null,
+                checkedAt,
+              }).run();
+            }
+          } else {
+            // SQLite / PostgreSQL path
+            await (tx.insert(schema.modelAvailability)
+              .values({
+                accountId,
+                modelName,
+                available: true,
+                isManual: true,
+                latencyMs: null,
+                checkedAt,
+              }) as any)
+              .onConflictDoUpdate({
+                target: [schema.modelAvailability.accountId, schema.modelAvailability.modelName],
+                set: {
+                  available: true,
+                  isManual: true,
+                  latencyMs: null,
+                  checkedAt,
+                },
+              })
+              .run();
+          }
+        }
+      });
+
+      try {
+        await rebuildTokenRoutesFromAvailability();
+      } catch { }
+
+      return { success: true };
+    } catch (err: any) {
+      return reply.code(500).send({ success: false, message: err?.message || '保存失败' });
+    }
+  });
 }
+

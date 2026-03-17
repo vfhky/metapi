@@ -23,6 +23,7 @@ import type {
   RouteDecision,
   RouteDecisionCandidate,
   MissingTokenRouteSiteActionItem,
+  MissingTokenGroupRouteSiteActionItem,
   RouteRoutingStrategy,
 } from './types.js';
 import type { RouteCandidateView, RouteTokenOption } from '../helpers/routeModelCandidatesIndex.js';
@@ -61,6 +62,7 @@ type RouteCardProps = {
   onChannelDragEnd: (routeId: number, event: DragEndEvent) => void;
   // Missing token hints
   missingTokenSiteItems: MissingTokenRouteSiteActionItem[];
+  missingTokenGroupItems: MissingTokenGroupRouteSiteActionItem[];
   onCreateTokenForMissing: (accountId: number, modelName: string) => void;
   // Add channel
   onAddChannel: (routeId: number) => void;
@@ -104,6 +106,7 @@ function RouteCardInner({
   onDeleteChannel,
   onChannelDragEnd,
   missingTokenSiteItems,
+  missingTokenGroupItems,
   onCreateTokenForMissing,
   onAddChannel,
   expandedSourceGroupMap,
@@ -111,6 +114,7 @@ function RouteCardInner({
 }: RouteCardProps) {
   const routeIcon = resolveRouteIcon(route);
   const exactRoute = isExactModelPattern(route.modelPattern);
+  const readOnlyRoute = route.kind === 'zero_channel' || route.readOnly === true || route.isVirtual === true;
   const title = resolveRouteTitle(route);
   const routingStrategy = route.routingStrategy === 'round_robin' ? 'round_robin' : 'weighted';
   const routingStrategyOptions = [
@@ -184,22 +188,34 @@ function RouteCardInner({
             <span className="badge badge-muted" style={{ fontSize: 10, flexShrink: 0 }}>{route.modelPattern}</span>
           ) : null}
 
-          <button
-            className={`badge route-enable-toggle ${route.enabled ? 'is-enabled' : 'is-disabled'}`}
-            style={{ fontSize: 11, cursor: 'pointer', border: 'none', flexShrink: 0, minWidth: 36, textAlign: 'center' }}
-            onClick={(e) => { e.stopPropagation(); onToggleEnabled(route); }}
-            data-tooltip={route.enabled ? '点击禁用此路由' : '点击启用此路由'}
-          >
-            {route.enabled ? tr('启用') : tr('禁用')}
-          </button>
+          {readOnlyRoute ? (
+            <span className="badge badge-muted" style={{ fontSize: 10, flexShrink: 0 }}>
+              {tr('未生成')}
+            </span>
+          ) : (
+            <button
+              className={`badge route-enable-toggle ${route.enabled ? 'is-enabled' : 'is-disabled'}`}
+              style={{ fontSize: 11, cursor: 'pointer', border: 'none', flexShrink: 0, minWidth: 36, textAlign: 'center' }}
+              onClick={(e) => { e.stopPropagation(); onToggleEnabled(route); }}
+              data-tooltip={route.enabled ? '点击禁用此路由' : '点击启用此路由'}
+            >
+              {route.enabled ? tr('启用') : tr('禁用')}
+            </button>
+          )}
 
           <span className="badge badge-info" style={{ fontSize: 10, flexShrink: 0 }}>
             {route.channelCount} {tr('通道')}
           </span>
 
-          <span className="badge badge-muted" style={{ fontSize: 10, flexShrink: 0 }}>
-            {routingStrategy === 'round_robin' ? tr('轮询') : tr('权重随机')}
-          </span>
+          {readOnlyRoute ? (
+            <span className="badge badge-warning" style={{ fontSize: 10, flexShrink: 0 }}>
+              {tr('0 通道')}
+            </span>
+          ) : (
+            <span className="badge badge-muted" style={{ fontSize: 10, flexShrink: 0 }}>
+              {routingStrategy === 'round_robin' ? tr('轮询') : tr('权重随机')}
+            </span>
+          )}
 
           <svg
             width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2"
@@ -236,27 +252,38 @@ function RouteCardInner({
           {route.displayName && route.displayName.trim() !== route.modelPattern ? (
             <span className="badge badge-muted" style={{ fontSize: 10 }}>{route.modelPattern}</span>
           ) : null}
-          <button
-            className={`badge route-enable-toggle ${route.enabled ? 'is-enabled' : 'is-disabled'}`}
-            style={{ fontSize: 11, cursor: 'pointer', border: 'none' }}
-            onClick={(e) => { e.stopPropagation(); onToggleEnabled(route); }}
-            data-tooltip={route.enabled ? '点击禁用此路由' : '点击启用此路由'}
-          >
-            {route.enabled ? tr('启用') : tr('禁用')}
-          </button>
+          {readOnlyRoute ? (
+            <span className="badge badge-muted" style={{ fontSize: 10 }}>
+              {tr('未生成')}
+            </span>
+          ) : (
+            <button
+              className={`badge route-enable-toggle ${route.enabled ? 'is-enabled' : 'is-disabled'}`}
+              style={{ fontSize: 11, cursor: 'pointer', border: 'none' }}
+              onClick={(e) => { e.stopPropagation(); onToggleEnabled(route); }}
+              data-tooltip={route.enabled ? '点击禁用此路由' : '点击启用此路由'}
+            >
+              {route.enabled ? tr('启用') : tr('禁用')}
+            </button>
+          )}
           <span className="badge badge-info" style={{ fontSize: 10 }}>
             {route.channelCount} {tr('通道')}
           </span>
+          {readOnlyRoute && (
+            <span className="badge badge-warning" style={{ fontSize: 10 }}>
+              {tr('0 通道')}
+            </span>
+          )}
           {savingPriority && (
             <span className="badge badge-warning" style={{ fontSize: 10 }}>{tr('排序保存中')}</span>
           )}
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          {!exactRoute && (
+          {!readOnlyRoute && !exactRoute && (
             <button onClick={() => onEdit(route)} className="btn btn-link">{tr('编辑群组')}</button>
           )}
-          <button onClick={() => onDelete(route.id)} className="btn btn-link btn-link-danger">{tr('删除路由')}</button>
+          {!readOnlyRoute && <button onClick={() => onDelete(route.id)} className="btn btn-link btn-link-danger">{tr('删除路由')}</button>}
           <button
             onClick={() => onToggleExpand(route.id)}
             className="btn btn-ghost"
@@ -280,49 +307,74 @@ function RouteCardInner({
         </div>
       )}
 
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
-        <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
-          {tr('路由策略')}
+      {!readOnlyRoute && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+          <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+            {tr('路由策略')}
+          </div>
+          <div style={{ minWidth: 220, maxWidth: 320, flex: '1 1 220px' }}>
+            <ModernSelect
+              size="sm"
+              value={routingStrategy}
+              disabled={updatingRoutingStrategy}
+              onChange={(nextValue) => onRoutingStrategyChange(route, nextValue as RouteRoutingStrategy)}
+              options={routingStrategyOptions.map((option) => ({ ...option }))}
+              placeholder={tr('选择路由策略')}
+              emptyLabel={tr('暂无可选策略')}
+            />
+          </div>
         </div>
-        <div style={{ minWidth: 220, maxWidth: 320, flex: '1 1 220px' }}>
-          <ModernSelect
-            size="sm"
-            value={routingStrategy}
-            disabled={updatingRoutingStrategy}
-            onChange={(nextValue) => onRoutingStrategyChange(route, nextValue as RouteRoutingStrategy)}
-            options={routingStrategyOptions.map((option) => ({ ...option }))}
-            placeholder={tr('选择路由策略')}
-            emptyLabel={tr('暂无可选策略')}
-          />
-        </div>
-      </div>
+      )}
 
       {/* Missing token hints + Add channel button */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
-        {missingTokenSiteItems.length > 0 ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', flex: 1 }}>
-            <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{tr('待注册站点')}:</span>
-            {missingTokenSiteItems.map((item) => (
-              <button
-                key={`missing-${route.id}-${item.key}`}
-                type="button"
-                onClick={() => onCreateTokenForMissing(item.accountId, route.modelPattern)}
-                className="badge badge-info missing-token-site-tag"
-                data-tooltip={`点击跳转到令牌创建（预选 ${item.siteName}/${item.accountLabel}）`}
-                style={{ fontSize: 11, cursor: 'pointer' }}
-              >
-                {item.siteName}
-              </button>
-            ))}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+        {(missingTokenSiteItems.length > 0 || missingTokenGroupItems.length > 0) ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1 }}>
+            {missingTokenSiteItems.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{tr('待注册站点')}:</span>
+                {missingTokenSiteItems.map((item) => (
+                  <button
+                    key={`missing-${route.id}-${item.key}`}
+                    type="button"
+                    onClick={() => onCreateTokenForMissing(item.accountId, route.modelPattern)}
+                    className="badge badge-info missing-token-site-tag"
+                    data-tooltip={`点击跳转到令牌创建（预选 ${item.siteName}/${item.accountLabel}）`}
+                    style={{ fontSize: 11, cursor: 'pointer' }}
+                  >
+                    {item.siteName}
+                  </button>
+                ))}
+              </div>
+            )}
+            {missingTokenGroupItems.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{tr('缺少分组')}:</span>
+                {missingTokenGroupItems.map((item) => (
+                  <button
+                    key={`missing-group-${route.id}-${item.key}`}
+                    type="button"
+                    onClick={() => onCreateTokenForMissing(item.accountId, route.modelPattern)}
+                    className="badge badge-warning missing-token-group-tag"
+                    data-tooltip={`缺少分组：${item.missingGroups.join('、') || '未知'}${item.availableGroups.length > 0 ? `；已覆盖：${item.availableGroups.join('、')}` : ''}${item.groupCoverageUncertain ? '；当前分组覆盖存在不确定性' : ''}`}
+                    style={{ fontSize: 11, cursor: 'pointer' }}
+                  >
+                    {item.siteName}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ) : <div />}
-        <button
-          onClick={() => onAddChannel(route.id)}
-          className="btn btn-ghost"
-          style={{ fontSize: 12, padding: '6px 10px', color: 'var(--color-primary)', border: '1px solid var(--color-border)', whiteSpace: 'nowrap' }}
-        >
-          + {tr('添加通道')}
-        </button>
+        {!readOnlyRoute && (
+          <button
+            onClick={() => onAddChannel(route.id)}
+            className="btn btn-ghost"
+            style={{ fontSize: 12, padding: '6px 10px', color: 'var(--color-primary)', border: '1px solid var(--color-border)', whiteSpace: 'nowrap' }}
+          >
+            + {tr('添加通道')}
+          </button>
+        )}
       </div>
 
       {/* Channel list */}
@@ -420,7 +472,9 @@ function RouteCardInner({
           </DndContext>
         </div>
       ) : (
-        <div style={{ fontSize: 13, color: 'var(--color-text-muted)', paddingLeft: 4 }}>暂无通道</div>
+        <div style={{ fontSize: 13, color: 'var(--color-text-muted)', paddingLeft: 4 }}>
+          {readOnlyRoute ? tr('暂无通道，先补齐令牌后再重建路由。') : tr('暂无通道')}
+        </div>
       )}
     </div>
   );

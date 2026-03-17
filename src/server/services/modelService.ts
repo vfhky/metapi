@@ -1,7 +1,13 @@
 import { and, eq } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { getAdapter } from './platforms/index.js';
-import { ensureDefaultTokenForAccount, getPreferredAccountToken } from './accountTokenService.js';
+import {
+  ACCOUNT_TOKEN_VALUE_STATUS_READY,
+  ensureDefaultTokenForAccount,
+  getPreferredAccountToken,
+  isMaskedTokenValue,
+  isUsableAccountToken,
+} from './accountTokenService.js';
 import { getCredentialModeFromExtraConfig, resolvePlatformUserId } from './accountExtraConfig.js';
 import { invalidateTokenRouterCache } from './tokenRouter.js';
 import { setAccountRuntimeHealth } from './accountHealthService.js';
@@ -12,6 +18,61 @@ const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
 const MODEL_REFRESH_BATCH_SIZE = 3;
 
 type ModelRefreshErrorCode = 'timeout' | 'unauthorized' | 'empty_models' | 'unknown';
+type ModelRefreshSkipCode = 'site_disabled' | 'adapter_or_status';
+
+export type ModelRefreshAccountNotFoundResult = {
+  accountId: number;
+  refreshed: false;
+  status: 'failed';
+  errorCode: 'account_not_found';
+  errorMessage: '账号不存在';
+  modelCount: 0;
+  modelsPreview: string[];
+  reason: 'account_not_found';
+};
+
+export type ModelRefreshSkippedResult = {
+  accountId: number;
+  refreshed: false;
+  status: 'skipped';
+  errorCode: ModelRefreshSkipCode;
+  errorMessage: string;
+  modelCount: 0;
+  modelsPreview: string[];
+  reason: ModelRefreshSkipCode;
+};
+
+export type ModelRefreshFailureResult = {
+  accountId: number;
+  refreshed: true;
+  status: 'failed';
+  errorCode: ModelRefreshErrorCode;
+  errorMessage: string;
+  modelCount: 0;
+  modelsPreview: string[];
+  tokenScanned: number;
+  discoveredByCredential: boolean;
+  discoveredApiToken: boolean;
+};
+
+export type ModelRefreshSuccessResult = {
+  accountId: number;
+  refreshed: true;
+  status: 'success';
+  errorCode: null;
+  errorMessage: '';
+  modelCount: number;
+  modelsPreview: string[];
+  tokenScanned: number;
+  discoveredByCredential: boolean;
+  discoveredApiToken: boolean;
+};
+
+export type ModelRefreshResult =
+  | ModelRefreshAccountNotFoundResult
+  | ModelRefreshSkippedResult
+  | ModelRefreshFailureResult
+  | ModelRefreshSuccessResult;
 
 function classifyModelDiscoveryError(message: string): ModelRefreshErrorCode {
   const lowered = message.toLowerCase();
@@ -40,7 +101,23 @@ function isApiKeyConnection(account: typeof schema.accounts.$inferSelect): boole
 }
 
 function normalizeModels(models: string[]): string[] {
-  return Array.from(new Set(models.filter((model) => typeof model === 'string' && model.trim().length > 0)));
+  const normalizedModels: string[] = [];
+  const seen = new Set<string>();
+
+  for (const rawModel of models) {
+    if (typeof rawModel !== 'string') continue;
+    const modelName = rawModel.trim();
+    if (!modelName) continue;
+
+    // Keep app/database behavior stable across SQLite/MySQL by deduping with a
+    // case-insensitive key after trimming whitespace.
+    const dedupeKey = modelName.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    normalizedModels.push(modelName);
+  }
+
+  return normalizedModels;
 }
 
 function isExactModelPattern(modelPattern: string): boolean {
@@ -64,23 +141,88 @@ async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMe
   }
 }
 
-export async function refreshModelsForAccount(accountId: number) {
+function buildAccountNotFoundRefreshResult(accountId: number): ModelRefreshAccountNotFoundResult {
+  return {
+    accountId,
+    refreshed: false,
+    status: 'failed',
+    errorCode: 'account_not_found',
+    errorMessage: '账号不存在',
+    modelCount: 0,
+    modelsPreview: [],
+    reason: 'account_not_found',
+  };
+}
+
+function buildSkippedRefreshResult(
+  accountId: number,
+  code: ModelRefreshSkipCode,
+  errorMessage: string,
+): ModelRefreshSkippedResult {
+  return {
+    accountId,
+    refreshed: false,
+    status: 'skipped',
+    errorCode: code,
+    errorMessage,
+    modelCount: 0,
+    modelsPreview: [],
+    reason: code,
+  };
+}
+
+function buildFailedRefreshResult(input: {
+  accountId: number;
+  errorCode: ModelRefreshErrorCode;
+  errorMessage: string;
+  tokenScanned: number;
+  discoveredByCredential: boolean;
+  discoveredApiToken: boolean;
+}): ModelRefreshFailureResult {
+  return {
+    accountId: input.accountId,
+    refreshed: true,
+    status: 'failed',
+    errorCode: input.errorCode,
+    errorMessage: input.errorMessage,
+    modelCount: 0,
+    modelsPreview: [],
+    tokenScanned: input.tokenScanned,
+    discoveredByCredential: input.discoveredByCredential,
+    discoveredApiToken: input.discoveredApiToken,
+  };
+}
+
+function buildSuccessfulRefreshResult(input: {
+  accountId: number;
+  modelCount: number;
+  modelsPreview: string[];
+  tokenScanned: number;
+  discoveredByCredential: boolean;
+  discoveredApiToken: boolean;
+}): ModelRefreshSuccessResult {
+  return {
+    accountId: input.accountId,
+    refreshed: true,
+    status: 'success',
+    errorCode: null,
+    errorMessage: '',
+    modelCount: input.modelCount,
+    modelsPreview: input.modelsPreview,
+    tokenScanned: input.tokenScanned,
+    discoveredByCredential: input.discoveredByCredential,
+    discoveredApiToken: input.discoveredApiToken,
+  };
+}
+
+export async function refreshModelsForAccount(accountId: number): Promise<ModelRefreshResult> {
   const row = await db.select().from(schema.accounts)
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .where(eq(schema.accounts.id, accountId))
     .get();
 
   if (!row) {
-    return {
-      accountId,
-      refreshed: false,
-      status: 'failed',
-      errorCode: 'account_not_found',
-      errorMessage: '账号不存在',
-      modelCount: 0,
-      modelsPreview: [],
-      reason: 'account_not_found',
-    };
+    return buildAccountNotFoundRefreshResult(accountId);
   }
 
   const account = row.accounts;
@@ -103,29 +245,11 @@ export async function refreshModelsForAccount(accountId: number) {
   }
 
   if (isSiteDisabled(site.status)) {
-    return {
-      accountId,
-      refreshed: false,
-      status: 'skipped',
-      errorCode: 'site_disabled',
-      errorMessage: '站点已禁用',
-      modelCount: 0,
-      modelsPreview: [],
-      reason: 'site_disabled',
-    };
+    return buildSkippedRefreshResult(accountId, 'site_disabled', '站点已禁用');
   }
 
   if (!adapter || account.status !== 'active') {
-    return {
-      accountId,
-      refreshed: false,
-      status: 'skipped',
-      errorCode: 'adapter_or_status',
-      errorMessage: '平台不可用或账号未激活',
-      modelCount: 0,
-      modelsPreview: [],
-      reason: 'adapter_or_status',
-    };
+    return buildSkippedRefreshResult(accountId, 'adapter_or_status', '平台不可用或账号未激活');
   }
 
   const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
@@ -138,20 +262,27 @@ export async function refreshModelsForAccount(accountId: number) {
         API_TOKEN_DISCOVERY_TIMEOUT_MS,
         `api token discovery timeout (${Math.round(API_TOKEN_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
       );
-      if (discoveredApiToken) {
+      if (discoveredApiToken && !isMaskedTokenValue(discoveredApiToken)) {
         ensureDefaultTokenForAccount(account.id, discoveredApiToken, { name: 'default', source: 'sync' });
         await db.update(schema.accounts).set({
           apiToken: discoveredApiToken,
           updatedAt: new Date().toISOString(),
         }).where(eq(schema.accounts.id, account.id)).run();
+      } else {
+        discoveredApiToken = null;
       }
-    } catch {}
+    } catch { }
   }
 
   let enabledTokens = await db.select()
     .from(schema.accountTokens)
-    .where(and(eq(schema.accountTokens.accountId, account.id), eq(schema.accountTokens.enabled, true)))
+    .where(and(
+      eq(schema.accountTokens.accountId, account.id),
+      eq(schema.accountTokens.enabled, true),
+      eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
+    ))
     .all();
+  enabledTokens = enabledTokens.filter(isUsableAccountToken);
 
   // Last fallback: if still no managed token but account has a legacy apiToken, mirror it into token table.
   if (!isApiKeyConnection(account) && enabledTokens.length === 0) {
@@ -160,8 +291,13 @@ export async function refreshModelsForAccount(accountId: number) {
       ensureDefaultTokenForAccount(account.id, fallback, { name: 'default', source: 'legacy' });
       enabledTokens = await db.select()
         .from(schema.accountTokens)
-        .where(and(eq(schema.accountTokens.accountId, account.id), eq(schema.accountTokens.enabled, true)))
+        .where(and(
+          eq(schema.accountTokens.accountId, account.id),
+          eq(schema.accountTokens.enabled, true),
+          eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
+        ))
         .all();
+      enabledTokens = enabledTokens.filter(isUsableAccountToken);
     }
   }
 
@@ -192,6 +328,7 @@ export async function refreshModelsForAccount(accountId: number) {
   const discoverModelsWithCredential = async (credentialRaw: string | null | undefined) => {
     const credential = (credentialRaw || '').trim();
     if (!credential) return;
+    if (isMaskedTokenValue(credential)) return;
     if (attemptedCredentials.has(credential)) return;
     attemptedCredentials.add(credential);
 
@@ -266,18 +403,14 @@ export async function refreshModelsForAccount(accountId: number) {
       source: 'model-discovery',
       checkedAt: new Date().toISOString(),
     });
-    return {
+    return buildFailedRefreshResult({
       accountId,
-      refreshed: true,
-      status: 'failed',
       errorCode,
       errorMessage,
-      modelCount: 0,
-      modelsPreview: [],
       tokenScanned: scannedTokenCount,
       discoveredByCredential,
       discoveredApiToken: !!discoveredApiToken,
-    };
+    });
   }
 
   const checkedAt = new Date().toISOString();
@@ -299,26 +432,22 @@ export async function refreshModelsForAccount(accountId: number) {
   });
 
   const modelsPreview = Array.from(accountModels).slice(0, 10);
-  return {
+  return buildSuccessfulRefreshResult({
     accountId,
-    refreshed: true,
-    status: 'success',
-    errorCode: null,
-    errorMessage: '',
     modelCount: accountModels.size,
     modelsPreview,
     tokenScanned: scannedTokenCount,
     discoveredByCredential,
     discoveredApiToken: !!discoveredApiToken,
-  };
+  });
 }
 
-async function refreshModelsForAllActiveAccounts() {
+async function refreshModelsForAllActiveAccounts(): Promise<ModelRefreshResult[]> {
   const accounts = await db.select({ id: schema.accounts.id }).from(schema.accounts)
     .where(eq(schema.accounts.status, 'active'))
     .all();
 
-  const results: any[] = [];
+  const results: ModelRefreshResult[] = [];
   for (let offset = 0; offset < accounts.length; offset += MODEL_REFRESH_BATCH_SIZE) {
     const batch = accounts.slice(offset, offset + MODEL_REFRESH_BATCH_SIZE);
     const batchResults = await Promise.all(batch.map(async (account) => refreshModelsForAccount(account.id)));
@@ -336,11 +465,13 @@ export async function rebuildTokenRoutesFromAvailability() {
       and(
         eq(schema.tokenModelAvailability.available, true),
         eq(schema.accountTokens.enabled, true),
+        eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
         eq(schema.accounts.status, 'active'),
         eq(schema.sites.status, 'active'),
       ),
     )
     .all();
+  const usableTokenRows = tokenRows.filter((row) => isUsableAccountToken(row.account_tokens));
 
   const accountRows = await db.select().from(schema.modelAvailability)
     .innerJoin(schema.accounts, eq(schema.modelAvailability.accountId, schema.accounts.id))
@@ -354,23 +485,37 @@ export async function rebuildTokenRoutesFromAvailability() {
     )
     .all();
 
+  // Load site-level disabled models
+  const disabledModelRows = await db.select().from(schema.siteDisabledModels).all();
+  const disabledModelsBySite = new Map<number, Set<string>>();
+  for (const row of disabledModelRows) {
+    if (!disabledModelsBySite.has(row.siteId)) disabledModelsBySite.set(row.siteId, new Set());
+    disabledModelsBySite.get(row.siteId)!.add(row.modelName);
+  }
+
+  function isModelDisabledForSite(siteId: number, modelName: string): boolean {
+    const disabled = disabledModelsBySite.get(siteId);
+    return !!disabled && disabled.has(modelName);
+  }
+
   const modelCandidates = new Map<string, Map<string, { accountId: number; tokenId: number | null }>>();
-  const addModelCandidate = (modelNameRaw: string | null | undefined, accountId: number, tokenId: number | null) => {
+  const addModelCandidate = (modelNameRaw: string | null | undefined, accountId: number, tokenId: number | null, siteId: number) => {
     const modelName = (modelNameRaw || '').trim();
     if (!modelName) return;
+    if (isModelDisabledForSite(siteId, modelName)) return;
     if (!modelCandidates.has(modelName)) modelCandidates.set(modelName, new Map());
     const candidateKey = `${accountId}:${tokenId ?? 'account'}`;
     modelCandidates.get(modelName)!.set(candidateKey, { accountId, tokenId });
   };
 
-  for (const row of tokenRows) {
-    addModelCandidate(row.token_model_availability.modelName, row.accounts.id, row.account_tokens.id);
+  for (const row of usableTokenRows) {
+    addModelCandidate(row.token_model_availability.modelName, row.accounts.id, row.account_tokens.id, row.accounts.siteId);
   }
 
   for (const row of accountRows) {
     if (!isApiKeyConnection(row.accounts)) continue;
     if (!(row.accounts.apiToken || '').trim()) continue;
-    addModelCandidate(row.model_availability.modelName, row.accounts.id, null);
+    addModelCandidate(row.model_availability.modelName, row.accounts.id, null, row.accounts.siteId);
   }
 
   const routes = await db.select().from(schema.tokenRoutes).all();

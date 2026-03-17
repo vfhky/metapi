@@ -10,7 +10,7 @@ async function request(url: string, options: RequestOptions = {}) {
   let timeoutHandle: ReturnType<typeof setTimeout> | null = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
-  let cleanupExternalSignal = () => {};
+  let cleanupExternalSignal = () => { };
 
   if (externalSignal) {
     if (externalSignal.aborted) {
@@ -69,7 +69,7 @@ async function request(url: string, options: RequestOptions = {}) {
             message = `${message}: ${text.slice(0, 120)}`;
           }
         }
-      } catch {}
+      } catch { }
       throw new Error(message);
     }
     return res.json();
@@ -135,6 +135,17 @@ export type ProxyTestRequestEnvelope = {
   multipartFiles?: ProxyTestMultipartFile[];
 };
 
+const DEFAULT_PROXY_TEST_TIMEOUT_MS = 30_000;
+const LONG_RUNNING_PROXY_TEST_TIMEOUT_MS = 150_000;
+
+function resolveProxyTestTimeoutMs(data: ProxyTestRequestEnvelope) {
+  if (data.jobMode) return LONG_RUNNING_PROXY_TEST_TIMEOUT_MS;
+  if (data.path === '/v1/images/generations') return LONG_RUNNING_PROXY_TEST_TIMEOUT_MS;
+  if (data.path === '/v1/images/edits') return LONG_RUNNING_PROXY_TEST_TIMEOUT_MS;
+  if (data.path === '/v1/videos' && data.method === 'POST') return LONG_RUNNING_PROXY_TEST_TIMEOUT_MS;
+  return DEFAULT_PROXY_TEST_TIMEOUT_MS;
+}
+
 export type ProxyTestJobResponse = {
   jobId: string;
   status: 'pending' | 'succeeded' | 'failed' | 'cancelled';
@@ -193,6 +204,10 @@ export type ProxyLogListItem = {
   siteName?: string | null;
   siteUrl?: string | null;
   errorMessage?: string | null;
+  downstreamKeyId?: number | null;
+  downstreamKeyName?: string | null;
+  downstreamKeyGroupName?: string | null;
+  downstreamKeyTags?: string[];
   promptTokens?: number | null;
   completionTokens?: number | null;
   estimatedCost?: number | null;
@@ -239,6 +254,8 @@ export const api = {
   deleteSite: (id: number) => request(`/api/sites/${id}`, { method: 'DELETE' }),
   batchUpdateSites: (data: any) => request('/api/sites/batch', { method: 'POST', body: JSON.stringify(data) }),
   detectSite: (url: string) => request('/api/sites/detect', { method: 'POST', body: JSON.stringify({ url }) }),
+  getSiteDisabledModels: (siteId: number) => request(`/api/sites/${siteId}/disabled-models`),
+  updateSiteDisabledModels: (siteId: number, models: string[]) => request(`/api/sites/${siteId}/disabled-models`, { method: 'PUT', body: JSON.stringify({ models }) }),
 
   // Accounts
   getAccounts: () => request('/api/accounts'),
@@ -251,6 +268,8 @@ export const api = {
   deleteAccount: (id: number) => request(`/api/accounts/${id}`, { method: 'DELETE' }),
   batchUpdateAccounts: (data: any) => request('/api/accounts/batch', { method: 'POST', body: JSON.stringify(data) }),
   refreshBalance: (id: number) => request(`/api/accounts/${id}/balance`, { method: 'POST' }),
+  getAccountModels: (id: number) => request(`/api/accounts/${id}/models`),
+  addAccountAvailableModels: (accountId: number, models: string[]) => request(`/api/accounts/${accountId}/models/manual`, { method: 'POST', body: JSON.stringify({ models }) }),
   refreshAccountHealth: (data?: { accountId?: number; wait?: boolean }) => request('/api/accounts/health/refresh', {
     method: 'POST',
     body: JSON.stringify(data || {}),
@@ -386,9 +405,26 @@ export const api = {
   deleteDownstreamApiKey: (id: number) => request(`/api/downstream-keys/${id}`, {
     method: 'DELETE',
   }),
+  batchDownstreamApiKeys: (data: {
+    ids: number[];
+    action: 'enable' | 'disable' | 'delete' | 'resetUsage' | 'updateMetadata';
+    groupOperation?: 'keep' | 'set' | 'clear';
+    groupName?: string;
+    tagOperation?: 'keep' | 'append';
+    tags?: string[];
+  }) =>
+    request('/api/downstream-keys/batch', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   resetDownstreamApiKeyUsage: (id: number) => request(`/api/downstream-keys/${id}/reset-usage`, {
     method: 'POST',
   }),
+  getDownstreamApiKeysSummary: (params?: { range?: '24h' | '7d' | 'all'; status?: 'all' | 'enabled' | 'disabled'; search?: string }) =>
+    request(`/api/downstream-keys/summary${buildQueryString(params)}`),
+  getDownstreamApiKeyOverview: (id: number) => request(`/api/downstream-keys/${id}/overview`),
+  getDownstreamApiKeyTrend: (id: number, params?: { range?: '24h' | '7d' | 'all' }) =>
+    request(`/api/downstream-keys/${id}/trend${buildQueryString(params)}`),
   exportBackup: (type: 'all' | 'accounts' | 'preferences' = 'all') =>
     request(`/api/settings/backup/export?type=${encodeURIComponent(type)}`),
   importBackup: (data: any) =>
@@ -425,13 +461,25 @@ export const api = {
   getTestChatJob: (jobId: string) => request(`/api/test/chat/jobs/${encodeURIComponent(jobId)}`),
   deleteTestChatJob: (jobId: string) => request(`/api/test/chat/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }),
   startProxyTestJob: (data: ProxyTestRequestEnvelope) =>
-    request('/api/test/proxy/jobs', { method: 'POST', body: JSON.stringify(data) }),
+    request('/api/test/proxy/jobs', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: resolveProxyTestTimeoutMs(data),
+    }),
   getProxyTestJob: (jobId: string) => request(`/api/test/proxy/jobs/${encodeURIComponent(jobId)}`),
   deleteProxyTestJob: (jobId: string) => request(`/api/test/proxy/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }),
   testProxy: (data: ProxyTestRequestEnvelope) =>
-    request('/api/test/proxy', { method: 'POST', body: JSON.stringify(data) }),
+    request('/api/test/proxy', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: resolveProxyTestTimeoutMs(data),
+    }),
   proxyTest: (data: ProxyTestRequestEnvelope) =>
-    request('/api/test/proxy', { method: 'POST', body: JSON.stringify(data) }),
+    request('/api/test/proxy', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: resolveProxyTestTimeoutMs(data),
+    }),
   testChat: (data: TestChatRequestPayload) =>
     request('/api/test/chat', { method: 'POST', body: JSON.stringify(data) }),
   testProxyStream: async (data: ProxyTestRequestEnvelope, signal?: AbortSignal) => {
