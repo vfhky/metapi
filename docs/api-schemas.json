@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "metapi-api-schemas.json",
   "title": "Metapi API 资源 JSON Schema 草案",
+  "description": "本文件仅覆盖核心资源对象（如 Site、Account、Route 等）。统计与聚合类响应结构以 OpenAPI 草案为准。",
   "type": "object",
   "$defs": {
     "Site": {

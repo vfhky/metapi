@@ -383,19 +383,33 @@ components:
           type: integer
         createdAt:
           type: string
+        routeId:
+          type: integer
+          nullable: true
+        channelId:
+          type: integer
+          nullable: true
         modelRequested:
           type: string
+          nullable: true
         modelActual:
           type: string
+          nullable: true
         status:
           type: string
+          nullable: true
+        httpStatus:
+          type: integer
+          nullable: true
         latencyMs:
           type: integer
+          nullable: true
         totalTokens:
           type: integer
           nullable: true
         retryCount:
           type: integer
+          nullable: true
         accountId:
           type: integer
           nullable: true
@@ -428,18 +442,10 @@ components:
         - $ref: '#/components/schemas/ProxyLogListItem'
         - type: object
           properties:
-            routeId:
-              type: integer
-              nullable: true
-            channelId:
-              type: integer
-              nullable: true
-            httpStatus:
-              type: integer
-              nullable: true
             billingDetails:
               type: object
               nullable: true
+              additionalProperties: true
     DownstreamApiKey:
       type: object
       properties:
@@ -549,18 +555,801 @@ components:
           nullable: true
         expiresAtMs:
           type: integer
+    CheckinLog:
+      type: object
+      properties:
+        id:
+          type: integer
+        accountId:
+          type: integer
+        status:
+          type: string
+        message:
+          type: string
+          nullable: true
+        reward:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          nullable: true
+      required:
+        - id
+        - accountId
+        - status
     CheckinLogRow:
       type: object
       properties:
         checkin_logs:
-          type: object
+          $ref: '#/components/schemas/CheckinLog'
         accounts:
-          type: object
+          $ref: '#/components/schemas/Account'
         sites:
-          type: object
+          $ref: '#/components/schemas/Site'
         failureReason:
+          $ref: '#/components/schemas/CheckinFailureReason'
+      required:
+        - checkin_logs
+        - accounts
+        - sites
+        - failureReason
+    CheckinFailureReason:
+      type: object
+      properties:
+        code:
+          type: string
+        category:
+          type: string
+        title:
+          type: string
+        actionHint:
+          type: string
+        detailHint:
+          type: string
+      required:
+        - code
+        - category
+        - title
+        - actionHint
+        - detailHint
+    DashboardCheckinStats:
+      type: object
+      properties:
+        success:
+          type: integer
+        failed:
+          type: integer
+        total:
+          type: integer
+      required:
+        - success
+        - failed
+        - total
+    DashboardProxyStats:
+      type: object
+      properties:
+        success:
+          type: integer
+        failed:
+          type: integer
+        total:
+          type: integer
+        totalTokens:
+          type: integer
+      required:
+        - success
+        - failed
+        - total
+        - totalTokens
+    DashboardPerformance:
+      type: object
+      properties:
+        windowSeconds:
+          type: integer
+        requestsPerMinute:
+          type: integer
+        tokensPerMinute:
+          type: integer
+      required:
+        - windowSeconds
+        - requestsPerMinute
+        - tokensPerMinute
+    SiteAvailabilityBucket:
+      type: object
+      properties:
+        startUtc:
+          type: string
+        label:
+          type: string
+        totalRequests:
+          type: integer
+        successCount:
+          type: integer
+        failedCount:
+          type: integer
+        availabilityPercent:
+          type: number
+          nullable: true
+        averageLatencyMs:
+          type: integer
+          nullable: true
+      required:
+        - startUtc
+        - label
+        - totalRequests
+        - successCount
+        - failedCount
+    SiteAvailabilitySummary:
+      type: object
+      properties:
+        siteId:
+          type: integer
+        siteName:
+          type: string
+        siteUrl:
           type: string
           nullable: true
+        platform:
+          type: string
+          nullable: true
+        totalRequests:
+          type: integer
+        successCount:
+          type: integer
+        failedCount:
+          type: integer
+        availabilityPercent:
+          type: number
+          nullable: true
+        averageLatencyMs:
+          type: integer
+          nullable: true
+        buckets:
+          type: array
+          items:
+            $ref: '#/components/schemas/SiteAvailabilityBucket'
+      required:
+        - siteId
+        - siteName
+        - totalRequests
+        - successCount
+        - failedCount
+        - buckets
+    ModelAnalysisWindow:
+      type: object
+      properties:
+        start:
+          type: string
+        end:
+          type: string
+        days:
+          type: integer
+      required:
+        - start
+        - end
+        - days
+    ModelAnalysisTotals:
+      type: object
+      properties:
+        calls:
+          type: integer
+        tokens:
+          type: integer
+        spend:
+          type: number
+      required:
+        - calls
+        - tokens
+        - spend
+    ModelAnalysisSpendDistribution:
+      type: object
+      properties:
+        model:
+          type: string
+        spend:
+          type: number
+        calls:
+          type: integer
+      required:
+        - model
+        - spend
+        - calls
+    ModelAnalysisSpendTrend:
+      type: object
+      properties:
+        day:
+          type: string
+        spend:
+          type: number
+      required:
+        - day
+        - spend
+    ModelAnalysisCallsDistribution:
+      type: object
+      properties:
+        model:
+          type: string
+        calls:
+          type: integer
+        share:
+          type: number
+      required:
+        - model
+        - calls
+        - share
+    ModelAnalysisCallRanking:
+      type: object
+      properties:
+        model:
+          type: string
+        calls:
+          type: integer
+        successRate:
+          type: number
+        avgLatencyMs:
+          type: integer
+        spend:
+          type: number
+        tokens:
+          type: integer
+      required:
+        - model
+        - calls
+        - successRate
+        - avgLatencyMs
+        - spend
+        - tokens
+    ModelAnalysis:
+      type: object
+      properties:
+        window:
+          $ref: '#/components/schemas/ModelAnalysisWindow'
+        totals:
+          $ref: '#/components/schemas/ModelAnalysisTotals'
+        spendDistribution:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelAnalysisSpendDistribution'
+        spendTrend:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelAnalysisSpendTrend'
+        callsDistribution:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelAnalysisCallsDistribution'
+        callRanking:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelAnalysisCallRanking'
+      required:
+        - window
+        - totals
+        - spendDistribution
+        - spendTrend
+        - callsDistribution
+        - callRanking
+    DashboardStats:
+      type: object
+      properties:
+        totalBalance:
+          type: number
+        totalUsed:
+          type: number
+        todaySpend:
+          type: number
+        todayReward:
+          type: number
+        activeAccounts:
+          type: integer
+        totalAccounts:
+          type: integer
+        todayCheckin:
+          $ref: '#/components/schemas/DashboardCheckinStats'
+        proxy24h:
+          $ref: '#/components/schemas/DashboardProxyStats'
+        performance:
+          $ref: '#/components/schemas/DashboardPerformance'
+        siteAvailability:
+          type: array
+          items:
+            $ref: '#/components/schemas/SiteAvailabilitySummary'
+        modelAnalysis:
+          $ref: '#/components/schemas/ModelAnalysis'
+      required:
+        - totalBalance
+        - totalUsed
+        - todaySpend
+        - todayReward
+        - activeAccounts
+        - totalAccounts
+        - todayCheckin
+        - proxy24h
+        - performance
+        - siteAvailability
+        - modelAnalysis
+    ProxyLogSummary:
+      type: object
+      properties:
+        totalCount:
+          type: integer
+        successCount:
+          type: integer
+        failedCount:
+          type: integer
+        totalCost:
+          type: number
+        totalTokensAll:
+          type: integer
+      required:
+        - totalCount
+        - successCount
+        - failedCount
+        - totalCost
+        - totalTokensAll
+    ProxyLogListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyLogListItem'
+        total:
+          type: integer
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        summary:
+          $ref: '#/components/schemas/ProxyLogSummary'
+      required:
+        - items
+        - total
+        - page
+        - pageSize
+        - summary
+    ModelMarketplaceAccountToken:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        isDefault:
+          type: boolean
+      required:
+        - id
+        - name
+        - isDefault
+    ModelMarketplaceAccount:
+      type: object
+      properties:
+        id:
+          type: integer
+        site:
+          type: string
+        username:
+          type: string
+          nullable: true
+        latency:
+          type: integer
+          nullable: true
+        unitCost:
+          type: number
+          nullable: true
+        balance:
+          type: number
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelMarketplaceAccountToken'
+      required:
+        - id
+        - site
+        - balance
+        - tokens
+    ModelMarketplaceGroupPricing:
+      type: object
+      properties:
+        quotaType:
+          type: integer
+        inputPerMillion:
+          type: number
+          nullable: true
+        outputPerMillion:
+          type: number
+          nullable: true
+        perCallInput:
+          type: number
+          nullable: true
+        perCallOutput:
+          type: number
+          nullable: true
+        perCallTotal:
+          type: number
+          nullable: true
+    ModelMarketplacePricingSource:
+      type: object
+      properties:
+        siteId:
+          type: integer
+        siteName:
+          type: string
+        accountId:
+          type: integer
+        username:
+          type: string
+          nullable: true
+        ownerBy:
+          type: string
+          nullable: true
+        enableGroups:
+          type: array
+          items:
+            type: string
+        groupPricing:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ModelMarketplaceGroupPricing'
+      required:
+        - siteId
+        - siteName
+        - accountId
+        - enableGroups
+        - groupPricing
+    ModelMarketplaceModel:
+      type: object
+      properties:
+        name:
+          type: string
+        accountCount:
+          type: integer
+        tokenCount:
+          type: integer
+        avgLatency:
+          type: integer
+        successRate:
+          type: number
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        supportedEndpointTypes:
+          type: array
+          items:
+            type: string
+        pricingSources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelMarketplacePricingSource'
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelMarketplaceAccount'
+      required:
+        - name
+        - accountCount
+        - tokenCount
+        - avgLatency
+        - tags
+        - supportedEndpointTypes
+        - pricingSources
+        - accounts
+    ModelMarketplaceMeta:
+      type: object
+      properties:
+        refreshRequested:
+          type: boolean
+        refreshQueued:
+          type: boolean
+        refreshReused:
+          type: boolean
+        refreshRunning:
+          type: boolean
+        refreshJobId:
+          type: string
+          nullable: true
+        includePricing:
+          type: boolean
+        cacheHit:
+          type: boolean
+      required:
+        - refreshRequested
+        - refreshQueued
+        - refreshReused
+        - refreshRunning
+        - includePricing
+    ModelMarketplaceResponse:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelMarketplaceModel'
+        meta:
+          $ref: '#/components/schemas/ModelMarketplaceMeta'
+      required:
+        - models
+        - meta
+    TokenCandidateModelToken:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        tokenId:
+          type: integer
+        tokenName:
+          type: string
+        isDefault:
+          type: boolean
+        username:
+          type: string
+          nullable: true
+        siteId:
+          type: integer
+        siteName:
+          type: string
+      required:
+        - accountId
+        - tokenId
+        - tokenName
+        - isDefault
+        - siteId
+        - siteName
+    TokenCandidateAccount:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        username:
+          type: string
+          nullable: true
+        siteId:
+          type: integer
+        siteName:
+          type: string
+      required:
+        - accountId
+        - siteId
+        - siteName
+    TokenCandidateMissingGroup:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        username:
+          type: string
+          nullable: true
+        siteId:
+          type: integer
+        siteName:
+          type: string
+        missingGroups:
+          type: array
+          items:
+            type: string
+        requiredGroups:
+          type: array
+          items:
+            type: string
+        availableGroups:
+          type: array
+          items:
+            type: string
+        groupCoverageUncertain:
+          type: boolean
+      required:
+        - accountId
+        - siteId
+        - siteName
+        - missingGroups
+        - requiredGroups
+        - availableGroups
+    TokenCandidateResponse:
+      type: object
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/TokenCandidateModelToken'
+        modelsWithoutToken:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/TokenCandidateAccount'
+        modelsMissingTokenGroups:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/TokenCandidateMissingGroup'
+        endpointTypesByModel:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+      required:
+        - models
+        - modelsWithoutToken
+        - modelsMissingTokenGroups
+        - endpointTypesByModel
+    ModelRefreshResult:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        refreshed:
+          type: boolean
+        status:
+          type: string
+        errorCode:
+          type: string
+          nullable: true
+        errorMessage:
+          type: string
+          nullable: true
+        modelCount:
+          type: integer
+        modelsPreview:
+          type: array
+          items:
+            type: string
+        tokenScanned:
+          type: integer
+          nullable: true
+        discoveredByCredential:
+          type: boolean
+          nullable: true
+        discoveredApiToken:
+          type: boolean
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+      required:
+        - accountId
+        - refreshed
+        - status
+        - modelCount
+        - modelsPreview
+    RouteRebuildResult:
+      type: object
+      properties:
+        models:
+          type: integer
+        createdRoutes:
+          type: integer
+        createdChannels:
+          type: integer
+        removedChannels:
+          type: integer
+        removedRoutes:
+          type: integer
+      required:
+        - models
+        - createdRoutes
+        - createdChannels
+        - removedChannels
+        - removedRoutes
+    ModelCheckResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        refresh:
+          $ref: '#/components/schemas/ModelRefreshResult'
+        rebuild:
+          $ref: '#/components/schemas/RouteRebuildResult'
+        error:
+          type: string
+      required:
+        - success
+    SiteDistributionItem:
+      type: object
+      properties:
+        siteId:
+          type: integer
+        siteName:
+          type: string
+        platform:
+          type: string
+          nullable: true
+        totalBalance:
+          type: number
+        totalSpend:
+          type: number
+        accountCount:
+          type: integer
+      required:
+        - siteId
+        - siteName
+        - totalBalance
+        - totalSpend
+        - accountCount
+    SiteDistributionResponse:
+      type: object
+      properties:
+        distribution:
+          type: array
+          items:
+            $ref: '#/components/schemas/SiteDistributionItem'
+      required:
+        - distribution
+    SiteTrendSiteStats:
+      type: object
+      properties:
+        spend:
+          type: number
+        calls:
+          type: integer
+      required:
+        - spend
+        - calls
+    SiteTrendEntry:
+      type: object
+      properties:
+        date:
+          type: string
+        sites:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SiteTrendSiteStats'
+      required:
+        - date
+        - sites
+    SiteTrendResponse:
+      type: object
+      properties:
+        trend:
+          type: array
+          items:
+            $ref: '#/components/schemas/SiteTrendEntry'
+      required:
+        - trend
+    ModelBySiteItem:
+      type: object
+      properties:
+        model:
+          type: string
+        calls:
+          type: integer
+        spend:
+          type: number
+        tokens:
+          type: integer
+      required:
+        - model
+        - calls
+        - spend
+        - tokens
+    ModelBySiteResponse:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelBySiteItem'
+      required:
+        - models
+    TaskDetailResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        task:
+          $ref: '#/components/schemas/BackgroundTask'
+        message:
+          type: string
+      required:
+        - success
 
 paths:
   /api/sites:
@@ -1589,8 +2378,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DashboardStats'
   /api/stats/proxy-logs:
     get:
       tags: [Stats]
@@ -1632,8 +2420,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ProxyLogListResponse'
   /api/stats/proxy-logs/{id}:
     get:
       tags: [Stats]
@@ -1674,8 +2461,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ModelMarketplaceResponse'
   /api/models/token-candidates:
     get:
       tags: [Stats]
@@ -1688,8 +2474,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/TokenCandidateResponse'
   /api/models/check/{accountId}:
     post:
       tags: [Stats]
@@ -1708,8 +2493,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ModelCheckResponse'
   /api/stats/site-distribution:
     get:
       tags: [Stats]
@@ -1722,8 +2506,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/SiteDistributionResponse'
   /api/stats/site-trend:
     get:
       tags: [Stats]
@@ -1741,8 +2524,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/SiteTrendResponse'
   /api/stats/model-by-site:
     get:
       tags: [Stats]
@@ -1764,8 +2546,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ModelBySiteResponse'
 
   /api/search:
     post:
@@ -1922,8 +2703,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/TaskDetailResponse'
 
   /api/settings/auth/info:
     get:
@@ -2920,6 +3700,7 @@ paths:
           required: true
           schema:
             type: string
+          description: 通配符路径，实际可包含冒号动作段，示例 `models/gemini-2.5-flash:generateContent`。OpenAPI 无法精确表达该通配符。
       responses:
         '200':
           description: Gemini 响应
@@ -2948,6 +3729,7 @@ paths:
           required: true
           schema:
             type: string
+          description: 通配符路径，实际可包含冒号动作段，示例 `models/gemini-2.5-flash:generateContent`。OpenAPI 无法精确表达该通配符。
       responses:
         '200':
           description: Gemini 响应
