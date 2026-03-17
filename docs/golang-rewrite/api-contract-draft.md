@@ -88,10 +88,18 @@
 | `accountId` | number | 账号 ID |
 | `name` | string | Token 名称 |
 | `token` | string | Token 明文（部分接口脱敏） |
+| `tokenMasked` | string? | 脱敏 Token（列表接口返回） |
 | `tokenGroup` | string? | 分组 |
+| `valueStatus` | string | `ready` / `masked_pending` |
 | `source` | string | `manual` / `sync` / `legacy` |
 | `enabled` | boolean | 是否启用 |
 | `isDefault` | boolean | 是否默认 |
+
+`valueStatus` 说明：
+| 状态 | 说明 |
+| --- | --- |
+| `ready` | 已保存明文，可用于路由与查看 |
+| `masked_pending` | 仅保存脱敏令牌，需同步或手动补全 |
 
 ### 4.4 TokenRoute / RouteChannel
 
@@ -122,6 +130,13 @@ RouteChannel：
 | `successCount` | number | 成功数 |
 | `failCount` | number | 失败数 |
 | `cooldownUntil` | string? | 冷却截止 |
+
+RouteChannelView（带关联信息）：
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `account` | object | 账号对象（`Account`） |
+| `site` | object | 站点对象（`Site`） |
+| `token` | object? | 令牌摘要（`{ id, name, accountId, enabled, isDefault }`） |
 
 ### 4.5 ProxyLog
 
@@ -250,7 +265,7 @@ Task：
 | POST | `/api/checkin/trigger` | 无 | `{ success, ... }` | 触发全部账号签到 |
 | POST | `/api/checkin/trigger/:id` | 无 | `{ success, ... }` | 单账号签到 |
 | GET | `/api/checkin/logs` | `limit?` `offset?` `accountId?` | `CheckinLogRow[]` | 直接返回数组（含 join 字段） |
-| PUT | `/api/checkin/schedule` | `{ cron }` | `{ success }` | 更新签到 Cron |
+| PUT | `/api/checkin/schedule` | `{ cron }` | `{ success, cron }` 或 `{ error }` | 更新签到 Cron |
 
 `CheckinLog`：
 
@@ -289,20 +304,20 @@ Task：
 | GET | `/api/routes` | 无 | 路由列表 | 含通道与统计信息 |
 | GET | `/api/routes/lite` | 无 | 路由简版列表 | 用于设置页 |
 | GET | `/api/routes/summary` | 无 | 路由摘要 | UI 预览 |
-| GET | `/api/routes/:id/channels` | 无 | 通道列表 | 单路由下通道 |
-| POST | `/api/routes/:id/channels` | `{ accountId, tokenId?, sourceModel?, priority?, weight? }` | `{ success, channel }` | 手动新增通道 |
-| POST | `/api/routes/:id/channels/batch` | `{ channels }` | `{ success, created }` | 批量新增 |
-| PUT | `/api/routes/:id` | `{ modelPattern?, displayName?, displayIcon?, modelMapping?, routingStrategy?, enabled? }` | `{ success, route }` | 更新路由 |
-| POST | `/api/routes` | 同上 | 新建路由 |  |
+| GET | `/api/routes/:id/channels` | 无 | `RouteChannelView[]` | 单路由下通道 |
+| POST | `/api/routes/:id/channels` | `{ accountId, tokenId?, sourceModel?, priority?, weight? }` | `RouteChannel` | 手动新增通道 |
+| POST | `/api/routes/:id/channels/batch` | `{ channels }` | `{ success, created, skipped, errors }` | 批量新增 |
+| PUT | `/api/routes/:id` | `{ modelPattern?, displayName?, displayIcon?, modelMapping?, routingStrategy?, enabled? }` | `Route` 或 `{ success, message }` | 更新路由 |
+| POST | `/api/routes` | 同上 | `Route` 或 `{ success, message }` | 新建路由 |
 | DELETE | `/api/routes/:id` | 无 | `{ success: true }` | 删除路由 |
-| PUT | `/api/channels/:channelId` | `{ priority?, weight?, enabled?, tokenId?, sourceModel? }` | `{ success, channel }` | 更新通道 |
-| PUT | `/api/channels/batch` | `{ updates: [{ id, priority }] }` | `{ success }` | 批量调整优先级 |
+| PUT | `/api/channels/:channelId` | `{ priority?, weight?, enabled?, tokenId?, sourceModel? }` | `RouteChannel` 或 `{ success, message }` | 更新通道 |
+| PUT | `/api/channels/batch` | `{ updates: [{ id, priority }] }` | `{ success, channels }` | 批量调整优先级 |
 | DELETE | `/api/channels/:channelId` | 无 | `{ success: true }` | 删除通道 |
-| POST | `/api/routes/rebuild` | `{ refreshModels?, wait? }` | `{ success, refresh?, rebuild? }` | 路由重建 |
-| GET | `/api/routes/decision` | `?model=` | 路由决策解释 | 单模型 |
-| POST | `/api/routes/decision/batch` | `{ models, refreshPricingCatalog?, persistSnapshots? }` | 决策列表 | 多模型 |
-| POST | `/api/routes/decision/by-route/batch` | `{ items, refreshPricingCatalog?, persistSnapshots? }` | 决策列表 | 指定路由 |
-| POST | `/api/routes/decision/route-wide/batch` | `{ routeIds, refreshPricingCatalog?, persistSnapshots? }` | 决策列表 | 路由级解释 |
+| POST | `/api/routes/rebuild` | `{ refreshModels?, wait? }` | `200: { success, refresh?, rebuild? }` `202: { success, queued, jobId, status, message }` | 路由重建 |
+| GET | `/api/routes/decision` | `?model=` | `{ success, decision }` | 单模型 |
+| POST | `/api/routes/decision/batch` | `{ models, refreshPricingCatalog?, persistSnapshots? }` | `{ success, decisions }` | 多模型 |
+| POST | `/api/routes/decision/by-route/batch` | `{ items, refreshPricingCatalog?, persistSnapshots? }` | `{ success, decisions }` | 指定路由 |
+| POST | `/api/routes/decision/route-wide/batch` | `{ routeIds, refreshPricingCatalog?, persistSnapshots? }` | `{ success, decisions }` | 路由级解释 |
 
 ### 5.6 模型与统计
 
@@ -317,6 +332,7 @@ Task：
 | GET | `/api/stats/site-distribution` | 无 | 站点分布 | 图表数据 |
 | GET | `/api/stats/site-trend` | `days?` | 站点趋势 | 图表数据 |
 | GET | `/api/stats/model-by-site` | `siteId?` `days?` | 模型消耗 | 图表数据 |
+| POST | `/api/search` | `{ query, limit? }` | `SearchResponse` | 统一搜索 |
 
 #### 5.6.1 DashboardStats
 
@@ -610,6 +626,26 @@ Task：
 | --- | --- | --- |
 | `trend` | object[] | 站点趋势列表 |
 
+#### 5.6.7 SearchResponse
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `accounts` | object[] | 账号搜索结果（`SearchAccountItem`） |
+| `accountTokens` | object[] | 令牌搜索结果（`SearchAccountTokenItem`） |
+| `sites` | object[] | 站点搜索结果（`Site`） |
+| `checkinLogs` | object[] | 签到记录（`SearchCheckinLogItem`） |
+| `proxyLogs` | object[] | 代理日志（`ProxyLogListItem`） |
+| `models` | object[] | 模型聚合（`SearchModelItem`） |
+
+`SearchAccountTokenItem` 说明：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `token` | string | 令牌值（可能为脱敏值） |
+| `valueStatus` | string | `ready` / `masked_pending` |
+| `account` | object | `{ id, username?, segment }` |
+| `site` | object | 站点对象（`Site`） |
+
 `trend` 单项：
 
 | 字段 | 类型 | 说明 |
@@ -657,63 +693,69 @@ Task：
 | --- | --- | --- | --- | --- |
 | GET | `/api/settings/auth/info` | 无 | `{ masked }` | 展示当前 Token |
 | POST | `/api/settings/auth/change` | `{ oldToken, newToken }` | `{ success, message }` | 修改管理员 Token |
-| GET | `/api/settings/runtime` | 无 | 运行时配置 | 含当前 IP 等 |
-| PUT | `/api/settings/runtime` | 运行时配置字段 | `{ success, message? }` | 校验通知配置 |
-| GET | `/api/settings/database/runtime` | 无 | 当前 DB 配置 |  |
-| PUT | `/api/settings/database/runtime` | `{ dialect, connectionString, ssl? }` | `{ success, ... }` | 更新 DB 配置 |
-| POST | `/api/settings/database/test-connection` | 同上 | `{ success, message }` | 测试连接 |
-| POST | `/api/settings/database/migrate` | `{ dialect, connectionString, overwrite?, ssl? }` | `{ success, ... }` | 触发迁移 |
-| GET | `/api/settings/backup/export` | `type?` | 导出 JSON | `type` 可选 `all` `accounts` `preferences` |
-| POST | `/api/settings/backup/import` | `{ data }` | `{ success, appliedSettings }` | 导入 JSON |
+| GET | `/api/settings/runtime` | 无 | `RuntimeSettings` | 含当前 IP 等 |
+| PUT | `/api/settings/runtime` | 运行时配置字段 | `{ ...RuntimeSettings, success, message }` | 校验通知配置 |
+| GET | `/api/settings/database/runtime` | 无 | `DatabaseRuntimeResponse` |  |
+| PUT | `/api/settings/database/runtime` | `{ dialect, connectionString, ssl? }` | `DatabaseRuntimeUpdateResponse` | 更新 DB 配置 |
+| POST | `/api/settings/database/test-connection` | 同上 | `{ success, message, dialect, connection }` | 测试连接 |
+| POST | `/api/settings/database/migrate` | `{ dialect, connectionString, overwrite?, ssl? }` | `DatabaseMigrationResponse` | 触发迁移 |
+| GET | `/api/settings/backup/export` | `type?` | `BackupExportResponse` | `type` 可选 `all` `accounts` `preferences` |
+| POST | `/api/settings/backup/import` | `{ data }` | `BackupImportResponse` | 导入 JSON |
 | POST | `/api/settings/notify/test` | 无 | `{ success }` | 测试通知 |
 | POST | `/api/settings/maintenance/clear-cache` | 无 | `{ success }` | 清理缓存 |
 | POST | `/api/settings/maintenance/clear-usage` | 无 | `{ success }` | 清理使用日志 |
 | POST | `/api/settings/maintenance/factory-reset` | 无 | `{ success }` | 恢复出厂 |
 
 运行时配置字段（`/api/settings/runtime`）核心项：
-- `proxyToken`、`systemProxyUrl`
+- `proxyToken`、`proxyTokenMasked`、`systemProxyUrl`
 - `checkinCron`、`balanceRefreshCron`
 - `logCleanupCron`、`logCleanupUsageLogsEnabled`、`logCleanupProgramLogsEnabled`、`logCleanupRetentionDays`
 - `routingFallbackUnitCost`、`routingWeights`
 - `webhookUrl`、`webhookEnabled`
 - `barkUrl`、`barkEnabled`
-- `serverChanKey`、`serverChanEnabled`
-- `telegramEnabled`、`telegramBotToken`、`telegramChatId`
-- `smtpEnabled`、`smtpHost`、`smtpPort`、`smtpSecure`、`smtpUser`、`smtpPass`、`smtpFrom`、`smtpTo`
+- `serverChanKey`、`serverChanKeyMasked`、`serverChanEnabled`
+- `telegramEnabled`、`telegramBotToken`、`telegramBotTokenMasked`、`telegramChatId`
+- `smtpEnabled`、`smtpHost`、`smtpPort`、`smtpSecure`、`smtpUser`、`smtpPass`、`smtpPassMasked`、`smtpFrom`、`smtpTo`
 - `notifyCooldownSec`
 - `adminIpAllowlist`
+
+说明：GET 返回的敏感字段均为脱敏值，PUT 需要提供明文值。
 
 ### 5.9 下游托管 Key
 
 | 方法 | 路径 | 请求 | 响应 | 备注 |
 | --- | --- | --- | --- | --- |
 | GET | `/api/downstream-keys` | 无 | `{ success, items }` | 列表 |
-| POST | `/api/downstream-keys` | `name` `key` `description?` `enabled?` `expiresAt?` `maxCost?` `maxRequests?` `supportedModels?` `allowedRouteIds?` `siteWeightMultipliers?` | `{ success, item }` | `key` 需 `sk-` 前缀 |
+| POST | `/api/downstream-keys` | `name` `key` `description?` `groupName?` `tags?` `enabled?` `expiresAt?` `maxCost?` `maxRequests?` `supportedModels?` `allowedRouteIds?` `siteWeightMultipliers?` | `{ success, item }` | `key` 需 `sk-` 前缀 |
 | PUT | `/api/downstream-keys/:id` | 同上 | `{ success, item }` |  |
 | POST | `/api/downstream-keys/:id/reset-usage` | 无 | `{ success, item }` | 重置费用与请求数 |
 | DELETE | `/api/downstream-keys/:id` | 无 | `{ success: true }` |  |
+| GET | `/api/downstream-keys/summary` | `range?` `status?` `search?` `group?` `tags?` `tagMatch?` | `DownstreamKeySummaryResponse` | 汇总列表 |
+| GET | `/api/downstream-keys/:id/overview` | 无 | `DownstreamKeyOverviewResponse` | 概览与分段使用 |
+| GET | `/api/downstream-keys/:id/trend` | `range?` | `DownstreamKeyTrendResponse` | 趋势桶 |
+| POST | `/api/downstream-keys/batch` | `{ ids, action, groupOperation?, groupName?, tagOperation?, tags? }` | `{ success, successIds, failedItems }` | action: `enable` `disable` `delete` `resetUsage` `updateMetadata` |
 
 ### 5.10 监控
 
 | 方法 | 路径 | 请求 | 响应 | 备注 |
 | --- | --- | --- | --- | --- |
-| GET | `/api/monitor/config` | 无 | `{ config }` | 前端监控配置 |
-| PUT | `/api/monitor/config` | `{ ldohCookie? }` | `{ success }` | 更新配置 |
-| POST | `/api/monitor/session` | 无 | `{ session }` | 初始化会话 |
+| GET | `/api/monitor/config` | 无 | `{ ldohCookieConfigured, ldohCookieMasked }` | 前端监控配置 |
+| PUT | `/api/monitor/config` | `{ ldohCookie? }` | `{ success, message, ldohCookieConfigured, ldohCookieMasked? }` | 更新配置 |
+| POST | `/api/monitor/session` | 无 | `{ success: true }` | 初始化会话 |
 
 ### 5.11 测试工具
 
 | 方法 | 路径 | 请求 | 响应 | 备注 |
 | --- | --- | --- | --- | --- |
-| POST | `/api/test/proxy` | `ProxyTestEnvelope` | 代理测试响应 | 同步 |
+| POST | `/api/test/proxy` | `ProxyTestEnvelope` | 透传上游响应 | 同步 |
 | POST | `/api/test/proxy/stream` | `ProxyTestEnvelope` | SSE | 流式 |
 | POST | `/api/test/proxy/jobs` | `ProxyTestEnvelope` | `{ jobId, status, createdAt, expiresAt }` | 异步任务 |
-| GET | `/api/test/proxy/jobs/:jobId` | 无 | `{ jobId, status, result?, error? }` | 查询任务 |
+| GET | `/api/test/proxy/jobs/:jobId` | 无 | `{ jobId, status, result?, error?, createdAt, updatedAt, expiresAt }` | 查询任务 |
 | DELETE | `/api/test/proxy/jobs/:jobId` | 无 | `{ success: true }` | 取消任务 |
-| POST | `/api/test/chat` | `TestChatRequestBody` | 代理测试响应 | 同步 |
+| POST | `/api/test/chat` | `TestChatRequestBody` | 透传上游响应 | 同步 |
 | POST | `/api/test/chat/stream` | `TestChatRequestBody` | SSE | 流式 |
 | POST | `/api/test/chat/jobs` | `TestChatRequestBody` | `{ jobId, status, createdAt, expiresAt }` | 异步任务 |
-| GET | `/api/test/chat/jobs/:jobId` | 无 | `{ jobId, status, result?, error? }` | 查询任务 |
+| GET | `/api/test/chat/jobs/:jobId` | 无 | `{ jobId, status, result?, error?, createdAt, updatedAt, expiresAt }` | 查询任务 |
 | DELETE | `/api/test/chat/jobs/:jobId` | 无 | `{ success: true }` | 取消任务 |
 
 `ProxyTestEnvelope` 关键字段：

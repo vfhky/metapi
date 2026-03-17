@@ -269,6 +269,8 @@ components:
         tokenGroup:
           type: string
           nullable: true
+        valueStatus:
+          type: string
         source:
           type: string
         enabled:
@@ -445,7 +447,6 @@ components:
             billingDetails:
               type: object
               nullable: true
-              additionalProperties: true
     DownstreamApiKey:
       type: object
       properties:
@@ -460,6 +461,13 @@ components:
         description:
           type: string
           nullable: true
+        groupName:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
         enabled:
           type: boolean
         expiresAt:
@@ -1350,6 +1358,1642 @@ components:
           type: string
       required:
         - success
+    QueuedTaskResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        queued:
+          type: boolean
+        reused:
+          type: boolean
+        jobId:
+          type: string
+        status:
+          type: string
+        message:
+          type: string
+      required:
+        - success
+        - queued
+        - reused
+        - jobId
+        - message
+    SiteDetectResponse:
+      type: object
+      properties:
+        platform:
+          type: string
+        title:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+    UserInfo:
+      type: object
+      properties:
+        username:
+          type: string
+        displayName:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        role:
+          type: integer
+          nullable: true
+      required:
+        - username
+    BalanceInfo:
+      type: object
+      properties:
+        balance:
+          type: number
+        used:
+          type: number
+        quota:
+          type: number
+        todayIncome:
+          type: number
+          nullable: true
+        todayQuotaConsumption:
+          type: number
+          nullable: true
+      required:
+        - balance
+        - used
+        - quota
+    AccountLoginSuccess:
+      type: object
+      properties:
+        success:
+          type: boolean
+        account:
+          $ref: '#/components/schemas/Account'
+        apiTokenFound:
+          type: boolean
+        tokenCount:
+          type: integer
+        reusedAccount:
+          type: boolean
+      required:
+        - success
+        - account
+        - apiTokenFound
+        - tokenCount
+        - reusedAccount
+    AccountLoginFailure:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        shieldBlocked:
+          type: boolean
+      required:
+        - success
+        - message
+    AccountLoginResponse:
+      oneOf:
+        - $ref: '#/components/schemas/AccountLoginSuccess'
+        - $ref: '#/components/schemas/AccountLoginFailure'
+    AccountVerifyTokenSession:
+      type: object
+      properties:
+        success:
+          type: boolean
+        tokenType:
+          type: string
+        userInfo:
+          $ref: '#/components/schemas/UserInfo'
+          nullable: true
+        balance:
+          $ref: '#/components/schemas/BalanceInfo'
+          nullable: true
+        apiToken:
+          type: string
+          nullable: true
+      required:
+        - success
+        - tokenType
+    AccountVerifyTokenApiKey:
+      type: object
+      properties:
+        success:
+          type: boolean
+        tokenType:
+          type: string
+        modelCount:
+          type: integer
+        models:
+          type: array
+          items:
+            type: string
+      required:
+        - success
+        - tokenType
+        - modelCount
+    AccountVerifyTokenFailure:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        needsUserId:
+          type: boolean
+        invalidUserId:
+          type: boolean
+        shieldBlocked:
+          type: boolean
+      required:
+        - success
+        - message
+    AccountVerifyTokenResponse:
+      oneOf:
+        - $ref: '#/components/schemas/AccountVerifyTokenSession'
+        - $ref: '#/components/schemas/AccountVerifyTokenApiKey'
+        - $ref: '#/components/schemas/AccountVerifyTokenFailure'
+    AccountCreateResponse:
+      allOf:
+        - $ref: '#/components/schemas/Account'
+        - type: object
+          properties:
+            tokenType:
+              type: string
+            credentialMode:
+              type: string
+            capabilities:
+              $ref: '#/components/schemas/AccountCapabilities'
+            modelCount:
+              type: integer
+            apiTokenFound:
+              type: boolean
+            usernameDetected:
+              type: boolean
+    AccountRebindSuccess:
+      type: object
+      properties:
+        success:
+          type: boolean
+        account:
+          $ref: '#/components/schemas/Account'
+        tokenType:
+          type: string
+        credentialMode:
+          type: string
+        capabilities:
+          $ref: '#/components/schemas/AccountCapabilities'
+        apiTokenFound:
+          type: boolean
+      required:
+        - success
+        - tokenType
+        - credentialMode
+        - apiTokenFound
+    AccountRebindFailure:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+        - message
+    AccountRebindResponse:
+      oneOf:
+        - $ref: '#/components/schemas/AccountRebindSuccess'
+        - $ref: '#/components/schemas/AccountRebindFailure'
+    AccountHealthRefreshResult:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        username:
+          type: string
+          nullable: true
+        siteName:
+          type: string
+        status:
+          type: string
+        state:
+          type: string
+        message:
+          type: string
+      required:
+        - accountId
+        - siteName
+        - status
+        - state
+        - message
+    AccountHealthRefreshSummary:
+      type: object
+      properties:
+        total:
+          type: integer
+        healthy:
+          type: integer
+        unhealthy:
+          type: integer
+        degraded:
+          type: integer
+        disabled:
+          type: integer
+        unknown:
+          type: integer
+        success:
+          type: integer
+        failed:
+          type: integer
+        skipped:
+          type: integer
+      required:
+        - total
+        - healthy
+        - unhealthy
+        - degraded
+        - disabled
+        - unknown
+        - success
+        - failed
+        - skipped
+    AccountHealthRefreshResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        summary:
+          $ref: '#/components/schemas/AccountHealthRefreshSummary'
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountHealthRefreshResult'
+      required:
+        - success
+        - summary
+        - results
+    AccountBalanceRefreshResponse:
+      allOf:
+        - $ref: '#/components/schemas/BalanceInfo'
+        - type: object
+          properties:
+            skipped:
+              type: boolean
+            reason:
+              type: string
+              nullable: true
+    AccountTokenListItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        accountId:
+          type: integer
+        name:
+          type: string
+        tokenGroup:
+          type: string
+          nullable: true
+        valueStatus:
+          type: string
+        source:
+          type: string
+        enabled:
+          type: boolean
+        isDefault:
+          type: boolean
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+        tokenMasked:
+          type: string
+        account:
+          type: object
+          properties:
+            id:
+              type: integer
+            username:
+              type: string
+              nullable: true
+            status:
+              type: string
+          required:
+            - id
+        site:
+          $ref: '#/components/schemas/Site'
+      required:
+        - id
+        - accountId
+        - name
+        - tokenMasked
+        - account
+        - site
+    AccountTokenGroupsResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        groups:
+          type: array
+          items:
+            type: string
+      required:
+        - success
+        - groups
+    AccountTokenValueResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        id:
+          type: integer
+        name:
+          type: string
+        token:
+          type: string
+        tokenMasked:
+          type: string
+      required:
+        - success
+    AccountTokenSyncResult:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        accountName:
+          type: string
+        accountStatus:
+          type: string
+          nullable: true
+        siteId:
+          type: integer
+        siteName:
+          type: string
+        siteStatus:
+          type: string
+          nullable: true
+        status:
+          type: string
+        reason:
+          type: string
+          nullable: true
+        message:
+          type: string
+          nullable: true
+        synced:
+          type: boolean
+        created:
+          type: integer
+        updated:
+          type: integer
+        maskedPending:
+          type: integer
+          nullable: true
+        pendingTokenIds:
+          type: array
+          items:
+            type: integer
+        total:
+          type: integer
+        defaultTokenId:
+          type: integer
+          nullable: true
+      required:
+        - accountId
+        - accountName
+        - siteId
+        - siteName
+        - status
+        - synced
+        - created
+        - updated
+        - total
+    AccountTokenSyncResponse:
+      allOf:
+        - $ref: '#/components/schemas/AccountTokenSyncResult'
+        - type: object
+          properties:
+            success:
+              type: boolean
+          required:
+            - success
+    AccountTokenSyncSummary:
+      type: object
+      properties:
+        total:
+          type: integer
+        synced:
+          type: integer
+        skipped:
+          type: integer
+        failed:
+          type: integer
+        created:
+          type: integer
+        updated:
+          type: integer
+      required:
+        - total
+        - synced
+        - skipped
+        - failed
+        - created
+        - updated
+    CoverageRefreshRebuildResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        result:
+          $ref: '#/components/schemas/RouteRebuildResult'
+        error:
+          type: string
+          nullable: true
+      required:
+        - success
+    CoverageRefreshResult:
+      type: object
+      properties:
+        refresh:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelRefreshResult'
+        rebuild:
+          $ref: '#/components/schemas/CoverageRefreshRebuildResult'
+      required:
+        - refresh
+        - rebuild
+    AccountTokenSyncAllResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        summary:
+          $ref: '#/components/schemas/AccountTokenSyncSummary'
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountTokenSyncResult'
+        coverageRefresh:
+          $ref: '#/components/schemas/CoverageRefreshResult'
+      required:
+        - success
+        - summary
+        - results
+        - coverageRefresh
+    AccountTokenCreateDirectResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        token:
+          $ref: '#/components/schemas/AccountToken'
+      required:
+        - success
+        - token
+    AccountTokenCreateUpstreamResponse:
+      allOf:
+        - $ref: '#/components/schemas/AccountTokenSyncResult'
+        - type: object
+          properties:
+            success:
+              type: boolean
+            createdViaUpstream:
+              type: boolean
+            token:
+              $ref: '#/components/schemas/AccountToken'
+          required:
+            - success
+            - createdViaUpstream
+    AccountTokenCreateResponse:
+      oneOf:
+        - $ref: '#/components/schemas/AccountTokenCreateDirectResponse'
+        - $ref: '#/components/schemas/AccountTokenCreateUpstreamResponse'
+    CheckinExecutionResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        status:
+          type: string
+        message:
+          type: string
+        reward:
+          type: string
+          nullable: true
+        skipped:
+          type: boolean
+        reason:
+          type: string
+          nullable: true
+      required:
+        - success
+        - status
+        - message
+    CheckinScheduleResponse:
+      oneOf:
+        - type: object
+          properties:
+            success:
+              type: boolean
+            cron:
+              type: string
+          required:
+            - success
+            - cron
+        - type: object
+          properties:
+            error:
+              type: string
+          required:
+            - error
+    RouteChannelTokenRef:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        accountId:
+          type: integer
+        enabled:
+          type: boolean
+        isDefault:
+          type: boolean
+      required:
+        - id
+        - name
+        - accountId
+    RouteChannelView:
+      allOf:
+        - $ref: '#/components/schemas/RouteChannel'
+        - type: object
+          properties:
+            account:
+              $ref: '#/components/schemas/Account'
+            site:
+              $ref: '#/components/schemas/Site'
+            token:
+              $ref: '#/components/schemas/RouteChannelTokenRef'
+          required:
+            - account
+            - site
+    TokenRouteLite:
+      type: object
+      properties:
+        id:
+          type: integer
+        modelPattern:
+          type: string
+        displayName:
+          type: string
+          nullable: true
+        displayIcon:
+          type: string
+          nullable: true
+        routingStrategy:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+      required:
+        - id
+        - modelPattern
+        - enabled
+    TokenRouteSummary:
+      type: object
+      properties:
+        id:
+          type: integer
+        modelPattern:
+          type: string
+        displayName:
+          type: string
+          nullable: true
+        displayIcon:
+          type: string
+          nullable: true
+        modelMapping:
+          type: string
+          nullable: true
+        routingStrategy:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        channelCount:
+          type: integer
+        enabledChannelCount:
+          type: integer
+        siteNames:
+          type: array
+          items:
+            type: string
+        decisionSnapshot:
+          type: object
+          nullable: true
+        decisionRefreshedAt:
+          type: string
+          nullable: true
+      required:
+        - id
+        - modelPattern
+        - enabled
+        - channelCount
+        - enabledChannelCount
+        - siteNames
+    TokenRouteWithChannels:
+      allOf:
+        - $ref: '#/components/schemas/TokenRoute'
+        - type: object
+          properties:
+            channels:
+              type: array
+              items:
+                $ref: '#/components/schemas/RouteChannelView'
+          required:
+            - channels
+    RouteDecisionResult:
+      type: object
+      description: 路由决策快照，字段结构随算法演进
+    RouteDecisionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        decision:
+          $ref: '#/components/schemas/RouteDecisionResult'
+      required:
+        - success
+        - decision
+    RouteDecisionBatchResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        decisions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/RouteDecisionResult'
+      required:
+        - success
+        - decisions
+    RouteDecisionByRouteBatchResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        decisions:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              $ref: '#/components/schemas/RouteDecisionResult'
+      required:
+        - success
+        - decisions
+    RouteDecisionRouteWideBatchResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        decisions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/RouteDecisionResult'
+      required:
+        - success
+        - decisions
+    RouteChannelBatchCreateResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        created:
+          type: integer
+        skipped:
+          type: integer
+        errors:
+          type: array
+          items:
+            type: string
+      required:
+        - success
+        - created
+        - skipped
+        - errors
+    RouteChannelBatchUpdateResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/RouteChannel'
+      required:
+        - success
+        - channels
+    RouteRebuildResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        refresh:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelRefreshResult'
+        rebuild:
+          $ref: '#/components/schemas/RouteRebuildResult'
+      required:
+        - success
+    SearchAccountItem:
+      allOf:
+        - $ref: '#/components/schemas/Account'
+        - type: object
+          properties:
+            segment:
+              type: string
+            site:
+              $ref: '#/components/schemas/Site'
+    SearchAccountTokenItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        accountId:
+          type: integer
+        name:
+          type: string
+        token:
+          type: string
+        tokenGroup:
+          type: string
+          nullable: true
+        valueStatus:
+          type: string
+        source:
+          type: string
+        enabled:
+          type: boolean
+        isDefault:
+          type: boolean
+        createdAt:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          nullable: true
+        account:
+          type: object
+          properties:
+            id:
+              type: integer
+            username:
+              type: string
+              nullable: true
+            segment:
+              type: string
+          required:
+            - id
+        site:
+          $ref: '#/components/schemas/Site'
+      required:
+        - id
+        - accountId
+        - name
+        - token
+        - account
+        - site
+    SearchCheckinLogItem:
+      allOf:
+        - $ref: '#/components/schemas/CheckinLog'
+        - type: object
+          properties:
+            account:
+              $ref: '#/components/schemas/Account'
+    SearchModelItem:
+      type: object
+      properties:
+        name:
+          type: string
+        accountCount:
+          type: integer
+        tokenCount:
+          type: integer
+        siteCount:
+          type: integer
+      required:
+        - name
+        - accountCount
+        - tokenCount
+        - siteCount
+    SearchResponse:
+      type: object
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchAccountItem'
+        accountTokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchAccountTokenItem'
+        sites:
+          type: array
+          items:
+            $ref: '#/components/schemas/Site'
+        checkinLogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchCheckinLogItem'
+        proxyLogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyLogListItem'
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchModelItem'
+      required:
+        - accounts
+        - accountTokens
+        - sites
+        - checkinLogs
+        - proxyLogs
+        - models
+    RuntimeSettings:
+      type: object
+      properties:
+        checkinCron:
+          type: string
+        balanceRefreshCron:
+          type: string
+        logCleanupCron:
+          type: string
+        logCleanupUsageLogsEnabled:
+          type: boolean
+        logCleanupProgramLogsEnabled:
+          type: boolean
+        logCleanupRetentionDays:
+          type: integer
+        routingFallbackUnitCost:
+          type: number
+        routingWeights:
+          type: object
+          additionalProperties:
+            type: number
+        webhookUrl:
+          type: string
+          nullable: true
+        barkUrl:
+          type: string
+          nullable: true
+        webhookEnabled:
+          type: boolean
+        barkEnabled:
+          type: boolean
+        serverChanEnabled:
+          type: boolean
+        serverChanKeyMasked:
+          type: string
+        telegramEnabled:
+          type: boolean
+        telegramApiBaseUrl:
+          type: string
+          nullable: true
+        telegramBotTokenMasked:
+          type: string
+        telegramChatId:
+          type: string
+          nullable: true
+        smtpEnabled:
+          type: boolean
+        smtpHost:
+          type: string
+          nullable: true
+        smtpPort:
+          type: integer
+          nullable: true
+        smtpSecure:
+          type: boolean
+        smtpUser:
+          type: string
+          nullable: true
+        smtpPassMasked:
+          type: string
+        smtpFrom:
+          type: string
+          nullable: true
+        smtpTo:
+          type: string
+          nullable: true
+        notifyCooldownSec:
+          type: integer
+        adminIpAllowlist:
+          type: array
+          items:
+            type: string
+        currentAdminIp:
+          type: string
+        systemProxyUrl:
+          type: string
+          nullable: true
+        proxyTokenMasked:
+          type: string
+      required:
+        - checkinCron
+        - balanceRefreshCron
+        - logCleanupCron
+        - logCleanupUsageLogsEnabled
+        - logCleanupProgramLogsEnabled
+        - logCleanupRetentionDays
+        - routingFallbackUnitCost
+        - routingWeights
+        - webhookEnabled
+        - barkEnabled
+        - serverChanEnabled
+        - telegramEnabled
+        - smtpEnabled
+        - notifyCooldownSec
+        - adminIpAllowlist
+        - currentAdminIp
+        - proxyTokenMasked
+    RuntimeSettingsUpdateResponse:
+      allOf:
+        - $ref: '#/components/schemas/RuntimeSettings'
+        - type: object
+          properties:
+            success:
+              type: boolean
+            message:
+              type: string
+          required:
+            - success
+            - message
+    DatabaseConnectionInfo:
+      type: object
+      properties:
+        dialect:
+          type: string
+        connection:
+          type: string
+        ssl:
+          type: boolean
+      required:
+        - dialect
+        - connection
+        - ssl
+    DatabaseRuntimeState:
+      type: object
+      properties:
+        active:
+          $ref: '#/components/schemas/DatabaseConnectionInfo'
+        saved:
+          $ref: '#/components/schemas/DatabaseConnectionInfo'
+          nullable: true
+        restartRequired:
+          type: boolean
+      required:
+        - active
+        - restartRequired
+    DatabaseRuntimeResponse:
+      allOf:
+        - $ref: '#/components/schemas/DatabaseRuntimeState'
+        - type: object
+          properties:
+            success:
+              type: boolean
+          required:
+            - success
+    DatabaseRuntimeUpdateResponse:
+      allOf:
+        - $ref: '#/components/schemas/DatabaseRuntimeState'
+        - type: object
+          properties:
+            success:
+              type: boolean
+            message:
+              type: string
+          required:
+            - success
+            - message
+    DatabaseTestConnectionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        dialect:
+          type: string
+        connection:
+          type: string
+      required:
+        - success
+        - message
+        - dialect
+        - connection
+    DatabaseMigrationRowCounts:
+      type: object
+      properties:
+        sites:
+          type: integer
+        siteDisabledModels:
+          type: integer
+        accounts:
+          type: integer
+        accountTokens:
+          type: integer
+        tokenRoutes:
+          type: integer
+        routeChannels:
+          type: integer
+        checkinLogs:
+          type: integer
+        modelAvailability:
+          type: integer
+        tokenModelAvailability:
+          type: integer
+        proxyLogs:
+          type: integer
+        proxyVideoTasks:
+          type: integer
+        proxyFiles:
+          type: integer
+        downstreamApiKeys:
+          type: integer
+        events:
+          type: integer
+        settings:
+          type: integer
+      required:
+        - sites
+        - siteDisabledModels
+        - accounts
+        - accountTokens
+        - tokenRoutes
+        - routeChannels
+        - checkinLogs
+        - modelAvailability
+        - tokenModelAvailability
+        - proxyLogs
+        - proxyVideoTasks
+        - proxyFiles
+        - downstreamApiKeys
+        - events
+        - settings
+    DatabaseMigrationResult:
+      type: object
+      properties:
+        dialect:
+          type: string
+        connection:
+          type: string
+        overwrite:
+          type: boolean
+        version:
+          type: string
+        timestamp:
+          type: integer
+        rows:
+          $ref: '#/components/schemas/DatabaseMigrationRowCounts'
+      required:
+        - dialect
+        - connection
+        - version
+        - timestamp
+        - rows
+    DatabaseMigrationResponse:
+      allOf:
+        - $ref: '#/components/schemas/DatabaseMigrationResult'
+        - type: object
+          properties:
+            success:
+              type: boolean
+            message:
+              type: string
+          required:
+            - success
+            - message
+    BackupSettingItem:
+      type: object
+      properties:
+        key:
+          type: string
+        value:
+          oneOf:
+            - type: string
+            - type: number
+            - type: boolean
+            - type: object
+            - type: array
+      required:
+        - key
+    BackupAccountsSection:
+      type: object
+      properties:
+        sites:
+          type: array
+          items:
+            $ref: '#/components/schemas/Site'
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Account'
+        accountTokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountToken'
+        tokenRoutes:
+          type: array
+          items:
+            $ref: '#/components/schemas/TokenRoute'
+        routeChannels:
+          type: array
+          items:
+            $ref: '#/components/schemas/RouteChannel'
+      required:
+        - sites
+        - accounts
+        - accountTokens
+        - tokenRoutes
+        - routeChannels
+    BackupPreferencesSection:
+      type: object
+      properties:
+        settings:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackupSettingItem'
+      required:
+        - settings
+    BackupExportFull:
+      type: object
+      properties:
+        version:
+          type: string
+        timestamp:
+          type: integer
+        accounts:
+          $ref: '#/components/schemas/BackupAccountsSection'
+        preferences:
+          $ref: '#/components/schemas/BackupPreferencesSection'
+      required:
+        - version
+        - timestamp
+        - accounts
+        - preferences
+    BackupExportAccounts:
+      type: object
+      properties:
+        version:
+          type: string
+        timestamp:
+          type: integer
+        type:
+          type: string
+        accounts:
+          $ref: '#/components/schemas/BackupAccountsSection'
+      required:
+        - version
+        - timestamp
+        - type
+        - accounts
+    BackupExportPreferences:
+      type: object
+      properties:
+        version:
+          type: string
+        timestamp:
+          type: integer
+        type:
+          type: string
+        preferences:
+          $ref: '#/components/schemas/BackupPreferencesSection'
+      required:
+        - version
+        - timestamp
+        - type
+        - preferences
+    BackupExportResponse:
+      oneOf:
+        - $ref: '#/components/schemas/BackupExportFull'
+        - $ref: '#/components/schemas/BackupExportAccounts'
+        - $ref: '#/components/schemas/BackupExportPreferences'
+    BackupImportSections:
+      type: object
+      properties:
+        accounts:
+          type: boolean
+        preferences:
+          type: boolean
+      required:
+        - accounts
+        - preferences
+    BackupImportResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        allImported:
+          type: boolean
+        sections:
+          $ref: '#/components/schemas/BackupImportSections'
+        appliedSettings:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackupSettingItem'
+      required:
+        - success
+        - message
+        - allImported
+        - sections
+        - appliedSettings
+    ClearCacheResponse:
+      allOf:
+        - $ref: '#/components/schemas/QueuedTaskResponse'
+        - type: object
+          properties:
+            deletedModelAvailability:
+              type: integer
+            deletedRouteChannels:
+              type: integer
+            deletedTokenRoutes:
+              type: integer
+    ClearUsageResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        deletedProxyLogs:
+          type: integer
+      required:
+        - success
+        - message
+        - deletedProxyLogs
+    MonitorConfigResponse:
+      type: object
+      properties:
+        ldohCookieConfigured:
+          type: boolean
+        ldohCookieMasked:
+          type: string
+      required:
+        - ldohCookieConfigured
+        - ldohCookieMasked
+    MonitorConfigUpdateResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        ldohCookieConfigured:
+          type: boolean
+        ldohCookieMasked:
+          type: string
+      required:
+        - success
+        - message
+        - ldohCookieConfigured
+    DownstreamApiKeyMutationResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+          nullable: true
+        item:
+          $ref: '#/components/schemas/DownstreamApiKey'
+      required:
+        - success
+    DownstreamKeyRangeUsage:
+      type: object
+      properties:
+        totalRequests:
+          type: integer
+        successRequests:
+          type: integer
+        failedRequests:
+          type: integer
+        successRate:
+          type: number
+          nullable: true
+        totalTokens:
+          type: integer
+        totalCost:
+          type: number
+      required:
+        - totalRequests
+        - successRequests
+        - failedRequests
+        - totalTokens
+        - totalCost
+    DownstreamKeySummaryItem:
+      allOf:
+        - $ref: '#/components/schemas/DownstreamApiKey'
+        - type: object
+          properties:
+            rangeUsage:
+              $ref: '#/components/schemas/DownstreamKeyRangeUsage'
+    DownstreamKeySummaryResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        range:
+          type: string
+        status:
+          type: string
+        search:
+          type: string
+          nullable: true
+        group:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        tagMatch:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DownstreamKeySummaryItem'
+      required:
+        - success
+        - range
+        - status
+        - tags
+        - tagMatch
+        - items
+    DownstreamKeyOverviewUsage:
+      type: object
+      properties:
+        last24h:
+          $ref: '#/components/schemas/DownstreamKeyRangeUsage'
+          nullable: true
+        last7d:
+          $ref: '#/components/schemas/DownstreamKeyRangeUsage'
+          nullable: true
+        all:
+          $ref: '#/components/schemas/DownstreamKeyRangeUsage'
+          nullable: true
+    DownstreamKeyOverviewResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        item:
+          $ref: '#/components/schemas/DownstreamApiKey'
+        usage:
+          $ref: '#/components/schemas/DownstreamKeyOverviewUsage'
+      required:
+        - success
+        - item
+        - usage
+    DownstreamKeyTrendBucket:
+      type: object
+      properties:
+        startUtc:
+          type: string
+          nullable: true
+        totalRequests:
+          type: integer
+        successRequests:
+          type: integer
+        failedRequests:
+          type: integer
+        successRate:
+          type: number
+          nullable: true
+        totalTokens:
+          type: integer
+        totalCost:
+          type: number
+      required:
+        - totalRequests
+        - successRequests
+        - failedRequests
+        - totalTokens
+        - totalCost
+    DownstreamKeyTrendResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        range:
+          type: string
+        item:
+          type: object
+          properties:
+            id:
+              type: integer
+            name:
+              type: string
+          required:
+            - id
+            - name
+        bucketSeconds:
+          type: integer
+        buckets:
+          type: array
+          items:
+            $ref: '#/components/schemas/DownstreamKeyTrendBucket'
+      required:
+        - success
+        - range
+        - item
+        - bucketSeconds
+        - buckets
+    ProxyFileObject:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        bytes:
+          type: integer
+        created_at:
+          type: integer
+        filename:
+          type: string
+        purpose:
+          type: string
+        mime_type:
+          type: string
+      required:
+        - id
+        - object
+        - bytes
+        - created_at
+        - filename
+        - purpose
+        - mime_type
+    ProxyFileListResponse:
+      type: object
+      properties:
+        object:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProxyFileObject'
+        has_more:
+          type: boolean
+      required:
+        - object
+        - data
+        - has_more
+    ProxyFileDeleteResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        deleted:
+          type: boolean
+      required:
+        - id
+        - object
+        - deleted
+    ProxyModelsOpenAIList:
+      type: object
+      properties:
+        object:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              object:
+                type: string
+              created:
+                type: integer
+              owned_by:
+                type: string
+            required:
+              - id
+              - object
+      required:
+        - object
+        - data
+    ProxyModelsClaudeList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              type:
+                type: string
+              display_name:
+                type: string
+              created_at:
+                type: string
+            required:
+              - id
+              - type
+        first_id:
+          type: string
+          nullable: true
+        last_id:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+      required:
+        - data
+        - has_more
+    ProxyModelsResponse:
+      oneOf:
+        - $ref: '#/components/schemas/ProxyModelsOpenAIList'
+        - $ref: '#/components/schemas/ProxyModelsClaudeList'
+    GeminiModelItem:
+      type: object
+      properties:
+        name:
+          type: string
+        displayName:
+          type: string
+          nullable: true
+      required:
+        - name
+    GeminiModelListResponse:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeminiModelItem'
+      required:
+        - models
+    UpstreamPassthroughResponse:
+      type: object
+      description: 透传上游响应，字段结构以真实上游为准
+    TestJobQueuedResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+        status:
+          type: string
+        createdAt:
+          type: string
+        expiresAt:
+          type: string
+      required:
+        - jobId
+        - status
+        - createdAt
+        - expiresAt
+    TestJobStatusResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+        status:
+          type: string
+        result:
+          type: object
+          nullable: true
+        error:
+          type: object
+          nullable: true
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        expiresAt:
+          type: string
+      required:
+        - jobId
+        - status
+        - createdAt
+        - updatedAt
+        - expiresAt
 
 paths:
   /api/sites:
@@ -1498,8 +3142,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/SiteDetectResponse'
 
   /api/accounts:
     get:
@@ -1533,8 +3176,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountCreateResponse'
   /api/accounts/login:
     post:
       tags: [Accounts]
@@ -1560,8 +3202,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountLoginResponse'
   /api/accounts/verify-token:
     post:
       tags: [Accounts]
@@ -1589,8 +3230,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountVerifyTokenResponse'
   /api/accounts/{id}/rebind-session:
     post:
       tags: [Accounts]
@@ -1615,8 +3255,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountRebindResponse'
   /api/accounts/{id}:
     put:
       tags: [Accounts]
@@ -1697,15 +3336,13 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountHealthRefreshResponse'
         '202':
           description: 后台任务已创建
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/QueuedTaskResponse'
   /api/accounts/{id}/balance:
     post:
       tags: [Accounts]
@@ -1724,8 +3361,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountBalanceRefreshResponse'
 
   /api/account-tokens:
     get:
@@ -1747,7 +3383,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/AccountToken'
+                  $ref: '#/components/schemas/AccountTokenListItem'
     post:
       tags: [AccountTokens]
       summary: 新建账号 Token
@@ -1765,8 +3401,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountTokenCreateResponse'
   /api/account-tokens/{id}:
     put:
       tags: [AccountTokens]
@@ -1791,8 +3426,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountTokenCreateDirectResponse'
     delete:
       tags: [AccountTokens]
       summary: 删除账号 Token
@@ -1867,8 +3501,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountTokenValueResponse'
   /api/account-tokens/groups/{accountId}:
     get:
       tags: [AccountTokens]
@@ -1887,8 +3520,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountTokenGroupsResponse'
   /api/account-tokens/sync/{accountId}:
     post:
       tags: [AccountTokens]
@@ -1907,8 +3539,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountTokenSyncResponse'
   /api/account-tokens/sync-all:
     post:
       tags: [AccountTokens]
@@ -1927,8 +3558,13 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AccountTokenSyncAllResponse'
+        '202':
+          description: 任务已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedTaskResponse'
 
   /api/checkin/trigger:
     post:
@@ -1942,8 +3578,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/QueuedTaskResponse'
   /api/checkin/trigger/{id}:
     post:
       tags: [Checkin]
@@ -1962,8 +3597,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/CheckinExecutionResult'
   /api/checkin/logs:
     get:
       tags: [Checkin]
@@ -2013,8 +3647,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/CheckinScheduleResponse'
 
   /api/routes/lite:
     get:
@@ -2030,7 +3663,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/TokenRoute'
+                  $ref: '#/components/schemas/TokenRouteLite'
   /api/routes/summary:
     get:
       tags: [Routes]
@@ -2045,7 +3678,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/RouteSummary'
+                  $ref: '#/components/schemas/TokenRouteSummary'
   /api/routes:
     get:
       tags: [Routes]
@@ -2060,8 +3693,7 @@ paths:
               schema:
                 type: array
                 items:
-                  type: object
-                  additionalProperties: true
+                  $ref: '#/components/schemas/TokenRouteWithChannels'
     post:
       tags: [Routes]
       summary: 创建路由
@@ -2143,8 +3775,7 @@ paths:
               schema:
                 type: array
                 items:
-                  type: object
-                  additionalProperties: true
+                  $ref: '#/components/schemas/RouteChannelView'
     post:
       tags: [Routes]
       summary: 新增路由通道
@@ -2193,8 +3824,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteChannelBatchCreateResponse'
   /api/channels/batch:
     put:
       tags: [Routes]
@@ -2213,8 +3843,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteChannelBatchUpdateResponse'
   /api/channels/{channelId}:
     put:
       tags: [Routes]
@@ -2276,8 +3905,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteDecisionResponse'
   /api/routes/decision/batch:
     post:
       tags: [Routes]
@@ -2296,8 +3924,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteDecisionBatchResponse'
   /api/routes/decision/by-route/batch:
     post:
       tags: [Routes]
@@ -2316,8 +3943,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteDecisionByRouteBatchResponse'
   /api/routes/decision/route-wide/batch:
     post:
       tags: [Routes]
@@ -2336,8 +3962,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteDecisionRouteWideBatchResponse'
   /api/routes/rebuild:
     post:
       tags: [Routes]
@@ -2356,15 +3981,13 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RouteRebuildResponse'
         '202':
           description: 任务已创建
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/QueuedTaskResponse'
 
   /api/stats/dashboard:
     get:
@@ -2566,8 +4189,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/SearchResponse'
 
   /api/events:
     get:
@@ -2739,8 +4361,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/SuccessResponse'
   /api/settings/runtime:
     get:
       tags: [Settings]
@@ -2753,8 +4374,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RuntimeSettings'
     put:
       tags: [Settings]
       summary: 更新运行时配置
@@ -2772,8 +4392,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RuntimeSettingsUpdateResponse'
   /api/settings/database/runtime:
     get:
       tags: [Settings]
@@ -2786,8 +4405,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DatabaseRuntimeResponse'
     put:
       tags: [Settings]
       summary: 更新运行时数据库配置
@@ -2805,8 +4423,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DatabaseRuntimeUpdateResponse'
   /api/settings/database/test-connection:
     post:
       tags: [Settings]
@@ -2825,8 +4442,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DatabaseTestConnectionResponse'
   /api/settings/database/migrate:
     post:
       tags: [Settings]
@@ -2845,8 +4461,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DatabaseMigrationResponse'
   /api/settings/backup/export:
     get:
       tags: [Settings]
@@ -2864,8 +4479,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/BackupExportResponse'
   /api/settings/backup/import:
     post:
       tags: [Settings]
@@ -2884,8 +4498,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/BackupImportResponse'
   /api/settings/notify/test:
     post:
       tags: [Settings]
@@ -2976,8 +4589,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DownstreamApiKeyMutationResponse'
   /api/downstream-keys/{id}:
     put:
       tags: [DownstreamKeys]
@@ -3002,8 +4614,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DownstreamApiKeyMutationResponse'
     delete:
       tags: [DownstreamKeys]
       summary: 删除下游 Key
@@ -3040,8 +4651,106 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/DownstreamApiKeyMutationResponse'
+  /api/downstream-keys/summary:
+    get:
+      tags: [DownstreamKeys]
+      summary: 获取下游 Key 汇总
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: range
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: group
+          in: query
+          schema:
+            type: string
+        - name: tags
+          in: query
+          schema:
+            type: string
+        - name: tagMatch
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 汇总结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownstreamKeySummaryResponse'
+  /api/downstream-keys/{id}/overview:
+    get:
+      tags: [DownstreamKeys]
+      summary: 获取下游 Key 概览
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 概览结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownstreamKeyOverviewResponse'
+  /api/downstream-keys/{id}/trend:
+    get:
+      tags: [DownstreamKeys]
+      summary: 获取下游 Key 趋势
+      security:
+        - adminBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: range
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 趋势结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownstreamKeyTrendResponse'
+  /api/downstream-keys/batch:
+    post:
+      tags: [DownstreamKeys]
+      summary: 批量操作下游 Key
+      security:
+        - adminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchActionResponse'
 
   /api/monitor/config:
     get:
@@ -3055,8 +4764,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/MonitorConfigResponse'
     put:
       tags: [Monitor]
       summary: 更新监控配置
@@ -3074,8 +4782,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/MonitorConfigUpdateResponse'
   /api/monitor/session:
     post:
       tags: [Monitor]
@@ -3108,8 +4815,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /api/test/proxy/stream:
     post:
       tags: [Test]
@@ -3147,8 +4853,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/TestJobQueuedResponse'
   /api/test/proxy/jobs/{jobId}:
     get:
       tags: [Test]
@@ -3167,8 +4872,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/TestJobStatusResponse'
     delete:
       tags: [Test]
       summary: 删除代理测试任务
@@ -3205,8 +4909,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /api/test/chat/stream:
     post:
       tags: [Test]
@@ -3244,8 +4947,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/TestJobQueuedResponse'
   /api/test/chat/jobs/{jobId}:
     get:
       tags: [Test]
@@ -3264,8 +4966,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/TestJobStatusResponse'
     delete:
       tags: [Test]
       summary: 删除 Chat 测试任务
@@ -3300,8 +5001,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
             text/event-stream:
               schema:
                 type: string
@@ -3320,8 +5020,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
             text/event-stream:
               schema:
                 type: string
@@ -3340,8 +5039,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
             text/event-stream:
               schema:
                 type: string
@@ -3360,8 +5058,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/completions:
     post:
       tags: [Proxy]
@@ -3377,8 +5074,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/embeddings:
     post:
       tags: [Proxy]
@@ -3394,8 +5090,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/search:
     post:
       tags: [Proxy]
@@ -3411,8 +5106,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/models:
     get:
       tags: [Proxy]
@@ -3428,8 +5122,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ProxyModelsResponse'
   /v1/files:
     post:
       tags: [Proxy]
@@ -3445,8 +5138,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ProxyFileObject'
     get:
       tags: [Proxy]
       summary: Files 列表
@@ -3461,8 +5153,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ProxyFileListResponse'
   /v1/files/{fileId}:
     get:
       tags: [Proxy]
@@ -3484,8 +5175,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ProxyFileObject'
     delete:
       tags: [Proxy]
       summary: 删除 File
@@ -3506,8 +5196,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/ProxyFileDeleteResponse'
   /v1/files/{fileId}/content:
     get:
       tags: [Proxy]
@@ -3546,8 +5235,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/images/edits:
     post:
       tags: [Proxy]
@@ -3563,8 +5251,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/images/variations:
     post:
       tags: [Proxy]
@@ -3580,8 +5267,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/videos:
     post:
       tags: [Proxy]
@@ -3597,8 +5283,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /v1/videos/{id}:
     get:
       tags: [Proxy]
@@ -3620,8 +5305,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
     delete:
       tags: [Proxy]
       summary: 删除视频任务
@@ -3642,8 +5326,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
 
   /v1beta/models:
     get:
@@ -3660,8 +5343,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/GeminiModelListResponse'
   /gemini/{geminiApiVersion}/models:
     get:
       tags: [Gemini]
@@ -3683,8 +5365,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/GeminiModelListResponse'
   /v1beta/models/{path}:
     post:
       tags: [Gemini]
@@ -3707,8 +5388,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'
   /gemini/{geminiApiVersion}/models/{path}:
     post:
       tags: [Gemini]
@@ -3736,5 +5416,4 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/UpstreamPassthroughResponse'

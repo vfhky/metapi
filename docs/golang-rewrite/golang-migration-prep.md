@@ -358,6 +358,16 @@ Go 侧需要覆盖：
 - 输出 API 行为契约
 - 生成路由算法一致性测试
 
+## 10. 文档评审与修复记录
+
+| 问题 | 影响 | 修复动作 | 参考文件 |
+| --- | --- | --- | --- |
+| OpenAPI 多处响应结构过于宽泛（`additionalProperties: true`） | 迁移时难以生成 Go/TS 类型，接口边界不清晰 | 引入明确响应组件，统一替换为可复用 schema | `docs/golang-rewrite/openapi-draft.yaml` |
+| 下游 Key 汇总/趋势/批量接口未入 OpenAPI | 迁移时易漏实现关键运维功能 | 补充路径与响应 schema | `docs/golang-rewrite/openapi-draft.yaml` |
+| 路由、通道与测试工具接口在契约中与实际返回不一致 | 迁移阶段可能出现兼容性回退 | 对齐返回结构并标注 200/202 分支 | `docs/golang-rewrite/api-contract-draft.md` |
+| 运行时配置存在脱敏字段但文档未说明 | 前端改造时可能误以为可以回显明文 | 增加脱敏字段说明与写入规则 | `docs/golang-rewrite/api-contract-draft.md` |
+| 搜索接口返回 token 可能脱敏且带 `valueStatus` | UI 误判可用性与复制权限 | 补充 SearchResponse 与状态说明 | `docs/golang-rewrite/api-contract-draft.md` |
+
 阶段 1：Go 代理链路落地
 - `/v1/*` 代理入口
 - 复刻 tokenRouter 与 pricing 逻辑
