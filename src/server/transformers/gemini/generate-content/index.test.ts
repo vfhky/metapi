@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   geminiGenerateContentTransformer,
+  resolveGeminiGenerateContentUrl,
+  resolveGeminiModelsUrl,
+  resolveGeminiNativeBaseUrl,
   reasoningEffortToGeminiThinkingConfig,
   geminiThinkingConfigToReasoning,
 } from './index.js';
 import { extractGeminiUsage } from './usage.js';
-import { serializeGeminiAggregateResponse, extractResponseMetadata } from './outbound.js';
+import { serializeGeminiAggregateResponse, extractResponseMetadata, geminiGenerateContentOutbound } from './outbound.js';
 import { resolveGeminiThinkingConfigFromRequest } from './convert.js';
 import {
   parseGeminiStreamPayload,
@@ -15,6 +18,191 @@ import {
 } from './stream.js';
 
 describe('geminiGenerateContentTransformer.inbound', () => {
+  it('reuses the same gemini url resolver helpers across transformer layers', () => {
+    expect(geminiGenerateContentTransformer.resolveBaseUrl).toBe(resolveGeminiNativeBaseUrl);
+    expect(geminiGenerateContentTransformer.resolveModelsUrl).toBe(resolveGeminiModelsUrl);
+    expect(geminiGenerateContentTransformer.resolveActionUrl).toBe(resolveGeminiGenerateContentUrl);
+    expect(geminiGenerateContentOutbound.resolveBaseUrl).toBe(resolveGeminiNativeBaseUrl);
+    expect(geminiGenerateContentOutbound.resolveModelsUrl).toBe(resolveGeminiModelsUrl);
+    expect(geminiGenerateContentOutbound.resolveActionUrl).toBe(resolveGeminiGenerateContentUrl);
+  });
+
+  it('preserves base-url query params when resolving Gemini endpoints', () => {
+    expect(
+      resolveGeminiNativeBaseUrl('https://example.com/native?alt=sse', 'v1beta'),
+    ).toBe('https://example.com/native/v1beta?alt=sse');
+    expect(
+      resolveGeminiModelsUrl('https://example.com/native?alt=sse', 'v1beta', 'api-key'),
+    ).toBe('https://example.com/native/v1beta/models?alt=sse&key=api-key');
+    expect(
+      resolveGeminiGenerateContentUrl(
+        'https://example.com/native?alt=sse',
+        'v1beta',
+        '/models/gemini-2.5-pro:generateContent',
+        'api-key',
+        '?trace=1',
+      ),
+    ).toBe('https://example.com/native/v1beta/models/gemini-2.5-pro:generateContent?alt=sse&trace=1&key=api-key');
+  });
+
+  it('parses native Gemini requests into canonical envelopes', () => {
+    const result = geminiGenerateContentTransformer.parseRequest({
+      model: 'gemini-2.5-pro',
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: 'hello' }],
+        },
+      ],
+      generationConfig: {
+        thinkingConfig: {
+          thinkingBudget: 512,
+        },
+      },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toMatchObject({
+      operation: 'generate',
+      surface: 'gemini-generate-content',
+      cliProfile: 'generic',
+      requestedModel: 'gemini-2.5-pro',
+      stream: false,
+      messages: [
+        {
+          role: 'user',
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+      reasoning: {
+        budgetTokens: 512,
+      },
+    });
+  });
+
+  it('parses non-image inlineData parts into canonical file parts', () => {
+    const result = geminiGenerateContentTransformer.parseRequest({
+      model: 'gemini-2.5-pro',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'summarize this pdf' },
+            {
+              inlineData: {
+                mimeType: 'application/pdf',
+                data: 'JVBERi0xLjQK',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.value?.messages).toEqual([
+      {
+        role: 'user',
+        parts: [
+          { type: 'text', text: 'summarize this pdf' },
+          {
+            type: 'file',
+            fileData: 'JVBERi0xLjQK',
+            mimeType: 'application/pdf',
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('builds native Gemini requests from canonical envelopes', () => {
+    const body = geminiGenerateContentTransformer.buildProtocolRequest({
+      operation: 'generate',
+      surface: 'gemini-generate-content',
+      cliProfile: 'gemini_cli',
+      requestedModel: 'gemini-2.5-pro',
+      stream: false,
+      messages: [{ role: 'user', parts: [{ type: 'text', text: 'hello' }] }],
+      reasoning: {
+        budgetTokens: 512,
+      },
+      tools: [{ name: 'lookup', inputSchema: { type: 'object' } }],
+      toolChoice: 'required',
+    });
+
+    expect(body).toMatchObject({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: 'hello' }],
+        },
+      ],
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: 'lookup',
+              parameters: { type: 'object' },
+            },
+          ],
+        },
+      ],
+      toolConfig: {
+        functionCallingConfig: {
+          mode: 'ANY',
+        },
+      },
+      generationConfig: {
+        thinkingConfig: {
+          thinkingBudget: 512,
+        },
+      },
+    });
+  });
+
+  it('compatibility preserves inline document parts as OpenAI file blocks', () => {
+    const body = geminiGenerateContentTransformer.compatibility.buildOpenAiBodyFromGeminiRequest({
+      modelName: 'gpt-5.4',
+      stream: false,
+      body: {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'summarize this file' },
+              {
+                inlineData: {
+                  mimeType: 'application/pdf',
+                  data: 'JVBERi0x',
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(body).toEqual({
+      model: 'gpt-5.4',
+      stream: false,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'summarize this file' },
+            {
+              type: 'file',
+              file: {
+                file_data: 'JVBERi0x',
+                mime_type: 'application/pdf',
+              },
+            },
+          ],
+        },
+      ],
+    });
+  });
+
   it('preserves native Gemini request fields through normalization', () => {
     const body = geminiGenerateContentTransformer.inbound.normalizeRequest({
       contents: [

@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs';
 
 type DbModule = typeof import('../../db/index.js');
 
-describe('sites system proxy settings', () => {
+describe('sites proxy settings', () => {
   let app: FastifyInstance;
   let db: DbModule['db'];
   let schema: DbModule['schema'];
@@ -36,7 +36,7 @@ describe('sites system proxy settings', () => {
     delete process.env.DATA_DIR;
   });
 
-  it('stores useSystemProxy, external checkin url, and custom headers when creating a site', async () => {
+  it('stores proxy settings, external checkin url, and custom headers when creating a site', async () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/sites',
@@ -44,6 +44,7 @@ describe('sites system proxy settings', () => {
         name: 'proxy-site',
         url: 'https://proxy-site.example.com',
         platform: 'new-api',
+        proxyUrl: 'socks5://127.0.0.1:1080',
         useSystemProxy: true,
         customHeaders: JSON.stringify({
           'cf-access-client-id': 'site-client-id',
@@ -56,15 +57,69 @@ describe('sites system proxy settings', () => {
 
     expect(response.statusCode).toBe(200);
     const payload = response.json() as {
+      proxyUrl?: string | null;
       useSystemProxy?: boolean;
       customHeaders?: string | null;
       externalCheckinUrl?: string | null;
       globalWeight?: number;
     };
+    expect(payload.proxyUrl).toBe('socks5://127.0.0.1:1080');
     expect(payload.useSystemProxy).toBe(true);
     expect(payload.customHeaders).toBe('{"cf-access-client-id":"site-client-id","x-site-scope":"internal"}');
     expect(payload.externalCheckinUrl).toBe('https://checkin.example.com/welfare');
     expect(payload.globalWeight).toBe(1.5);
+  });
+
+  it('returns a conflict response when the same platform and url already exist', async () => {
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'existing-site',
+        url: 'https://duplicate-site.example.com/',
+        platform: 'new-api',
+      },
+    });
+    expect(first.statusCode).toBe(200);
+
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'duplicate-site',
+        url: 'https://duplicate-site.example.com',
+        platform: 'new-api',
+      },
+    });
+
+    expect(duplicate.statusCode).toBe(409);
+    expect((duplicate.json() as { error?: string }).error).toContain('already exists');
+  });
+
+  it('normalizes platform before conflict checks when creating a site', async () => {
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'existing-site',
+        url: 'https://duplicate-site.example.com/',
+        platform: 'new-api',
+      },
+    });
+    expect(first.statusCode).toBe(200);
+
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'duplicate-site',
+        url: 'https://duplicate-site.example.com',
+        platform: '  new-api  ',
+      },
+    });
+
+    expect(duplicate.statusCode).toBe(409);
+    expect((duplicate.json() as { error?: string }).error).toContain('already exists');
   });
 
   it('rejects invalid useSystemProxy flag', async () => {
@@ -81,6 +136,22 @@ describe('sites system proxy settings', () => {
 
     expect(response.statusCode).toBe(400);
     expect((response.json() as { error?: string }).error).toContain('Invalid useSystemProxy');
+  });
+
+  it('rejects invalid proxy url', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'proxy-site',
+        url: 'https://proxy-site.example.com',
+        platform: 'new-api',
+        proxyUrl: 'not-a-proxy',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('Invalid proxyUrl');
   });
 
   it('rejects invalid site global weight', async () => {
@@ -115,7 +186,7 @@ describe('sites system proxy settings', () => {
     expect((response.json() as { error?: string }).error).toContain('Invalid externalCheckinUrl');
   });
 
-  it('updates useSystemProxy for an existing site', async () => {
+  it('updates per-site proxy settings for an existing site', async () => {
     const created = await app.inject({
       method: 'POST',
       url: '/api/sites',
@@ -133,12 +204,77 @@ describe('sites system proxy settings', () => {
       method: 'PUT',
       url: `/api/sites/${site.id}`,
       payload: {
+        proxyUrl: 'http://127.0.0.1:8080',
         useSystemProxy: true,
       },
     });
 
     expect(response.statusCode).toBe(200);
-    expect((response.json() as { useSystemProxy?: boolean }).useSystemProxy).toBe(true);
+    const payload = response.json() as { proxyUrl?: string | null; useSystemProxy?: boolean };
+    expect(payload.proxyUrl).toBe('http://127.0.0.1:8080');
+    expect(payload.useSystemProxy).toBe(true);
+  });
+
+  it('returns a conflict response when updating a site to an existing platform and url', async () => {
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'first-site',
+        url: 'https://first-site.example.com',
+        platform: 'new-api',
+      },
+    });
+    expect(first.statusCode).toBe(200);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'second-site',
+        url: 'https://second-site.example.com',
+        platform: 'new-api',
+      },
+    });
+    expect(second.statusCode).toBe(200);
+
+    const { id } = second.json() as { id: number };
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/api/sites/${id}`,
+      payload: {
+        url: 'https://first-site.example.com/',
+        platform: 'new-api',
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect((response.json() as { error?: string }).error).toContain('already exists');
+  });
+
+  it('rejects blank platform updates instead of persisting an empty platform', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'editable-site',
+        url: 'https://editable-site.example.com',
+        platform: 'new-api',
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    const site = created.json() as { id: number };
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/api/sites/${site.id}`,
+      payload: {
+        platform: '   ',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('platform');
   });
 
   it('rejects invalid custom headers json', async () => {
@@ -173,5 +309,181 @@ describe('sites system proxy settings', () => {
 
     expect(response.statusCode).toBe(400);
     expect((response.json() as { error?: string }).error).toContain('must use a string value');
+  });
+
+  it('rejects create payloads whose name is not a string', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 123,
+        url: 'https://typed-site.example.com',
+        platform: 'new-api',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('Invalid name');
+  });
+
+  it('rejects update payloads whose url is not a string', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'typed-site',
+        url: 'https://typed-site.example.com',
+        platform: 'new-api',
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    const site = created.json() as { id: number };
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/api/sites/${site.id}`,
+      payload: {
+        url: 123,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('Invalid url');
+  });
+
+  it('rejects create payloads that are not objects', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: [],
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('Invalid site payload');
+  });
+
+  it('rejects update payloads that are not objects', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'typed-site',
+        url: 'https://typed-site.example.com',
+        platform: 'new-api',
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    const site = created.json() as { id: number };
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/api/sites/${site.id}`,
+      payload: [],
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('Invalid site payload');
+  });
+
+  it('detects Aliyun CodingPlan endpoints with initialization preset metadata', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites/detect',
+      payload: {
+        url: 'https://coding.dashscope.aliyuncs.com/v1',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      platform: 'openai',
+      initializationPresetId: 'codingplan-openai',
+    });
+  });
+
+  it('creates CodingPlan sites without explicit platform by using preset-backed detection', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'Aliyun CodingPlan',
+        url: 'https://coding.dashscope.aliyuncs.com/v1',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      name: 'Aliyun CodingPlan',
+      platform: 'openai',
+      initializationPresetId: 'codingplan-openai',
+    });
+  });
+
+  it('rejects empty detect payload urls at the route boundary', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites/detect',
+      payload: {
+        url: '   ',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain('url');
+  });
+
+  it('does not force CodingPlan preset metadata when the user explicitly chooses generic openai', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'Aliyun Generic OpenAI',
+        url: 'https://coding.dashscope.aliyuncs.com/v1',
+        platform: 'openai',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      name: 'Aliyun Generic OpenAI',
+      platform: 'openai',
+    });
+    expect(response.json()).not.toHaveProperty('initializationPresetId');
+  });
+
+  it('preserves explicit preset metadata even when the preset uses a custom gateway url', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'Aliyun CodingPlan Gateway',
+        url: 'https://gateway.example.com/coding/v1',
+        platform: 'openai',
+        initializationPresetId: 'codingplan-openai',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      name: 'Aliyun CodingPlan Gateway',
+      platform: 'openai',
+      initializationPresetId: 'codingplan-openai',
+    });
+  });
+
+  it('detects Zhipu Coding Plan OpenAI endpoint with initialization preset metadata', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites/detect',
+      payload: {
+        url: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      platform: 'openai',
+      initializationPresetId: 'zhipu-coding-plan-openai',
+    });
   });
 });

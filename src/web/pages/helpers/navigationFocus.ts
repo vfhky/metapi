@@ -1,4 +1,7 @@
+import { isTruthyFlag } from './accountConnection.js';
+
 const FOCUS_SITE_ID_KEY = 'focusSiteId';
+const FOCUS_ANNOUNCEMENT_ID_KEY = 'focusAnnouncementId';
 const FOCUS_ACCOUNT_ID_KEY = 'focusAccountId';
 const FOCUS_TOKEN_ID_KEY = 'focusTokenId';
 const OPEN_REBIND_KEY = 'openRebind';
@@ -9,16 +12,16 @@ function normalizePositiveId(input: unknown): number | null {
   return value;
 }
 
-function isTruthyFlag(value: string | null): boolean {
-  if (!value) return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
-}
-
 export function buildSiteFocusPath(siteId: number): string {
   const normalizedId = normalizePositiveId(siteId);
   if (!normalizedId) return '/sites';
   return `/sites?${FOCUS_SITE_ID_KEY}=${normalizedId}`;
+}
+
+export function buildAnnouncementFocusPath(announcementId: number): string {
+  const normalizedId = normalizePositiveId(announcementId);
+  if (!normalizedId) return '/site-announcements';
+  return `/site-announcements?${FOCUS_ANNOUNCEMENT_ID_KEY}=${normalizedId}`;
 }
 
 export function buildAccountFocusPath(
@@ -48,6 +51,11 @@ export function readFocusSiteId(search: string): number | null {
   return normalizePositiveId(params.get(FOCUS_SITE_ID_KEY));
 }
 
+export function readFocusAnnouncementId(search: string): number | null {
+  const params = new URLSearchParams(search);
+  return normalizePositiveId(params.get(FOCUS_ANNOUNCEMENT_ID_KEY));
+}
+
 export function readFocusAccountIntent(search: string): { accountId: number | null; openRebind: boolean } {
   const params = new URLSearchParams(search);
   return {
@@ -64,6 +72,7 @@ export function readFocusTokenId(search: string): number | null {
 export function clearFocusParams(search: string): string {
   const params = new URLSearchParams(search);
   params.delete(FOCUS_SITE_ID_KEY);
+  params.delete(FOCUS_ANNOUNCEMENT_ID_KEY);
   params.delete(FOCUS_ACCOUNT_ID_KEY);
   params.delete(FOCUS_TOKEN_ID_KEY);
   params.delete(OPEN_REBIND_KEY);
@@ -86,6 +95,12 @@ export function buildEventNavigationPath(event: {
   if (relatedType === 'site' && relatedId) {
     return buildSiteFocusPath(relatedId);
   }
+  if (relatedType === 'site_announcement' && relatedId) {
+    return buildAnnouncementFocusPath(relatedId);
+  }
+  if (relatedType === 'update_center') {
+    return '/settings';
+  }
   if (relatedType === 'route') {
     return '/routes';
   }
@@ -94,6 +109,9 @@ export function buildEventNavigationPath(event: {
   }
   if (eventType === 'checkin') {
     return '/checkin';
+  }
+  if (eventType === 'site_notice') {
+    return '/site-announcements';
   }
 
   return '/events';

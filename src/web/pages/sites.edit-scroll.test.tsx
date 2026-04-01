@@ -8,6 +8,7 @@ const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     getSites: vi.fn(),
     getSiteDisabledModels: vi.fn().mockResolvedValue({ models: [] }),
+    getSiteAvailableModels: vi.fn().mockResolvedValue({ models: [] }),
   },
 }));
 
@@ -57,7 +58,7 @@ describe('Sites edit behavior', () => {
       value: scrollToMock,
     });
 
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = create(
@@ -90,7 +91,7 @@ describe('Sites edit behavior', () => {
   it('restores header add button label after closing add modal', async () => {
     apiMock.getSites.mockResolvedValue([]);
 
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = create(

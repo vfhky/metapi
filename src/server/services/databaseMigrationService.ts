@@ -1,4 +1,5 @@
 ﻿import Database from 'better-sqlite3';
+import currentSchemaContract from '../db/generated/schemaContract.json' with { type: 'json' };
 import { db, schema } from '../db/index.js';
 import {
   createRuntimeSchemaClient,
@@ -28,6 +29,7 @@ type BackupSnapshot = {
   timestamp: number;
   accounts: {
     sites: Array<Record<string, unknown>>;
+    siteAnnouncements: Array<Record<string, unknown>>;
     siteDisabledModels: Array<Record<string, unknown>>;
     accounts: Array<Record<string, unknown>>;
     accountTokens: Array<Record<string, unknown>>;
@@ -36,6 +38,7 @@ type BackupSnapshot = {
     tokenModelAvailability: Array<Record<string, unknown>>;
     tokenRoutes: Array<Record<string, unknown>>;
     routeChannels: Array<Record<string, unknown>>;
+    routeGroupSources: Array<Record<string, unknown>>;
     proxyLogs: Array<Record<string, unknown>>;
     proxyVideoTasks: Array<Record<string, unknown>>;
     proxyFiles: Array<Record<string, unknown>>;
@@ -55,11 +58,13 @@ export interface DatabaseMigrationSummary {
   timestamp: number;
   rows: {
     sites: number;
+    siteAnnouncements: number;
     siteDisabledModels: number;
     accounts: number;
     accountTokens: number;
     tokenRoutes: number;
     routeChannels: number;
+    routeGroupSources: number;
     checkinLogs: number;
     modelAvailability: number;
     tokenModelAvailability: number;
@@ -81,6 +86,16 @@ interface InsertStatement {
 }
 
 const DIALECTS: MigrationDialect[] = ['sqlite', 'mysql', 'postgres'];
+const RUNTIME_DATABASE_SETTING_KEYS = new Set(['db_type', 'db_url', 'db_ssl']);
+type SchemaContractShape = {
+  tables: Record<string, {
+    columns: Record<string, {
+      logicalType: string | null;
+    }>;
+  }>;
+};
+type LogicalColumnTypeShape = string | null;
+const schemaContract = currentSchemaContract as SchemaContractShape;
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -106,6 +121,32 @@ function asNumber(value: unknown, fallback: number | null = null): number | null
 function asNullableString(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   return String(value);
+}
+
+function getColumnLogicalType(
+  table: string,
+  column: string,
+  contract: SchemaContractShape = schemaContract,
+): LogicalColumnTypeShape | null {
+  return contract.tables[table]?.columns[column]?.logicalType ?? null;
+}
+
+function serializeJsonColumnValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
+function serializeColumnValue(
+  table: string,
+  column: string,
+  value: unknown,
+  contract: SchemaContractShape = schemaContract,
+): string | null {
+  if (getColumnLogicalType(table, column, contract) === 'json') {
+    return serializeJsonColumnValue(value);
+  }
+  return asNullableString(value);
 }
 
 function toJsonString(value: unknown): string {
@@ -210,6 +251,7 @@ async function toBackupSnapshot(): Promise<BackupSnapshot> {
     timestamp: Date.now(),
     accounts: {
       sites: await db.select().from(schema.sites).all() as Array<Record<string, unknown>>,
+      siteAnnouncements: await db.select().from(schema.siteAnnouncements).all() as Array<Record<string, unknown>>,
       siteDisabledModels: await db.select().from(schema.siteDisabledModels).all() as Array<Record<string, unknown>>,
       accounts: await db.select().from(schema.accounts).all() as Array<Record<string, unknown>>,
       accountTokens: await db.select().from(schema.accountTokens).all() as Array<Record<string, unknown>>,
@@ -218,6 +260,7 @@ async function toBackupSnapshot(): Promise<BackupSnapshot> {
       tokenModelAvailability: await db.select().from(schema.tokenModelAvailability).all() as Array<Record<string, unknown>>,
       tokenRoutes: await db.select().from(schema.tokenRoutes).all() as Array<Record<string, unknown>>,
       routeChannels: await db.select().from(schema.routeChannels).all() as Array<Record<string, unknown>>,
+      routeGroupSources: await db.select().from(schema.routeGroupSources).all() as Array<Record<string, unknown>>,
       proxyLogs: await db.select().from(schema.proxyLogs).all() as Array<Record<string, unknown>>,
       proxyVideoTasks: await db.select().from(schema.proxyVideoTasks).all() as Array<Record<string, unknown>>,
       proxyFiles: await db.select().from(schema.proxyFiles).all() as Array<Record<string, unknown>>,
@@ -245,6 +288,7 @@ async function ensureTargetState(client: SqlClient, overwrite: boolean): Promise
 async function clearTargetData(client: SqlClient): Promise<void> {
   const tables = [
     'route_channels',
+    'route_group_sources',
     'token_model_availability',
     'model_availability',
     'checkin_logs',
@@ -253,6 +297,7 @@ async function clearTargetData(client: SqlClient): Promise<void> {
     'proxy_files',
     'account_tokens',
     'accounts',
+    'site_announcements',
     'site_disabled_models',
     'token_routes',
     'sites',
@@ -265,7 +310,10 @@ async function clearTargetData(client: SqlClient): Promise<void> {
   }
 }
 
-function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
+function buildStatements(
+  snapshot: BackupSnapshot,
+  contract: SchemaContractShape = schemaContract,
+): InsertStatement[] {
   const statements: InsertStatement[] = [];
 
   for (const row of snapshot.accounts.sites) {
@@ -280,7 +328,7 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asNullableString(row.platform),
         asNullableString(row.proxyUrl),
         asBoolean(row.useSystemProxy, false),
-        asNullableString(row.customHeaders),
+        serializeColumnValue('sites', 'custom_headers', row.customHeaders, contract),
         asNullableString(row.status) ?? 'active',
         asBoolean(row.isPinned, false),
         asNumber(row.sortOrder, 0),
@@ -301,6 +349,50 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asNumber(row.siteId, 0),
         asNullableString(row.modelName),
         asNullableString(row.createdAt),
+      ],
+    });
+  }
+
+  for (const row of snapshot.accounts.siteAnnouncements || []) {
+    statements.push({
+      table: 'site_announcements',
+      columns: [
+        'id',
+        'site_id',
+        'platform',
+        'source_key',
+        'title',
+        'content',
+        'level',
+        'source_url',
+        'starts_at',
+        'ends_at',
+        'upstream_created_at',
+        'upstream_updated_at',
+        'first_seen_at',
+        'last_seen_at',
+        'read_at',
+        'dismissed_at',
+        'raw_payload',
+      ],
+      values: [
+        asNumber(row.id, 0),
+        asNumber(row.siteId, 0),
+        asNullableString(row.platform),
+        asNullableString(row.sourceKey),
+        asNullableString(row.title),
+        asNullableString(row.content),
+        asNullableString(row.level) ?? 'info',
+        asNullableString(row.sourceUrl),
+        asNullableString(row.startsAt),
+        asNullableString(row.endsAt),
+        asNullableString(row.upstreamCreatedAt),
+        asNullableString(row.upstreamUpdatedAt),
+        asNullableString(row.firstSeenAt),
+        asNullableString(row.lastSeenAt),
+        asNullableString(row.readAt),
+        asNullableString(row.dismissedAt),
+        asNullableString(row.rawPayload),
       ],
     });
   }
@@ -326,7 +418,7 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asBoolean(row.checkinEnabled, true),
         asNullableString(row.lastCheckinAt),
         asNullableString(row.lastBalanceRefresh),
-        asNullableString(row.extraConfig),
+        serializeColumnValue('accounts', 'extra_config', row.extraConfig, contract),
         asNullableString(row.createdAt),
         asNullableString(row.updatedAt),
       ],
@@ -401,14 +493,15 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
   for (const row of snapshot.accounts.tokenRoutes) {
     statements.push({
       table: 'token_routes',
-      columns: ['id', 'model_pattern', 'display_name', 'display_icon', 'model_mapping', 'decision_snapshot', 'decision_refreshed_at', 'routing_strategy', 'enabled', 'created_at', 'updated_at'],
+      columns: ['id', 'model_pattern', 'display_name', 'display_icon', 'model_mapping', 'route_mode', 'decision_snapshot', 'decision_refreshed_at', 'routing_strategy', 'enabled', 'created_at', 'updated_at'],
       values: [
         asNumber(row.id, 0),
         asNullableString(row.modelPattern),
         asNullableString(row.displayName),
         asNullableString(row.displayIcon),
-        asNullableString(row.modelMapping),
-        asNullableString(row.decisionSnapshot),
+        serializeColumnValue('token_routes', 'model_mapping', row.modelMapping, contract),
+        asNullableString(row.routeMode) ?? 'pattern',
+        serializeColumnValue('token_routes', 'decision_snapshot', row.decisionSnapshot, contract),
         asNullableString(row.decisionRefreshedAt),
         asNullableString(row.routingStrategy),
         asBoolean(row.enabled, true),
@@ -446,6 +539,18 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
     });
   }
 
+  for (const row of (snapshot.accounts.routeGroupSources || [])) {
+    statements.push({
+      table: 'route_group_sources',
+      columns: ['id', 'group_route_id', 'source_route_id'],
+      values: [
+        asNumber(row.id, 0),
+        asNumber(row.groupRouteId, 0),
+        asNumber(row.sourceRouteId, 0),
+      ],
+    });
+  }
+
   for (const row of snapshot.accounts.proxyLogs) {
     statements.push({
       table: 'proxy_logs',
@@ -465,7 +570,7 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asNumber(row.completionTokens, null),
         asNumber(row.totalTokens, null),
         asNumber(row.estimatedCost, null),
-        asNullableString(row.billingDetails),
+        serializeColumnValue('proxy_logs', 'billing_details', row.billingDetails, contract),
         asNullableString(row.errorMessage),
         asNumber(row.retryCount, 0),
         asNullableString(row.createdAt),
@@ -487,8 +592,8 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asNullableString(row.actualModel),
         asNumber(row.channelId, null),
         asNumber(row.accountId, null),
-        asNullableString(row.statusSnapshot),
-        asNullableString(row.upstreamResponseMeta),
+        serializeColumnValue('proxy_video_tasks', 'status_snapshot', row.statusSnapshot, contract),
+        serializeColumnValue('proxy_video_tasks', 'upstream_response_meta', row.upstreamResponseMeta, contract),
         asNumber(row.lastUpstreamStatus, null),
         asNullableString(row.lastPolledAt),
         asNullableString(row.createdAt),
@@ -534,9 +639,9 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
         asNumber(row.usedCost, 0),
         asNumber(row.maxRequests, null),
         asNumber(row.usedRequests, 0),
-        asNullableString(row.supportedModels),
-        asNullableString(row.allowedRouteIds),
-        asNullableString(row.siteWeightMultipliers),
+        serializeColumnValue('downstream_api_keys', 'supported_models', row.supportedModels, contract),
+        serializeColumnValue('downstream_api_keys', 'allowed_route_ids', row.allowedRouteIds, contract),
+        serializeColumnValue('downstream_api_keys', 'site_weight_multipliers', row.siteWeightMultipliers, contract),
         asNullableString(row.lastUsedAt),
         asNullableString(row.createdAt),
         asNullableString(row.updatedAt),
@@ -563,6 +668,9 @@ function buildStatements(snapshot: BackupSnapshot): InsertStatement[] {
   }
 
   for (const row of snapshot.preferences.settings) {
+    if (RUNTIME_DATABASE_SETTING_KEYS.has(row.key)) {
+      continue;
+    }
     statements.push({
       table: 'settings',
       columns: ['key', 'value'],
@@ -600,6 +708,7 @@ async function syncPostgresSequences(client: SqlClient): Promise<void> {
   if (client.dialect !== 'postgres') return;
   const tables = [
     'sites',
+    'site_announcements',
     'site_disabled_models',
     'accounts',
     'account_tokens',
@@ -608,6 +717,7 @@ async function syncPostgresSequences(client: SqlClient): Promise<void> {
     'token_model_availability',
     'token_routes',
     'route_channels',
+    'route_group_sources',
     'proxy_logs',
     'proxy_video_tasks',
     'proxy_files',
@@ -615,9 +725,9 @@ async function syncPostgresSequences(client: SqlClient): Promise<void> {
     'events',
   ];
   for (const table of tables) {
-    await client.execute(`SELECT setval(pg_get_serial_sequence('${table}', 'id'), COALESCE((SELECT MAX(id) FROM "${table}"), 1), TRUE)`);
+      await client.execute(`SELECT setval(pg_get_serial_sequence('${table}', 'id'), COALESCE((SELECT MAX(id) FROM "${table}"), 1), TRUE)`);
+    }
   }
-}
 
 export async function bootstrapRuntimeDatabaseSchema(input: Pick<NormalizedDatabaseMigrationInput, 'dialect' | 'connectionString' | 'ssl'>): Promise<void> {
   const client = await createClient({
@@ -666,6 +776,7 @@ export async function migrateCurrentDatabase(input: DatabaseMigrationInput): Pro
     timestamp: snapshot.timestamp,
     rows: {
       sites: snapshot.accounts.sites.length,
+      siteAnnouncements: snapshot.accounts.siteAnnouncements.length,
       siteDisabledModels: snapshot.accounts.siteDisabledModels.length,
       accounts: snapshot.accounts.accounts.length,
       accountTokens: snapshot.accounts.accountTokens.length,
@@ -680,6 +791,7 @@ export async function migrateCurrentDatabase(input: DatabaseMigrationInput): Pro
       downstreamApiKeys: snapshot.accounts.downstreamApiKeys.length,
       events: snapshot.accounts.events.length,
       settings: snapshot.preferences.settings.length,
+      routeGroupSources: snapshot.accounts.routeGroupSources.length,
     },
   };
 }
@@ -702,4 +814,5 @@ export async function testDatabaseConnection(input: DatabaseMigrationInput): Pro
 export const __databaseMigrationServiceTestUtils = {
   ensureSchema: ensureRuntimeDatabaseSchema,
   buildStatements,
+  serializeColumnValue,
 };

@@ -2,23 +2,33 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import CenteredModal from '../components/CenteredModal.js';
+import ResponsiveFilterPanel from '../components/ResponsiveFilterPanel.js';
+import ResponsiveFormGrid from '../components/ResponsiveFormGrid.js';
+import ResponsiveBatchActionBar from '../components/ResponsiveBatchActionBar.js';
 import { useToast } from '../components/Toast.js';
 import ModernSelect from '../components/ModernSelect.js';
 import { MobileCard, MobileField } from '../components/MobileCard.js';
 import { useIsMobile } from '../components/useIsMobile.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.js';
 import SiteBadgeLink from '../components/SiteBadgeLink.js';
+import AccountModelsModal from './accounts/AccountModelsModal.js';
 import {
   buildAddAccountPrereqHint,
   buildVerifyFailureHint,
   normalizeVerifyFailureMessage,
 } from './helpers/accountVerifyFeedback.js';
+import {
+  isTruthyFlag,
+  parsePositiveInt,
+  resolveAccountCredentialMode,
+} from './helpers/accountConnection.js';
 import { clearFocusParams, readFocusAccountIntent } from './helpers/navigationFocus.js';
 import { TokensPanel } from './Tokens.js';
 import { tr } from '../i18n.js';
 import { buildCustomReorderUpdates, sortItemsForDisplay, type SortMode } from './helpers/listSorting.js';
 import { shouldIgnoreRowSelectionClick } from './helpers/rowSelection.js';
 import { SITE_DOCS_URL } from '../docsLink.js';
+import { getSiteInitializationPreset } from '../../shared/siteInitializationPresets.js';
 
 type ConnectionsSegment = 'session' | 'apikey' | 'tokens';
 
@@ -33,6 +43,8 @@ const ACCOUNT_SEGMENTS: Array<{
     { value: 'apikey', label: 'API Key管理', tooltip: '只有 Base URL + Key 时使用，只负责代理调用', tooltipSide: 'bottom', tooltipAlign: 'center' },
     { value: 'tokens', label: '账号令牌管理', tooltip: '从账号同步或手动维护，供路由实际调用', tooltipSide: 'bottom', tooltipAlign: 'end' },
   ];
+
+const SITE_SELECT_SEARCH_PLACEHOLDER = '筛选站点（名称 / 平台 / URL）';
 
 function createLoginForm() {
   return { siteId: 0, username: '', password: '' };
@@ -55,17 +67,6 @@ function createRebindForm(platformUserId = '') {
   return { accessToken: '', platformUserId, refreshToken: '', tokenExpiresAt: '' };
 }
 
-function isTruthyFlag(value: string | null): boolean {
-  if (!value) return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
-}
-
-function parsePositiveInt(value: string | null): number {
-  const parsed = Number.parseInt(String(value || '').trim(), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-}
-
 function resolveConnectionsSegment(search: string): ConnectionsSegment {
   const rawSegment = new URLSearchParams(search).get('segment');
   if (rawSegment === 'apikey' || rawSegment === 'tokens') return rawSegment;
@@ -82,11 +83,14 @@ export default function Accounts() {
   const [sortMode, setSortMode] = useState<SortMode>('custom');
   const [highlightAccountId, setHighlightAccountId] = useState<number | null>(null);
   const [expandedAccountIds, setExpandedAccountIds] = useState<number[]>([]);
-  const isMobile = useIsMobile(768);
+  const isMobile = useIsMobile();
+  const [showMobileTools, setShowMobileTools] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [addMode, setAddMode] = useState<'token' | 'login'>('token');
   const [loginForm, setLoginForm] = useState(createLoginForm);
   const [tokenForm, setTokenForm] = useState(() => createTokenForm('session'));
+  const [createIntentPresetId, setCreateIntentPresetId] = useState<string | null>(null);
+  const [applyCreatePresetModels, setApplyCreatePresetModels] = useState(false);
   const [verifyResult, setVerifyResult] = useState<any>(null);
   const [verifying, setVerifying] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -111,6 +115,7 @@ export default function Accounts() {
     isPinned: false,
     refreshToken: '',
     tokenExpiresAt: '',
+    proxyUrl: '',
   });
   const [savingEdit, setSavingEdit] = useState(false);
   const [rebindTarget, setRebindTarget] = useState<any | null>(null);
@@ -172,13 +177,30 @@ export default function Accounts() {
     () => sites.find((item) => item.id === tokenForm.siteId) || null,
     [sites, tokenForm.siteId],
   );
+  const siteSelectOptions = useMemo(
+    () => [
+      { value: '0', label: '选择站点' },
+      ...sites.map((site: any) => ({
+        value: String(site.id),
+        label: `${site.name} (${site.platform})`,
+        description: site.url || undefined,
+      })),
+    ],
+    [sites],
+  );
   const isSub2ApiSelected = (selectedTokenSite?.platform || '').toLowerCase() === 'sub2api';
   const activeAddCredentialMode = activeSegment === 'apikey' ? 'apikey' : 'session';
+  const createIntentPreset = useMemo(
+    () => getSiteInitializationPreset(createIntentPresetId),
+    [createIntentPresetId],
+  );
 
   const resetAddForms = (credentialMode: 'session' | 'apikey' = activeAddCredentialMode) => {
     setAddMode('token');
     setLoginForm(createLoginForm());
     setTokenForm(createTokenForm(credentialMode));
+    setCreateIntentPresetId(null);
+    setApplyCreatePresetModels(false);
     setVerifyResult(null);
   };
 
@@ -187,18 +209,6 @@ export default function Accounts() {
     setVerifying(false);
     setSaving(false);
     resetAddForms();
-  };
-
-  const resolveAccountCredentialMode = (account: any): 'session' | 'apikey' => {
-    const rawMode = String(account?.credentialMode || '').trim().toLowerCase();
-    if (rawMode === 'apikey') return 'apikey';
-    if (rawMode === 'session') return 'session';
-    const fromServer = account?.capabilities;
-    if (fromServer && typeof fromServer.proxyOnly === 'boolean') {
-      return fromServer.proxyOnly ? 'apikey' : 'session';
-    }
-    const hasSession = typeof account?.accessToken === 'string' && account.accessToken.trim().length > 0;
-    return hasSession ? 'session' : 'apikey';
   };
 
   const resolveAccountDisplayName = (account: any) => {
@@ -215,6 +225,7 @@ export default function Accounts() {
     if (activeSegment === 'tokens') return [];
     return sortedAccounts.filter((account) => resolveAccountCredentialMode(account) === activeSegment);
   }, [activeSegment, sortedAccounts]);
+  const allVisibleAccountsSelected = visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id));
   const verifyFailureHint = buildVerifyFailureHint(verifyResult);
   const addAccountPrereqHint = buildAddAccountPrereqHint(verifyResult);
 
@@ -252,18 +263,23 @@ export default function Accounts() {
     if (!shouldOpenCreate || !requestedSiteId) return;
 
     const credentialMode = activeSegment === 'apikey' ? 'apikey' : 'session';
+    const initializationPreset = getSiteInitializationPreset(params.get('initPreset'));
     setShowAdd(true);
     setAddMode('token');
     setVerifyResult(null);
+    setCreateIntentPresetId(initializationPreset?.id || null);
+    setApplyCreatePresetModels(Boolean(initializationPreset?.recommendedModels?.length));
     setLoginForm(createLoginForm());
     setTokenForm({
       ...createTokenForm(credentialMode),
       siteId: requestedSiteId,
+      skipModelFetch: credentialMode === 'apikey' && initializationPreset?.recommendedSkipModelFetch === true,
     });
 
     params.delete('create');
     params.delete('siteId');
     params.delete('from');
+    params.delete('initPreset');
     const nextSearch = params.toString();
     navigate(
       {
@@ -341,6 +357,7 @@ export default function Accounts() {
       return;
     }
     const credentialMode = activeSegment === 'apikey' ? 'apikey' : 'session';
+    const initializationPreset = createIntentPreset;
     setSaving(true);
     try {
       const result = await api.addAccount({
@@ -357,8 +374,28 @@ export default function Accounts() {
         credentialMode,
         skipModelFetch: tokenForm.skipModelFetch,
       });
+      let seededRecommendedModels = false;
+      const recommendedModels = initializationPreset?.recommendedModels || [];
+      const createdAccountId = Number(result?.id) || 0;
+      const shouldSeedRecommendedModels = (
+        credentialMode === 'apikey'
+        && tokenForm.skipModelFetch
+        && applyCreatePresetModels
+        && recommendedModels.length > 0
+        && createdAccountId > 0
+      );
+      if (shouldSeedRecommendedModels) {
+        try {
+          await api.addAccountAvailableModels(createdAccountId, recommendedModels);
+          seededRecommendedModels = true;
+        } catch (seedErr: any) {
+          toast.error(seedErr?.message || '连接已添加，但推荐模型补录失败');
+        }
+      }
       closeAddPanel();
-      if (result.tokenType === 'apikey') {
+      if (result.queued) {
+        toast.info(result.message || '账号已添加，后台正在同步初始化信息。');
+      } else if (result.tokenType === 'apikey') {
         toast.success('已添加为 API Key 账号（可用于代理转发）');
       } else {
         const parts: string[] = [];
@@ -366,6 +403,9 @@ export default function Accounts() {
         if (result.apiTokenFound) parts.push('API Key 已自动获取');
         const extra = parts.length ? `（${parts.join('，')}）` : '';
         toast.success(`账号已添加${extra}`);
+      }
+      if (seededRecommendedModels) {
+        toast.success(`已补入 ${recommendedModels.length} 个推荐模型并重建路由`);
       }
       load();
     } catch (e: any) {
@@ -650,21 +690,23 @@ export default function Accounts() {
     }
   };
 
+  const parseAccountExtraConfig = (account: any): Record<string, any> => {
+    try { return JSON.parse(account?.extraConfig || '{}') || {}; }
+    catch { return {}; }
+  };
+
   const extractManagedSub2ApiAuth = (account: any) => {
-    try {
-      const parsed = JSON.parse(account?.extraConfig || '{}');
-      const auth = parsed?.sub2apiAuth || {};
-      return {
-        refreshToken: typeof auth.refreshToken === 'string' ? auth.refreshToken : '',
-        tokenExpiresAt: auth.tokenExpiresAt ? String(auth.tokenExpiresAt) : '',
-      };
-    } catch {
-      return { refreshToken: '', tokenExpiresAt: '' };
-    }
+    const parsed = parseAccountExtraConfig(account);
+    const auth = parsed?.sub2apiAuth || {};
+    return {
+      refreshToken: typeof auth.refreshToken === 'string' ? auth.refreshToken : '',
+      tokenExpiresAt: auth.tokenExpiresAt ? String(auth.tokenExpiresAt) : '',
+    };
   };
 
   const openEditPanel = (account: any) => {
     const managedAuth = extractManagedSub2ApiAuth(account);
+    const proxyUrl = parseAccountExtraConfig(account)?.proxyUrl || '';
     closeAddPanel();
     setRebindTarget(null);
     setEditingAccount(account);
@@ -678,6 +720,7 @@ export default function Accounts() {
       isPinned: !!account?.isPinned,
       refreshToken: managedAuth.refreshToken,
       tokenExpiresAt: managedAuth.tokenExpiresAt,
+      proxyUrl,
     });
   };
 
@@ -700,6 +743,7 @@ export default function Accounts() {
         isPinned: editForm.isPinned,
         refreshToken: editForm.refreshToken.trim() || null,
         tokenExpiresAt: editForm.tokenExpiresAt.trim() ? Number.parseInt(editForm.tokenExpiresAt.trim(), 10) : null,
+        proxyUrl: editForm.proxyUrl.trim() || null,
       });
       toast.success('账号已更新');
       closeEditPanel();
@@ -721,10 +765,10 @@ export default function Accounts() {
 
   const toggleSelectAllVisibleAccounts = (checked: boolean) => {
     if (!checked) {
-      setSelectedAccountIds([]);
+      setSelectedAccountIds((current) => current.filter((id) => !visibleAccounts.some((account) => account.id === id)));
       return;
     }
-    setSelectedAccountIds(visibleAccounts.map((account) => account.id));
+    setSelectedAccountIds((current) => Array.from(new Set([...current, ...visibleAccounts.map((account) => account.id)])));
   };
 
   const toggleAccountDetails = (accountId: number) => {
@@ -784,12 +828,10 @@ export default function Accounts() {
   };
 
   const extractPlatformUserId = (account: any): string => {
-    try {
-      const parsed = JSON.parse(account?.extraConfig || '{}');
-      const raw = parsed?.platformUserId;
-      const value = Number.parseInt(String(raw ?? ''), 10);
-      if (Number.isFinite(value) && value > 0) return String(value);
-    } catch { }
+    const parsed = parseAccountExtraConfig(account);
+    const raw = parsed?.platformUserId;
+    const value = Number.parseInt(String(raw ?? ''), 10);
+    if (Number.isFinite(value) && value > 0) return String(value);
     const guessed = Number.parseInt(String(account?.username || '').match(/(\d{3,8})$/)?.[1] || '', 10);
     return Number.isFinite(guessed) && guessed > 0 ? String(guessed) : '';
   };
@@ -909,35 +951,59 @@ export default function Accounts() {
         <h2 className="page-title">{tr('连接管理')}</h2>
         {activeSegment !== 'tokens' && (
           <div className="page-actions accounts-page-actions">
-            <div className="accounts-sort-select" style={{ minWidth: 156, position: 'relative', zIndex: 20 }}>
-              <ModernSelect
-                size="sm"
-                value={sortMode}
-                onChange={(nextValue) => setSortMode(nextValue as SortMode)}
-                options={[
-                  { value: 'custom', label: '自定义排序' },
-                  { value: 'balance-desc', label: '余额高到低' },
-                  { value: 'balance-asc', label: '余额低到高' },
-                ]}
-                placeholder="自定义排序"
-              />
-            </div>
-            {activeSegment === 'session' && (
-              <button
-                onClick={() => withLoading('checkin-all', () => api.triggerCheckinAll(), '已触发全部签到')}
-                disabled={actionLoading['checkin-all']}
-                className="btn btn-soft-primary"
-              >
-                {actionLoading['checkin-all'] ? <><span className="spinner spinner-sm" />{tr('签到中...')}</> : tr('全部签到')}
-              </button>
+            {isMobile ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowMobileTools(true)}
+                  className="btn btn-ghost"
+                  style={{ border: '1px solid var(--color-border)' }}
+                >
+                  排序与操作
+                </button>
+                <button
+                  type="button"
+                  data-testid="accounts-mobile-select-all"
+                  onClick={() => toggleSelectAllVisibleAccounts(!allVisibleAccountsSelected)}
+                  className="btn btn-ghost"
+                  style={{ border: '1px solid var(--color-border)' }}
+                >
+                  {allVisibleAccountsSelected ? '取消全选' : '全选可见项'}
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="accounts-sort-select" style={{ minWidth: 156, position: 'relative', zIndex: 20 }}>
+                  <ModernSelect
+                    size="sm"
+                    value={sortMode}
+                    onChange={(nextValue) => setSortMode(nextValue as SortMode)}
+                    options={[
+                      { value: 'custom', label: '自定义排序' },
+                      { value: 'balance-desc', label: '余额高到低' },
+                      { value: 'balance-asc', label: '余额低到高' },
+                    ]}
+                    placeholder="自定义排序"
+                  />
+                </div>
+                {activeSegment === 'session' && (
+                  <button
+                    onClick={() => withLoading('checkin-all', () => api.triggerCheckinAll(), '已触发全部签到')}
+                    disabled={actionLoading['checkin-all']}
+                    className="btn btn-soft-primary"
+                  >
+                    {actionLoading['checkin-all'] ? <><span className="spinner spinner-sm" />{tr('签到中...')}</> : tr('全部签到')}
+                  </button>
+                )}
+                <button
+                  onClick={handleRefreshRuntimeHealth}
+                  disabled={actionLoading['health-refresh']}
+                  className="btn btn-soft-primary"
+                >
+                  {actionLoading['health-refresh'] ? <><span className="spinner spinner-sm" />{tr('刷新状态中...')}</> : tr('刷新账户状态')}
+                </button>
+              </>
             )}
-            <button
-              onClick={handleRefreshRuntimeHealth}
-              disabled={actionLoading['health-refresh']}
-              className="btn btn-soft-primary"
-            >
-              {actionLoading['health-refresh'] ? <><span className="spinner spinner-sm" />{tr('刷新状态中...')}</> : tr('刷新账户状态')}
-            </button>
             <button
               onClick={() => {
                 const nextOpen = !showAdd;
@@ -958,6 +1024,54 @@ export default function Accounts() {
         )}
         {activeSegment === 'tokens' && embeddedTokenActions}
       </div>
+
+      <ResponsiveFilterPanel
+        isMobile={isMobile}
+        mobileOpen={showMobileTools}
+        onMobileClose={() => setShowMobileTools(false)}
+        mobileTitle="连接排序与操作"
+        mobileContent={(
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>排序方式</div>
+              <ModernSelect
+                value={sortMode}
+                onChange={(nextValue) => setSortMode(nextValue as SortMode)}
+                options={[
+                  { value: 'custom', label: '自定义排序' },
+                  { value: 'balance-desc', label: '余额高到低' },
+                  { value: 'balance-asc', label: '余额低到高' },
+                ]}
+                placeholder="自定义排序"
+              />
+            </div>
+            {activeSegment === 'session' && (
+              <button
+                onClick={async () => {
+                  setShowMobileTools(false);
+                  await withLoading('checkin-all', () => api.triggerCheckinAll(), '已触发全部签到');
+                }}
+                disabled={actionLoading['checkin-all']}
+                className="btn btn-ghost"
+                style={{ border: '1px solid var(--color-border)' }}
+              >
+                {actionLoading['checkin-all'] ? <><span className="spinner spinner-sm" />{tr('签到中...')}</> : tr('全部签到')}
+              </button>
+            )}
+            <button
+              onClick={async () => {
+                setShowMobileTools(false);
+                await handleRefreshRuntimeHealth();
+              }}
+              disabled={actionLoading['health-refresh']}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)' }}
+            >
+              {actionLoading['health-refresh'] ? <><span className="spinner spinner-sm" />{tr('刷新状态中...')}</> : tr('刷新账户状态')}
+            </button>
+          </div>
+        )}
+      />
 
       <div
         style={{
@@ -1008,9 +1122,12 @@ export default function Accounts() {
           : <>确定要删除选中的 <strong>{deleteConfirm?.count || 0}</strong> 个连接吗？</>}
       />
 
-      {!isMobile && activeSegment !== 'tokens' && selectedAccountIds.length > 0 && (
-        <div className="card" style={{ padding: 12, marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <span style={{ fontSize: 13, fontWeight: 600 }}>已选 {selectedAccountIds.length} 项</span>
+      {activeSegment !== 'tokens' && selectedAccountIds.length > 0 && (
+        <ResponsiveBatchActionBar
+          isMobile={isMobile}
+          info={`已选 ${selectedAccountIds.length} 项`}
+          desktopStyle={{ marginBottom: 12 }}
+        >
           <button data-testid="accounts-batch-refresh-balance" onClick={() => runBatchAccountAction('refreshBalance')} disabled={batchActionLoading} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
             批量刷新余额
           </button>
@@ -1023,27 +1140,7 @@ export default function Accounts() {
           <button onClick={() => runBatchAccountAction('delete')} disabled={batchActionLoading} className="btn btn-link btn-link-danger">
             批量删除
           </button>
-        </div>
-      )}
-
-      {isMobile && activeSegment !== 'tokens' && selectedAccountIds.length > 0 && (
-        <div className="mobile-actions-bar">
-          <span className="mobile-actions-info">已选 {selectedAccountIds.length} 项</span>
-          <div className="mobile-actions-row">
-            <button data-testid="accounts-batch-refresh-balance" onClick={() => runBatchAccountAction('refreshBalance')} disabled={batchActionLoading} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
-              批量刷新余额
-            </button>
-            <button onClick={() => runBatchAccountAction('enable')} disabled={batchActionLoading} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
-              批量启用
-            </button>
-            <button onClick={() => runBatchAccountAction('disable')} disabled={batchActionLoading} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
-              批量禁用
-            </button>
-            <button onClick={() => runBatchAccountAction('delete')} disabled={batchActionLoading} className="btn btn-link btn-link-danger">
-              批量删除
-            </button>
-          </div>
-        </div>
+        </ResponsiveBatchActionBar>
       )}
 
       {activeSegment === 'tokens' ? (
@@ -1128,14 +1225,10 @@ export default function Accounts() {
                         setTokenForm((f) => ({ ...f, siteId: nextSiteId }));
                         setVerifyResult(null);
                       }}
-                      options={[
-                        { value: '0', label: '选择站点' },
-                        ...sites.map((s: any) => ({
-                          value: String(s.id),
-                          label: `${s.name} (${s.platform})`,
-                        })),
-                      ]}
+                      options={siteSelectOptions}
                       placeholder="选择站点"
+                      searchable
+                      searchPlaceholder={SITE_SELECT_SEARCH_PLACEHOLDER}
                     />
                     <input
                       placeholder="连接名称（可选）"
@@ -1162,12 +1255,17 @@ export default function Accounts() {
                     </div>
                     {isSub2ApiSelected && (
                       <>
-                        <input
-                          placeholder="Sub2API refresh_token（可选，用于托管自动续期）"
-                          value={tokenForm.refreshToken}
-                          onChange={(e) => setTokenForm((f) => ({ ...f, refreshToken: e.target.value.trim() }))}
-                          style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
-                        />
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          <input
+                            placeholder="Sub2API refresh_token（可选，用于托管自动续期）"
+                            value={tokenForm.refreshToken}
+                            onChange={(e) => setTokenForm((f) => ({ ...f, refreshToken: e.target.value.trim() }))}
+                            style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
+                          />
+                          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                            可在浏览器控制台执行 <code style={{ fontFamily: 'var(--font-mono)' }}>localStorage.getItem('refresh_token')</code> 获取。
+                          </div>
+                        </div>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                           <input
                             placeholder="token_expires_at（可选，毫秒时间戳）"
@@ -1250,14 +1348,10 @@ export default function Accounts() {
                         const nextSiteId = Number.parseInt(nextValue, 10) || 0;
                         setLoginForm((f) => ({ ...f, siteId: nextSiteId }));
                       }}
-                      options={[
-                        { value: '0', label: '选择站点' },
-                        ...sites.map((s: any) => ({
-                          value: String(s.id),
-                          label: `${s.name} (${s.platform})`,
-                        })),
-                      ]}
+                      options={siteSelectOptions}
                       placeholder="选择站点"
+                      searchable
+                      searchPlaceholder={SITE_SELECT_SEARCH_PLACEHOLDER}
                     />
                     <input placeholder="用户名" value={loginForm.username} onChange={(e) => setLoginForm((f) => ({ ...f, username: e.target.value }))} style={inputStyle} />
                     <input type="password" placeholder="密码" value={loginForm.password} onChange={(e) => setLoginForm((f) => ({ ...f, password: e.target.value }))} onKeyDown={(e) => e.key === 'Enter' && handleLoginAdd()} style={inputStyle} />
@@ -1272,21 +1366,44 @@ export default function Accounts() {
                 <div className="info-tip">
                   API Key 连接只用于代理转发，不会自动派生账号令牌。系统会按站点平台能力自动引导到 Session 或 API Key 创建流程。
                 </div>
+                {createIntentPreset && (
+                  <div className="alert alert-info animate-scale-in">
+                    <div className="alert-title">{createIntentPreset.label}</div>
+                    <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 4, lineHeight: 1.8 }}>
+                      <div>{createIntentPreset.description}</div>
+                      <div>推荐模型：{createIntentPreset.recommendedModels.join(' / ')}</div>
+                      {createIntentPreset.recommendedSkipModelFetch && (
+                        <div>建议直接跳过模型验证，先保存 Base URL + Key，再补入推荐模型完成初始化。</div>
+                      )}
+                    </div>
+                    {createIntentPreset.recommendedModels.length > 0 && (
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, cursor: 'pointer', marginTop: 8 }}>
+                        <input
+                          type="checkbox"
+                          checked={applyCreatePresetModels}
+                          onChange={(e) => setApplyCreatePresetModels(e.target.checked)}
+                          style={{ width: 14, height: 14 }}
+                        />
+                        <span>添加后自动补入推荐模型并重建路由</span>
+                      </label>
+                    )}
+                  </div>
+                )}
                 <ModernSelect
                   value={String(tokenForm.siteId || 0)}
                   onChange={(nextValue) => {
                     const nextSiteId = Number.parseInt(nextValue, 10) || 0;
                     setTokenForm((f) => ({ ...f, siteId: nextSiteId, credentialMode: 'apikey' }));
                     setVerifyResult(null);
+                    if (createIntentPresetId && nextSiteId !== tokenForm.siteId) {
+                      setCreateIntentPresetId(null);
+                      setApplyCreatePresetModels(false);
+                    }
                   }}
-                  options={[
-                    { value: '0', label: '选择站点' },
-                    ...sites.map((s: any) => ({
-                      value: String(s.id),
-                      label: `${s.name} (${s.platform})`,
-                    })),
-                  ]}
+                  options={siteSelectOptions}
                   placeholder="选择站点"
+                  searchable
+                  searchPlaceholder={SITE_SELECT_SEARCH_PLACEHOLDER}
                 />
                 <input
                   placeholder="连接名称（可选）"
@@ -1492,7 +1609,7 @@ export default function Accounts() {
             )}
           >
             {editingAccount ? (
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <ResponsiveFormGrid>
                 <input
                   placeholder="账号名称"
                   value={editForm.username}
@@ -1535,6 +1652,15 @@ export default function Accounts() {
                   onChange={(e) => setEditForm((prev) => ({ ...prev, apiToken: e.target.value }))}
                   style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
                 />
+                <input
+                  placeholder="代理地址（可选，如 http://127.0.0.1:7890）"
+                  value={editForm.proxyUrl}
+                  onChange={(e) => setEditForm((prev) => ({ ...prev, proxyUrl: e.target.value }))}
+                  style={inputStyle}
+                />
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: -4 }}>
+                  覆盖站点和系统代理，留空则使用站点设置。支持 http/https/socks5 协议。
+                </div>
                 {((editingAccount?.site?.platform || '').toLowerCase() === 'sub2api') && (
                   <>
                     <input
@@ -1551,7 +1677,7 @@ export default function Accounts() {
                     />
                   </>
                 )}
-              </div>
+              </ResponsiveFormGrid>
             ) : null}
           </CenteredModal>
 
@@ -1571,7 +1697,7 @@ export default function Accounts() {
                       <MobileCard
                         key={a.id}
                         title={resolveAccountDisplayName(a)}
-                        actions={(
+                        headerActions={(
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <input
                               type="checkbox"
@@ -1582,7 +1708,31 @@ export default function Accounts() {
                             <span className={`badge ${connectionMode === 'apikey' ? 'badge-warning' : 'badge-info'}`} style={{ fontSize: 10 }}>
                               {connectionMode === 'apikey' ? 'API Key' : 'Session'}
                             </span>
+                            {parseAccountExtraConfig(a)?.proxyUrl && (
+                              <span className="badge badge-purple" style={{ fontSize: 10 }}>代理</span>
+                            )}
                           </div>
+                        )}
+                        footerActions={(
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => toggleAccountDetails(a.id)}
+                              className="btn btn-link"
+                            >
+                              {isExpanded ? '收起' : '详情'}
+                            </button>
+                            <button onClick={() => openEditPanel(a)} className="btn btn-link btn-link-info">
+                              编辑
+                            </button>
+                            <button
+                              onClick={() => openModelModal(a)}
+                              disabled={actionLoading[`models-${a.id}`]}
+                              className="btn btn-link btn-link-info"
+                            >
+                              模型
+                            </button>
+                          </>
                         )}
                       >
                         <MobileField
@@ -1670,75 +1820,59 @@ export default function Accounts() {
                             />
                             <MobileField
                               label="提示"
+                              stacked
                               value={hintMessage}
                             />
+                            <div className="mobile-card-actions">
+                              <button
+                                onClick={() => handleTogglePin(a)}
+                                disabled={!!actionLoading[`pin-toggle-${a.id}`]}
+                                className={`btn btn-link ${a.isPinned ? 'btn-link-warning' : 'btn-link-primary'}`}
+                              >
+                                {actionLoading[`pin-toggle-${a.id}`] ? <span className="spinner spinner-sm" /> : (a.isPinned ? '取消置顶' : '置顶')}
+                              </button>
+                              {sortMode === 'custom' && (
+                                <>
+                                  <button
+                                    onClick={() => handleMoveCustomOrder(a, 'up')}
+                                    disabled={!!actionLoading[`reorder-${a.id}`]}
+                                    className="btn btn-link btn-link-muted"
+                                  >
+                                    ↑ 上移
+                                  </button>
+                                  <button
+                                    onClick={() => handleMoveCustomOrder(a, 'down')}
+                                    disabled={!!actionLoading[`reorder-${a.id}`]}
+                                    className="btn btn-link btn-link-muted"
+                                  >
+                                    ↓ 下移
+                                  </button>
+                                </>
+                              )}
+                              {capabilities.canRefreshBalance && (
+                                <button onClick={() => withLoading(`refresh-${a.id}`, () => api.refreshBalance(a.id), '余额已刷新')} disabled={actionLoading[`refresh-${a.id}`]} className="btn btn-link btn-link-primary">
+                                  {actionLoading[`refresh-${a.id}`] ? <span className="spinner spinner-sm" /> : '刷新'}
+                                </button>
+                              )}
+                              {capabilities.canCheckin && (
+                                <button onClick={() => withLoading(`checkin-${a.id}`, () => api.triggerCheckin(a.id), '签到完成')} disabled={actionLoading[`checkin-${a.id}`]} className="btn btn-link btn-link-warning">
+                                  {actionLoading[`checkin-${a.id}`] ? <span className="spinner spinner-sm" /> : '签到'}
+                                </button>
+                              )}
+                              {a.status === 'expired' && !capabilities.proxyOnly && (
+                                <button
+                                  onClick={() => openRebindPanel(a)}
+                                  className="btn btn-link btn-link-warning"
+                                >
+                                  重新绑定
+                                </button>
+                              )}
+                              <button onClick={() => setDeleteConfirm({ mode: 'single', accountId: a.id, accountName: resolveAccountDisplayName(a) })} disabled={actionLoading[`delete-${a.id}`]} className="btn btn-link btn-link-danger">
+                                {actionLoading[`delete-${a.id}`] ? <span className="spinner spinner-sm" /> : '删除'}
+                              </button>
+                            </div>
                           </div>
                         ) : null}
-                        <div className="mobile-card-actions">
-                          <button
-                            type="button"
-                            onClick={() => toggleAccountDetails(a.id)}
-                            className="btn btn-link"
-                          >
-                            {isExpanded ? '收起' : '详情'}
-                          </button>
-                          <button
-                            onClick={() => handleTogglePin(a)}
-                            disabled={!!actionLoading[`pin-toggle-${a.id}`]}
-                            className={`btn btn-link ${a.isPinned ? 'btn-link-warning' : 'btn-link-primary'}`}
-                          >
-                            {actionLoading[`pin-toggle-${a.id}`] ? <span className="spinner spinner-sm" /> : (a.isPinned ? '取消置顶' : '置顶')}
-                          </button>
-                          {sortMode === 'custom' && (
-                            <>
-                              <button
-                                onClick={() => handleMoveCustomOrder(a, 'up')}
-                                disabled={!!actionLoading[`reorder-${a.id}`]}
-                                className="btn btn-link btn-link-muted"
-                              >
-                                ↑
-                              </button>
-                              <button
-                                onClick={() => handleMoveCustomOrder(a, 'down')}
-                                disabled={!!actionLoading[`reorder-${a.id}`]}
-                                className="btn btn-link btn-link-muted"
-                              >
-                                ↓
-                              </button>
-                            </>
-                          )}
-                          {capabilities.canRefreshBalance && (
-                            <button onClick={() => withLoading(`refresh-${a.id}`, () => api.refreshBalance(a.id), '余额已刷新')} disabled={actionLoading[`refresh-${a.id}`]} className="btn btn-link btn-link-primary">
-                              {actionLoading[`refresh-${a.id}`] ? <span className="spinner spinner-sm" /> : '刷新'}
-                            </button>
-                          )}
-                          <button
-                            onClick={() => openModelModal(a)}
-                            disabled={actionLoading[`models-${a.id}`]}
-                            className="btn btn-link btn-link-info"
-                          >
-                            模型
-                          </button>
-                          {capabilities.canCheckin && (
-                            <button onClick={() => withLoading(`checkin-${a.id}`, () => api.triggerCheckin(a.id), '签到完成')} disabled={actionLoading[`checkin-${a.id}`]} className="btn btn-link btn-link-warning">
-                              {actionLoading[`checkin-${a.id}`] ? <span className="spinner spinner-sm" /> : '签到'}
-                            </button>
-                          )}
-                          {a.status === 'expired' && !capabilities.proxyOnly && (
-                            <button
-                              onClick={() => openRebindPanel(a)}
-                              className="btn btn-link btn-link-warning"
-                            >
-                              重新绑定
-                            </button>
-                          )}
-                          <button onClick={() => openEditPanel(a)} className="btn btn-link btn-link-info">
-                            编辑
-                          </button>
-                          <button onClick={() => setDeleteConfirm({ mode: 'single', accountId: a.id, accountName: resolveAccountDisplayName(a) })} disabled={actionLoading[`delete-${a.id}`]} className="btn btn-link btn-link-danger">
-                            {actionLoading[`delete-${a.id}`] ? <span className="spinner spinner-sm" /> : '删除'}
-                          </button>
-                        </div>
                       </MobileCard>
                     );
                   })}
@@ -1750,7 +1884,7 @@ export default function Accounts() {
                     <th style={{ width: 44 }}>
                       <input
                         type="checkbox"
-                        checked={visibleAccounts.length > 0 && selectedAccountIds.length === visibleAccounts.length}
+                        checked={allVisibleAccountsSelected}
                         onChange={(e) => toggleSelectAllVisibleAccounts(e.target.checked)}
                       />
                     </th>
@@ -1792,6 +1926,9 @@ export default function Accounts() {
                             <span className={`badge ${connectionMode === 'apikey' ? 'badge-warning' : 'badge-info'}`} style={{ fontSize: 10 }}>
                               {connectionMode === 'apikey' ? 'API Key' : 'Session'}
                             </span>
+                            {parseAccountExtraConfig(a)?.proxyUrl && (
+                              <span className="badge badge-purple" style={{ fontSize: 10 }}>代理</span>
+                            )}
                           </div>
                         </td>
                         <td>
@@ -1940,209 +2077,24 @@ export default function Accounts() {
         </>
       )}
 
-      {/* Model management modal */}
-      <CenteredModal
-        open={modelModal.open}
+      <AccountModelsModal
+        modelModal={modelModal}
+        inputStyle={inputStyle}
         onClose={closeModelModal}
-        title={modelModal.siteName ? `模型管理 · ${modelModal.siteName}` : '模型管理'}
-        maxWidth={600}
-        footer={
-          <>
-            <button onClick={closeModelModal} className="btn btn-ghost">取消</button>
-            <button
-              onClick={saveModelDisabled}
-              disabled={modelModal.saving || modelModal.loading}
-              className="btn btn-primary"
-            >
-              {modelModal.saving ? <><span className="spinner spinner-sm" />保存中...</> : '保存'}
-            </button>
-          </>
-        }
-      >
-        {modelModal.loading ? (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '48px 0', gap: 10 }}>
-            <span className="spinner" />
-            <span style={{ color: 'var(--color-text-muted)', fontSize: 14 }}>加载模型列表...</span>
-          </div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {modelModal.models.length === 0 ? (
-              <div style={{ textAlign: 'center', padding: '32px 0' }}>
-                <div style={{ fontSize: 32, marginBottom: 8 }}>🤖</div>
-                <div style={{ fontSize: 14, color: 'var(--color-text-muted)', marginBottom: 8 }}>暂无可用模型</div>
-                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16 }}>请先点击账号操作栏中的「刷新」或「模型」按钮获取模型</div>
-                <button
-                  onClick={async () => {
-                    if (!modelModal.account) return;
-                    await loadModelModalModels(modelModal.account, {
-                      refreshUpstream: true,
-                      successMessage: '模型列表已刷新',
-                      errorMessage: '刷新失败',
-                    });
-                  }}
-                  className="btn btn-soft-primary"
-                >
-                  立即获取模型
-                </button>
-              </div>
-            ) : (
-              <>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', userSelect: 'none' }}>
-                    <input
-                      type="checkbox"
-                      checked={modelModal.pendingDisabled.size === 0}
-                      ref={(el) => {
-                        if (el) {
-                          const total = modelModal.models.length;
-                          const disabled = modelModal.pendingDisabled.size;
-                          el.indeterminate = disabled > 0 && disabled < total;
-                        }
-                      }}
-                      onChange={() => {
-                        const allEnabled = modelModal.pendingDisabled.size === 0;
-                        setModelModal(s => ({
-                          ...s,
-                          pendingDisabled: allEnabled
-                            ? new Set(s.models.map((m) => m.name))
-                            : new Set(),
-                        }));
-                      }}
-                      style={{ accentColor: 'var(--color-primary)', width: 15, height: 15 }}
-                    />
-                    <span style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>
-                      已启用 <strong style={{ color: 'var(--color-text-primary)' }}>{modelModal.models.length - modelModal.pendingDisabled.size}</strong> / {modelModal.models.length} 个模型
-                    </span>
-                  </label>
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <button
-                      onClick={async () => {
-                        if (!modelModal.account) return;
-                        await loadModelModalModels(modelModal.account, {
-                          refreshUpstream: true,
-                          successMessage: '模型列表已刷新',
-                          errorMessage: '刷新失败',
-                        });
-                      }}
-                      disabled={modelModal.saving}
-                      className="btn btn-ghost"
-                      style={{ fontSize: 12, padding: '4px 10px' }}
-                    >
-                      刷新模型
-                    </button>
-                    <button
-                      onClick={() => setModelModal(s => {
-                        const next = new Set<string>();
-                        for (const m of s.models) {
-                          if (!s.pendingDisabled.has(m.name)) next.add(m.name);
-                        }
-                        return { ...s, pendingDisabled: next };
-                      })}
-                      className="btn btn-ghost"
-                      style={{ fontSize: 12, padding: '4px 10px' }}
-                    >
-                      反选
-                    </button>
-                    <button
-                      onClick={() => setModelModal(s => ({ ...s, pendingDisabled: new Set(s.models.map((m) => m.name)) }))}
-                      className="btn btn-ghost"
-                      style={{ fontSize: 12, padding: '4px 10px' }}
-                    >
-                      全部禁用
-                    </button>
-                    <button
-                      onClick={() => setModelModal(s => ({ ...s, pendingDisabled: new Set() }))}
-                      className="btn btn-ghost"
-                      style={{ fontSize: 12, padding: '4px 10px' }}
-                    >
-                      全部启用
-                    </button>
-                  </div>
-                </div>
-
-                <div style={{
-                  maxHeight: 280,
-                  overflowY: 'auto',
-                  border: '1px solid var(--color-border-light)',
-                  borderRadius: 'var(--radius-sm)',
-                }}>
-                  {modelModal.models.map((model, idx) => {
-                    const isDisabled = modelModal.pendingDisabled.has(model.name);
-                    return (
-                      <label
-                        key={model.name}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 10,
-                          padding: '9px 14px',
-                          cursor: 'pointer',
-                          background: isDisabled ? 'var(--color-bg)' : undefined,
-                          borderBottom: idx < modelModal.models.length - 1 ? '1px solid var(--color-border-light)' : undefined,
-                          opacity: isDisabled ? 0.55 : 1,
-                          transition: 'opacity 0.15s, background 0.15s',
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={!isDisabled}
-                          onChange={() => toggleModelDisabled(model.name)}
-                          style={{ accentColor: 'var(--color-primary)', width: 15, height: 15, flexShrink: 0 }}
-                        />
-                        <span style={{ flex: 1, fontSize: 13, fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
-                          {model.name}
-                        </span>
-                        {model.latencyMs != null && (
-                          <span style={{ fontSize: 11, color: 'var(--color-text-muted)', flexShrink: 0 }}>
-                            {model.latencyMs}ms
-                          </span>
-                        )}
-                        {model.isManual && (
-                          <span className="badge badge-info" style={{ fontSize: 10, flexShrink: 0, padding: '0 4px' }}>手动</span>
-                        )}
-                        {isDisabled && (
-                          <span className="badge badge-error" style={{ fontSize: 10, flexShrink: 0 }}>禁用</span>
-                        )}
-                      </label>
-                    );
-                  })}
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 4 }}>
-                  💡 禁用的模型将对整个站点生效，该站点下所有连接都不会使用这些模型进行代理。
-                </div>
-              </>
-            )}
-
-            <div style={{ marginTop: 16, padding: '12px', background: 'var(--color-bg)', border: '1px solid var(--color-border-light)', borderRadius: 'var(--radius-sm)' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: 'var(--color-text-primary)' }}>手动添加可用模型</div>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
-                如果您的账号支持某些未在上方列表中显示的模型，可以在此手动添加（多个以英文逗号分隔）。
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <input
-                  placeholder="例如: gpt-4-custom, claude-3-5-sonnet-20241022"
-                  value={modelModal.manualModelsInput}
-                  onChange={(e) => setModelModal(s => ({ ...s, manualModelsInput: e.target.value }))}
-                  style={{ ...inputStyle, flex: 1, fontFamily: 'var(--font-mono)' }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !modelModal.addingManualModels) {
-                      handleAddManualModels();
-                    }
-                  }}
-                />
-                <button
-                  disabled={!modelModal.manualModelsInput.trim() || modelModal.addingManualModels}
-                  onClick={handleAddManualModels}
-                  className="btn btn-primary btn-sm"
-                  style={{ whiteSpace: 'nowrap' }}
-                >
-                  {modelModal.addingManualModels ? <span className="spinner spinner-sm" /> : '添加'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-      </CenteredModal>
+        onSave={saveModelDisabled}
+        onRefresh={async () => {
+          if (!modelModal.account) return;
+          await loadModelModalModels(modelModal.account, {
+            refreshUpstream: true,
+            successMessage: '模型列表已刷新',
+            errorMessage: '刷新失败',
+          });
+        }}
+        onToggleModelDisabled={toggleModelDisabled}
+        onSetPendingDisabled={(pendingDisabled) => setModelModal((state) => ({ ...state, pendingDisabled }))}
+        onManualInputChange={(value) => setModelModal((state) => ({ ...state, manualModelsInput: value }))}
+        onAddManualModels={handleAddManualModels}
+      />
     </div>
   );
 }

@@ -10,6 +10,9 @@ type CenteredModalProps = {
   footer?: React.ReactNode;
   maxWidth?: number;
   bodyStyle?: React.CSSProperties;
+  closeOnBackdrop?: boolean;
+  closeOnEscape?: boolean;
+  showCloseButton?: boolean;
 };
 
 export default function CenteredModal({
@@ -20,20 +23,27 @@ export default function CenteredModal({
   footer,
   maxWidth = 860,
   bodyStyle,
+  closeOnBackdrop = false,
+  closeOnEscape = false,
+  showCloseButton = true,
 }: CenteredModalProps) {
   const presence = useAnimatedVisibility(open, 220);
+  const canUsePortal = typeof document !== 'undefined'
+    && !!document.body
+    && typeof document.body.appendChild === 'function'
+    && typeof document.body.removeChild === 'function';
 
   useEffect(() => {
-    if (!open || typeof document === 'undefined') return;
+    if (!open || !canUsePortal) return;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     return () => {
       document.body.style.overflow = previousOverflow;
     };
-  }, [open]);
+  }, [canUsePortal, open]);
 
   useEffect(() => {
-    if (!open || typeof document === 'undefined') return;
+    if (!open || !closeOnEscape || !canUsePortal) return;
     const handleKeydown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
     };
@@ -41,21 +51,33 @@ export default function CenteredModal({
     return () => {
       document.removeEventListener('keydown', handleKeydown);
     };
-  }, [open, onClose]);
+  }, [canUsePortal, closeOnEscape, open, onClose]);
 
   if (!presence.shouldRender) return null;
 
   const modal = (
     <div
       className={`modal-backdrop ${presence.isVisible ? '' : 'is-closing'}`.trim()}
-      onClick={onClose}
+      onClick={closeOnBackdrop ? onClose : undefined}
     >
       <div
         className={`modal-content ${presence.isVisible ? '' : 'is-closing'}`.trim()}
         style={{ maxWidth }}
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="modal-header">{title}</div>
+        <div className="modal-header">
+          <div className="modal-title">{title}</div>
+          {showCloseButton ? (
+            <button
+              type="button"
+              className="modal-close-button"
+              onClick={onClose}
+              aria-label="关闭弹框"
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
         <div className="modal-body" style={bodyStyle}>
           {children}
         </div>
@@ -64,5 +86,5 @@ export default function CenteredModal({
     </div>
   );
 
-  return typeof document !== 'undefined' ? createPortal(modal, document.body) : modal;
+  return canUsePortal ? createPortal(modal, document.body) : modal;
 }

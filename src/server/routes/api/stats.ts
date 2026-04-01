@@ -1,11 +1,9 @@
 ﻿import { FastifyInstance } from 'fastify';
 import { db, schema } from '../../db/index.js';
 import { and, desc, eq, gte, lt, sql } from 'drizzle-orm';
-import {
-  refreshModelsForAccount,
-  refreshModelsAndRebuildRoutes,
-  rebuildTokenRoutesFromAvailability,
-} from '../../services/modelService.js';
+import { config } from '../../config.js';
+import { refreshModelsForAccount } from '../../services/modelService.js';
+import * as routeRefreshWorkflow from '../../services/routeRefreshWorkflow.js';
 import { buildModelAnalysis } from '../../services/modelAnalysisService.js';
 import { fallbackTokenCost, fetchModelPricingCatalog } from '../../services/modelPricingService.js';
 import { getUpstreamModelDescriptionsCached } from '../../services/upstreamModelDescriptionService.js';
@@ -17,7 +15,12 @@ import {
   parseProxyLogBillingDetails,
   withProxyLogSelectFields,
 } from '../../services/proxyLogStore.js';
-import { getCredentialModeFromExtraConfig } from '../../services/accountExtraConfig.js';
+import {
+  getProxyDebugTraceDetail,
+  listProxyDebugTraces,
+} from '../../services/proxyDebugTraceStore.js';
+import { parseProxyLogMessageMeta } from '../proxy/logPathMeta.js';
+import { requiresManagedAccountTokens } from '../../services/accountExtraConfig.js';
 import { ACCOUNT_TOKEN_VALUE_STATUS_READY } from '../../services/accountTokenService.js';
 import {
   formatLocalDateTime,
@@ -25,8 +28,10 @@ import {
   getLocalDayRangeUtc,
   getLocalRangeStartUtc,
   parseStoredUtcDateTime,
+  type StoredUtcDateTimeInput,
   toLocalDayKeyFromStoredUtc,
 } from '../../services/localTimeService.js';
+import { createRateLimitGuard } from '../../middleware/requestRateLimit.js';
 
 function parseBooleanFlag(raw?: string): boolean {
   if (!raw) return false;
@@ -34,14 +39,13 @@ function parseBooleanFlag(raw?: string): boolean {
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
 }
 
-function isApiKeyConnection(account: { accessToken?: string | null; extraConfig?: string | null }): boolean {
-  const explicit = getCredentialModeFromExtraConfig(account.extraConfig);
-  if (explicit && explicit !== 'auto') return explicit === 'apikey';
-  return !(account.accessToken || '').trim();
-}
-
 const MODELS_MARKETPLACE_BASE_TTL_MS = 15_000;
 const MODELS_MARKETPLACE_PRICING_TTL_MS = 90_000;
+const limitModelTokenCandidatesRead = createRateLimitGuard({
+  bucket: 'models-token-candidates-read',
+  max: 30,
+  windowMs: 60_000,
+});
 
 type ModelsMarketplaceCacheEntry = {
   expiresAt: number;
@@ -84,6 +88,22 @@ function proxyCostSqlExpression() {
 }
 
 type ProxyLogStatusFilter = 'all' | 'success' | 'failed';
+type ProxyLogClientFilter = {
+  kind: 'app' | 'family';
+  value: string;
+} | null;
+
+type ProxyLogClientOption = {
+  value: string;
+  label: string;
+};
+
+const PROXY_LOG_CLIENT_FAMILY_LABELS: Record<string, string> = {
+  codex: 'Codex',
+  claude_code: 'Claude Code',
+  gemini_cli: 'Gemini CLI',
+  generic: '通用',
+};
 
 function normalizeProxyLogPageSize(raw?: string): number {
   const parsed = Number.parseInt(raw || '50', 10);
@@ -112,6 +132,20 @@ function normalizeProxyLogSiteId(raw?: string): number | null {
   const parsed = Number.parseInt(raw || '', 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
+}
+
+function normalizeProxyLogClientFilter(raw?: string): ProxyLogClientFilter {
+  const text = (raw || '').trim();
+  if (!text) return null;
+  const separatorIndex = text.indexOf(':');
+  if (separatorIndex <= 0) return null;
+  const kind = text.slice(0, separatorIndex).trim().toLowerCase();
+  const value = text.slice(separatorIndex + 1).trim().toLowerCase();
+  if (!value) return null;
+  if (kind === 'app' || kind === 'family') {
+    return { kind, value };
+  }
+  return null;
 }
 
 function normalizeProxyLogTimeBoundary(raw?: string): string | null {
@@ -165,9 +199,18 @@ function buildProxyLogStatusCondition(status: ProxyLogStatusFilter) {
   return null;
 }
 
+function buildProxyLogClientCondition(client: ProxyLogClientFilter) {
+  if (!client) return null;
+  if (client.kind === 'app') {
+    return eq(schema.proxyLogs.clientAppId, client.value);
+  }
+  return eq(schema.proxyLogs.clientFamily, client.value);
+}
+
 function buildProxyLogWhereClause(params: {
   status?: ProxyLogStatusFilter;
   search?: string;
+  client?: ProxyLogClientFilter;
   siteId?: number | null;
   fromUtc?: string | null;
   toUtc?: string | null;
@@ -175,6 +218,7 @@ function buildProxyLogWhereClause(params: {
   const conditions = [
     params.status ? buildProxyLogStatusCondition(params.status) : null,
     params.search ? buildProxyLogSearchCondition(params.search) : null,
+    params.client ? buildProxyLogClientCondition(params.client) : null,
     params.siteId ? eq(schema.sites.id, params.siteId) : null,
     params.fromUtc ? gte(schema.proxyLogs.createdAt, params.fromUtc) : null,
     params.toUtc ? lt(schema.proxyLogs.createdAt, params.toUtc) : null,
@@ -186,6 +230,91 @@ function buildProxyLogWhereClause(params: {
 
 function toRoundedMicroNumber(value: number | null | undefined): number {
   return Math.round(Number(value || 0) * 1_000_000) / 1_000_000;
+}
+
+function normalizeNullableText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function normalizeClientConfidence(value: unknown): string | null {
+  const normalized = normalizeNullableText(value)?.toLowerCase() || null;
+  if (normalized === 'exact' || normalized === 'heuristic' || normalized === 'unknown') {
+    return normalized;
+  }
+  return null;
+}
+
+function displayProxyLogClientFamily(value: string | null): string | null {
+  if (!value) return null;
+  return PROXY_LOG_CLIENT_FAMILY_LABELS[value] || value;
+}
+
+function resolveProxyLogClientMeta(proxyLog: Record<string, unknown>) {
+  const clientFamily = normalizeNullableText(proxyLog.clientFamily)?.toLowerCase() || null;
+  const clientAppId = normalizeNullableText(proxyLog.clientAppId)?.toLowerCase() || null;
+  const clientAppName = normalizeNullableText(proxyLog.clientAppName) || null;
+  const clientConfidence = normalizeClientConfidence(proxyLog.clientConfidence);
+
+  if (clientFamily || clientAppId || clientAppName || clientConfidence) {
+    return {
+      clientFamily,
+      clientAppId,
+      clientAppName,
+      clientConfidence,
+    };
+  }
+
+  const legacyMeta = parseProxyLogMessageMeta(typeof proxyLog.errorMessage === 'string' ? proxyLog.errorMessage : '');
+  return {
+    clientFamily: normalizeNullableText(legacyMeta.clientKind)?.toLowerCase() || null,
+    clientAppId: null,
+    clientAppName: null,
+    clientConfidence: null,
+  };
+}
+
+function normalizeProxyLogUsageSource(value: unknown): 'upstream' | 'self-log' | 'unknown' | null {
+  const normalized = normalizeNullableText(value)?.toLowerCase() || null;
+  if (normalized === 'upstream' || normalized === 'self-log' || normalized === 'unknown') {
+    return normalized;
+  }
+  return null;
+}
+
+function buildProxyLogClientOptions(rows: Array<{
+  clientFamily?: string | null;
+  clientAppId?: string | null;
+  clientAppName?: string | null;
+}>): ProxyLogClientOption[] {
+  const appOptions = new Map<string, ProxyLogClientOption>();
+  const familyOptions = new Map<string, ProxyLogClientOption>();
+
+  for (const row of rows) {
+    const clientAppId = normalizeNullableText(row.clientAppId)?.toLowerCase() || null;
+    const clientAppName = normalizeNullableText(row.clientAppName) || null;
+    const clientFamily = normalizeNullableText(row.clientFamily)?.toLowerCase() || null;
+
+    if (clientAppId && clientAppName && !appOptions.has(clientAppId)) {
+      appOptions.set(clientAppId, {
+        value: `app:${clientAppId}`,
+        label: `应用 · ${clientAppName}`,
+      });
+    }
+
+    if (clientFamily && clientFamily !== 'generic' && !familyOptions.has(clientFamily)) {
+      familyOptions.set(clientFamily, {
+        value: `family:${clientFamily}`,
+        label: `协议 · ${displayProxyLogClientFamily(clientFamily) || clientFamily}`,
+      });
+    }
+  }
+
+  return [
+    ...Array.from(appOptions.values()).sort((left, right) => left.label.localeCompare(right.label, 'zh-CN')),
+    ...Array.from(familyOptions.values()).sort((left, right) => left.label.localeCompare(right.label, 'zh-CN')),
+  ];
 }
 
 const SITE_AVAILABILITY_BUCKET_COUNT = 24;
@@ -202,7 +331,7 @@ type SiteAvailabilitySiteRow = {
 
 type SiteAvailabilityLogRow = {
   siteId: number | null;
-  createdAt: string | null;
+  createdAt: StoredUtcDateTimeInput;
   status: string | null;
   latencyMs: number | null;
 };
@@ -350,11 +479,18 @@ function mapProxyLogRow(
   },
   options?: { includeBillingDetails?: boolean },
 ) {
+  const clientMeta = resolveProxyLogClientMeta(row.proxy_logs);
+  const legacyMeta = parseProxyLogMessageMeta(typeof row.proxy_logs.errorMessage === 'string' ? row.proxy_logs.errorMessage : '');
   return {
     ...row.proxy_logs,
     ...(options?.includeBillingDetails
       ? { billingDetails: parseProxyLogBillingDetails(row.proxy_logs.billingDetails) }
       : {}),
+    clientFamily: clientMeta.clientFamily,
+    clientAppId: clientMeta.clientAppId,
+    clientAppName: clientMeta.clientAppName,
+    clientConfidence: clientMeta.clientConfidence,
+    usageSource: normalizeProxyLogUsageSource(legacyMeta.usageSource),
     username: row.accounts?.username || null,
     siteId: row.sites?.id || null,
     siteName: row.sites?.name || null,
@@ -546,6 +682,7 @@ export async function statsRoutes(app: FastifyInstance) {
     offset?: string;
     status?: string;
     search?: string;
+    client?: string;
     siteId?: string;
     from?: string;
     to?: string;
@@ -554,11 +691,13 @@ export async function statsRoutes(app: FastifyInstance) {
     const offset = normalizeProxyLogOffset(request.query.offset);
     const status = normalizeProxyLogStatusFilter(request.query.status);
     const search = normalizeProxyLogSearch(request.query.search);
+    const client = normalizeProxyLogClientFilter(request.query.client);
     const siteId = normalizeProxyLogSiteId(request.query.siteId);
     const fromUtc = normalizeProxyLogTimeBoundary(request.query.from);
     const toUtc = normalizeProxyLogTimeBoundary(request.query.to);
-    const listWhere = buildProxyLogWhereClause({ status, search, siteId, fromUtc, toUtc });
-    const summaryWhere = buildProxyLogWhereClause({ search, siteId, fromUtc, toUtc });
+    const listWhere = buildProxyLogWhereClause({ status, search, client, siteId, fromUtc, toUtc });
+    const summaryWhere = buildProxyLogWhereClause({ search, client, siteId, fromUtc, toUtc });
+    const clientOptionsWhere = buildProxyLogWhereClause({ status, search, siteId, fromUtc, toUtc });
 
     const listRows = await withProxyLogSelectFields(({ fields }) => {
       let query = db.select({
@@ -603,6 +742,31 @@ export async function statsRoutes(app: FastifyInstance) {
     }
     const totalRow = await totalQuery.get();
 
+    const clientOptionRows = await withProxyLogSelectFields(({ fields, includeClientFields }) => {
+      if (!includeClientFields) {
+        return Promise.resolve([]);
+      }
+
+      let query = db.select({
+        clientFamily: fields.clientFamily!,
+        clientAppId: fields.clientAppId!,
+        clientAppName: fields.clientAppName!,
+      }).from(schema.proxyLogs)
+        .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
+        .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+        .leftJoin(schema.downstreamApiKeys, eq(schema.proxyLogs.downstreamApiKeyId, schema.downstreamApiKeys.id));
+
+      if (clientOptionsWhere) {
+        query = query.where(clientOptionsWhere) as typeof query;
+      }
+
+      return query.all();
+    }, { includeBillingDetails: false, includeClientFields: true }) as Array<{
+      clientFamily?: string | null;
+      clientAppId?: string | null;
+      clientAppName?: string | null;
+    }>;
+
     let summaryQuery = db.select({
       totalCount: sql<number>`count(*)`,
       successCount: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
@@ -623,6 +787,7 @@ export async function statsRoutes(app: FastifyInstance) {
       total: Number(totalRow?.total || 0),
       page: Math.floor(offset / limit) + 1,
       pageSize: limit,
+      clientOptions: buildProxyLogClientOptions(clientOptionRows),
       summary: {
         totalCount: Number(summaryRow?.totalCount || 0),
         successCount: Number(summaryRow?.successCount || 0),
@@ -670,6 +835,26 @@ export async function statsRoutes(app: FastifyInstance) {
     return mapProxyLogRow(row, { includeBillingDetails: true });
   });
 
+  app.get<{ Querystring: { limit?: string } }>('/api/stats/proxy-debug/traces', async (request) => {
+    const limit = normalizeProxyLogPageSize(request.query.limit);
+    const items = await listProxyDebugTraces({ limit });
+    return { items };
+  });
+
+  app.get<{ Params: { id: string } }>('/api/stats/proxy-debug/traces/:id', async (request, reply) => {
+    const id = Number.parseInt(request.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return reply.code(400).send({ message: 'proxy debug trace id is invalid' });
+    }
+
+    const detail = await getProxyDebugTraceDetail(id);
+    if (!detail) {
+      return reply.code(404).send({ message: 'proxy debug trace not found' });
+    }
+
+    return detail;
+  });
+
   // Models marketplace - refresh upstream models and aggregate.
   app.get<{ Querystring: { refresh?: string; includePricing?: string } }>('/api/models/marketplace', async (request) => {
     const refreshRequested = parseBooleanFlag(request.query.refresh);
@@ -694,7 +879,7 @@ export async function statsRoutes(app: FastifyInstance) {
           },
           failureMessage: (currentTask) => `模型广场刷新失败：${currentTask.error || 'unknown error'}`,
         },
-        async () => refreshModelsAndRebuildRoutes(),
+        async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
       );
       refreshQueued = !reused;
       refreshReused = reused;
@@ -976,7 +1161,7 @@ export async function statsRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get('/api/models/token-candidates', async () => {
+  app.get('/api/models/token-candidates', { preHandler: [limitModelTokenCandidatesRead] }, async () => {
     const resolveTokenGroupLabel = (tokenGroup: string | null, tokenName: string | null): string | null => {
       const explicit = (tokenGroup || '').trim();
       if (explicit) return explicit;
@@ -990,6 +1175,11 @@ export async function statsRoutes(app: FastifyInstance) {
       if (/^token-\d+$/.test(normalized)) return null;
       return name;
     };
+
+    // Load global allowed models whitelist
+    const globalAllowedModels = new Set(
+      config.globalAllowedModels.map((m) => m.toLowerCase().trim()).filter(Boolean),
+    );
 
     const rows = await db.select().from(schema.tokenModelAvailability)
       .innerJoin(schema.accountTokens, eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id))
@@ -1012,6 +1202,7 @@ export async function statsRoutes(app: FastifyInstance) {
       siteId: schema.sites.id,
       siteName: schema.sites.name,
       accessToken: schema.accounts.accessToken,
+      apiToken: schema.accounts.apiToken,
       extraConfig: schema.accounts.extraConfig,
     })
       .from(schema.modelAvailability)
@@ -1090,7 +1281,7 @@ export async function statsRoutes(app: FastifyInstance) {
     }
 
     for (const row of availableModelRows) {
-      if (isApiKeyConnection(row)) continue;
+      if (!requiresManagedAccountTokens(row)) continue;
       const modelName = (row.modelName || '').trim();
       if (!modelName) continue;
       const coverageKey = `${row.accountId}::${modelName.toLowerCase()}`;
@@ -1107,7 +1298,7 @@ export async function statsRoutes(app: FastifyInstance) {
 
     const accountIdsForGroupHints = new Set(
       availableModelRows
-        .filter((row) => !isApiKeyConnection(row))
+        .filter((row) => requiresManagedAccountTokens(row))
         .map((row) => row.accountId),
     );
     const requiredGroupsByAccountModel = new Map<string, Map<string, string>>();
@@ -1169,7 +1360,7 @@ export async function statsRoutes(app: FastifyInstance) {
     }
 
     for (const row of availableModelRows) {
-      if (isApiKeyConnection(row)) continue;
+      if (!requiresManagedAccountTokens(row)) continue;
       const modelName = (row.modelName || '').trim();
       if (!modelName) continue;
       const accountModelKey = `${row.accountId}::${modelName.toLowerCase()}`;
@@ -1220,10 +1411,41 @@ export async function statsRoutes(app: FastifyInstance) {
       }
     }
 
+    // Apply model whitelist filter if configured
+    const filteredResult: typeof result = {};
+    const filteredModelsWithoutToken: typeof modelsWithoutToken = {};
+    const filteredModelsMissingTokenGroups: typeof modelsMissingTokenGroups = {};
+
+    if (globalAllowedModels.size > 0) {
+      // Filter result
+      for (const [modelName, candidates] of Object.entries(result)) {
+        if (globalAllowedModels.has(modelName.toLowerCase().trim())) {
+          filteredResult[modelName] = candidates;
+        }
+      }
+      // Filter modelsWithoutToken
+      for (const [modelName, accounts] of Object.entries(modelsWithoutToken)) {
+        if (globalAllowedModels.has(modelName.toLowerCase().trim())) {
+          filteredModelsWithoutToken[modelName] = accounts;
+        }
+      }
+      // Filter modelsMissingTokenGroups
+      for (const [modelName, accounts] of Object.entries(modelsMissingTokenGroups)) {
+        if (globalAllowedModels.has(modelName.toLowerCase().trim())) {
+          filteredModelsMissingTokenGroups[modelName] = accounts;
+        }
+      }
+    } else {
+      // No whitelist configured, return all models (backward compatible)
+      Object.assign(filteredResult, result);
+      Object.assign(filteredModelsWithoutToken, modelsWithoutToken);
+      Object.assign(filteredModelsMissingTokenGroups, modelsMissingTokenGroups);
+    }
+
     return {
-      models: result,
-      modelsWithoutToken,
-      modelsMissingTokenGroups,
+      models: filteredResult,
+      modelsWithoutToken: filteredModelsWithoutToken,
+      modelsMissingTokenGroups: filteredModelsMissingTokenGroups,
       endpointTypesByModel,
     };
   });
@@ -1236,7 +1458,7 @@ export async function statsRoutes(app: FastifyInstance) {
     }
 
     const refresh = await refreshModelsForAccount(accountId);
-    const rebuild = rebuildTokenRoutesFromAvailability();
+    const rebuild = await routeRefreshWorkflow.rebuildRoutesOnly();
     return { success: true, refresh, rebuild };
   });
 

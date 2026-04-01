@@ -1,5 +1,5 @@
+import type { Response as UndiciResponse } from 'undici';
 import type { DownstreamFormat } from './normalized.js';
-import type { EndpointAttemptContext, EndpointRecoverResult } from '../../routes/proxy/endpointFlow.js';
 import {
   buildMinimalJsonHeadersForCompatibility,
   isEndpointDispatchDeniedError,
@@ -12,6 +12,20 @@ import {
   isMessagesRequiredError,
   shouldRetryNormalizedMessagesBody,
 } from '../anthropic/messages/compatibility.js';
+
+type EndpointAttemptContext = {
+  request: CompatibilityRequest;
+  targetUrl: string;
+  response: UndiciResponse;
+  rawErrText: string;
+};
+
+type EndpointRecoverResult = {
+  upstream: UndiciResponse;
+  upstreamPath: string;
+  request?: CompatibilityRequest;
+  targetUrl?: string;
+} | null;
 
 type CompatibilityRequest = {
   endpoint: CompatibilityEndpoint;
@@ -58,6 +72,7 @@ export function createChatEndpointStrategy(input: CreateChatEndpointStrategyInpu
           return {
             upstream: normalizedResponse,
             upstreamPath: normalizedClaudeRequest.path,
+            request: normalizedClaudeRequest,
           };
         }
 
@@ -92,6 +107,8 @@ export function createChatEndpointStrategy(input: CreateChatEndpointStrategyInpu
         return {
           upstream: minimalResponse,
           upstreamPath: minimalRequest.path,
+          request: minimalRequest,
+          targetUrl: ctx.targetUrl,
         };
       }
 

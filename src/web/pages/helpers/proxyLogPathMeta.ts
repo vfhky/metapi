@@ -1,18 +1,24 @@
+import { parseProxyLogMetadata, type ParsedProxyLogMetadata } from '../../../shared/proxyLogMeta.js';
+
 type ProxyLogPathMeta = {
+  clientFamily: string | null;
+  sessionId: string | null;
   downstreamPath: string | null;
   upstreamPath: string | null;
+  usageSource: ParsedProxyLogMetadata['usageSource'];
   errorMessage: string;
 };
 
 export function parseProxyLogPathMeta(message?: string): ProxyLogPathMeta {
   const raw = typeof message === 'string' ? message.trim() : '';
-  const downstreamMatch = raw.match(/\[downstream:([^\]]+)\]/i);
-  const upstreamMatch = raw.match(/\[upstream:([^\]]+)\]/i);
-  const stripped = raw.replace(/^\s*(?:\[(?:downstream|upstream):[^\]]+\]\s*)+/i, '').trim();
+  const parsed = parseProxyLogMetadata(raw);
 
   return {
-    downstreamPath: downstreamMatch?.[1]?.trim() || null,
-    upstreamPath: upstreamMatch?.[1]?.trim() || null,
-    errorMessage: stripped,
+    clientFamily: parsed.clientKind,
+    sessionId: parsed.sessionId,
+    downstreamPath: parsed.downstreamPath,
+    upstreamPath: parsed.upstreamPath,
+    usageSource: parsed.usageSource,
+    errorMessage: parsed.messageText,
   };
 }

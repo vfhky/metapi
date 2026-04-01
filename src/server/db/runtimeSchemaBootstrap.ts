@@ -12,6 +12,7 @@ import {
   generateUpgradeSql,
   type MysqlIndexPrefixRequirementMap,
 } from './schemaArtifactGenerator.js';
+import { installPostgresJsonTextParsers } from './postgresJsonTextParsers.js';
 import { introspectLiveSchema } from './schemaIntrospection.js';
 import { resolveGeneratedSchemaContractPath, type SchemaContract } from './schemaContract.js';
 
@@ -312,12 +313,8 @@ async function resolveMySqlIndexPrefixRequirements(
     }
 
     const declaredType = String(row.column_type || row.data_type || '');
-    if (!requiresMysqlIndexPrefixForColumnType(declaredType)) {
-      continue;
-    }
-
     requirements[tableName] ??= {};
-    requirements[tableName][columnName] = true;
+    requirements[tableName][columnName] = requiresMysqlIndexPrefixForColumnType(declaredType);
   }
 
   return requirements;
@@ -328,6 +325,7 @@ async function createPostgresClient(connectionString: string, ssl: boolean): Pro
   if (ssl) {
     clientOptions.ssl = { rejectUnauthorized: false };
   }
+  installPostgresJsonTextParsers();
   const client = new pg.Client(clientOptions);
   await client.connect();
 

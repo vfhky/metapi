@@ -1,12 +1,15 @@
-﻿import React, { useEffect, useMemo, useState } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useToast } from '../components/Toast.js';
+import { useIsMobile } from '../components/useIsMobile.js';
 import ChangeKeyModal from '../components/ChangeKeyModal.js';
 import { useAnimatedVisibility } from '../components/useAnimatedVisibility.js';
-import { BrandGlyph, InlineBrandIcon, getBrand, normalizeBrandIconKey } from '../components/BrandIcon.js';
 import ModernSelect from '../components/ModernSelect.js';
+import DownstreamApiKeyModal from './settings/DownstreamApiKeyModal.js';
+import FactoryResetModal from './settings/FactoryResetModal.js';
+import RouteSelectorModal from './settings/RouteSelectorModal.js';
+import UpdateCenterSection from './settings/UpdateCenterSection.js';
 import {
   applyRoutingProfilePreset,
   resolveRoutingProfilePreset,
@@ -16,27 +19,57 @@ import { fuzzyMatch } from './helpers/fuzzySearch.js';
 import { clearAuthSession } from '../authSession.js';
 import { clearAppInstallationState } from '../appLocalState.js';
 import { tr } from '../i18n.js';
+import {
+  isExactModelPattern,
+  resolveRouteTitle,
+} from './token-routes/utils.js';
+import { generateDownstreamSkKey } from './helpers/generateDownstreamSkKey.js';
 
 const PROXY_TOKEN_PREFIX = 'sk-';
-const ROUTE_BRAND_ICON_PREFIX = 'brand:';
 const FACTORY_RESET_ADMIN_TOKEN = 'change-me-admin-token';
 const FACTORY_RESET_CONFIRM_SECONDS = 3;
+const CHECKIN_SCHEDULE_MODE_OPTIONS = [
+  { value: 'cron', label: 'Cron' },
+  { value: 'interval', label: '间隔签到' },
+] as const;
+const CHECKIN_INTERVAL_OPTIONS = Array.from({ length: 24 }, (_, index) => {
+  const hour = index + 1;
+  return {
+    value: String(hour),
+    label: `${hour} 小时`,
+  };
+});
 type DbDialect = 'sqlite' | 'mysql' | 'postgres';
 
 type RuntimeSettings = {
   checkinCron: string;
+  checkinScheduleMode: 'cron' | 'interval';
+  checkinIntervalHours: number;
   balanceRefreshCron: string;
   logCleanupCron: string;
   logCleanupUsageLogsEnabled: boolean;
   logCleanupProgramLogsEnabled: boolean;
   logCleanupRetentionDays: number;
+  codexUpstreamWebsocketEnabled: boolean;
+  disableCrossProtocolFallback: boolean;
+  proxySessionChannelConcurrencyLimit: number;
+  proxySessionChannelQueueWaitMs: number;
   routingFallbackUnitCost: number;
   routingWeights: RoutingWeights;
   systemProxyUrl: string;
+  proxyErrorKeywords: string[];
+  proxyEmptyContentFailEnabled: boolean;
   proxyTokenMasked?: string;
   adminIpAllowlist?: string[];
   currentAdminIp?: string;
+  globalBlockedBrands?: string[];
+  globalAllowedModels?: string[];
 };
+
+type SystemProxyTestState =
+  | { kind: 'success'; text: string }
+  | { kind: 'error'; text: string }
+  | null;
 
 type DownstreamApiKeyItem = {
   id: number;
@@ -151,56 +184,49 @@ function inferUrlDialect(connectionString: string): 'mysql' | 'postgres' | null 
   return null;
 }
 
-function isRegexModelPattern(pattern: string): boolean {
-  return pattern.trim().toLowerCase().startsWith('re:');
-}
-
-function isExactModelPattern(modelPattern: string): boolean {
-  const normalized = modelPattern.trim();
-  if (!normalized) return false;
-  if (isRegexModelPattern(normalized)) return false;
-  return !/[\*\?\[]/.test(normalized);
-}
-
-function routeTitle(route: RouteSelectorItem): string {
-  const displayName = (route.displayName || '').trim();
-  return displayName || route.modelPattern;
-}
-
-function parseBrandIconValue(raw: string | null | undefined): string | null {
-  const normalized = (raw || '').trim();
-  if (!normalized.startsWith(ROUTE_BRAND_ICON_PREFIX)) return null;
-  const icon = normalized.slice(ROUTE_BRAND_ICON_PREFIX.length).trim();
-  return normalizeBrandIconKey(icon);
-}
-
-function resolveRouteBrandSource(route: RouteSelectorItem): string {
-  const title = routeTitle(route);
-  if (getBrand(title)) return title;
-  return route.modelPattern;
-}
-
 export default function Settings() {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const [runtime, setRuntime] = useState<RuntimeSettings>({
     checkinCron: '0 8 * * *',
+    checkinScheduleMode: 'cron',
+    checkinIntervalHours: 6,
     balanceRefreshCron: '0 * * * *',
     logCleanupCron: '0 6 * * *',
     logCleanupUsageLogsEnabled: false,
     logCleanupProgramLogsEnabled: false,
     logCleanupRetentionDays: 30,
+    codexUpstreamWebsocketEnabled: false,
+    disableCrossProtocolFallback: false,
+    proxySessionChannelConcurrencyLimit: 2,
+    proxySessionChannelQueueWaitMs: 1500,
     routingFallbackUnitCost: 1,
     routingWeights: defaultWeights,
     systemProxyUrl: '',
+    proxyErrorKeywords: [],
+    proxyEmptyContentFailEnabled: false,
   });
   const [proxyTokenSuffix, setProxyTokenSuffix] = useState('');
+  const [proxyErrorKeywordsText, setProxyErrorKeywordsText] = useState('');
   const [maskedToken, setMaskedToken] = useState('');
   const [loading, setLoading] = useState(true);
   const [savingSchedule, setSavingSchedule] = useState(false);
+  const [testingCheckin, setTestingCheckin] = useState(false);
   const [savingToken, setSavingToken] = useState(false);
   const [savingSystemProxy, setSavingSystemProxy] = useState(false);
+  const [savingProxyTransport, setSavingProxyTransport] = useState(false);
+  const [testingSystemProxy, setTestingSystemProxy] = useState(false);
+  const [systemProxyTestState, setSystemProxyTestState] = useState<SystemProxyTestState>(null);
+  const [savingProxyFailureRules, setSavingProxyFailureRules] = useState(false);
   const [savingRouting, setSavingRouting] = useState(false);
   const [showAdvancedRouting, setShowAdvancedRouting] = useState(false);
+  const [allBrandNames, setAllBrandNames] = useState<string[] | null>(null);
+  const [blockedBrands, setBlockedBrands] = useState<string[]>([]);
+  const [savingBrandFilter, setSavingBrandFilter] = useState(false);
+  const [availableModels, setAvailableModels] = useState<string[] | null>(null);
+  const [allowedModels, setAllowedModels] = useState<string[]>([]);
+  const [allowedModelsInput, setAllowedModelsInput] = useState('');
+  const [savingAllowedModels, setSavingAllowedModels] = useState(false);
   const [savingSecurity, setSavingSecurity] = useState(false);
   const [adminIpAllowlistText, setAdminIpAllowlistText] = useState('');
   const [clearingCache, setClearingCache] = useState(false);
@@ -269,7 +295,7 @@ export default function Settings() {
   const groupRouteOptions = useMemo(() => (
     selectorRoutes
       .filter((route) => !isExactModelPattern(route.modelPattern))
-      .sort((a, b) => routeTitle(a).localeCompare(routeTitle(b), undefined, { sensitivity: 'base' }))
+      .sort((a, b) => resolveRouteTitle(a).localeCompare(resolveRouteTitle(b), undefined, { sensitivity: 'base' }))
   ), [selectorRoutes]);
 
   const filteredExactModelOptions = useMemo(() => {
@@ -282,7 +308,7 @@ export default function Settings() {
     const query = selectorGroupSearch.trim();
     if (!query) return groupRouteOptions;
     return groupRouteOptions.filter((route) => {
-      const matchText = `${routeTitle(route)} ${route.modelPattern} ${route.displayName || ''}`;
+      const matchText = `${resolveRouteTitle(route)} ${route.modelPattern}`;
       return fuzzyMatch(matchText, query);
     });
   }, [groupRouteOptions, selectorGroupSearch]);
@@ -390,6 +416,10 @@ export default function Settings() {
       setMaskedToken(authInfo.masked || '****');
       setRuntime({
         checkinCron: runtimeInfo.checkinCron || '0 8 * * *',
+        checkinScheduleMode: runtimeInfo.checkinScheduleMode === 'interval' ? 'interval' : 'cron',
+        checkinIntervalHours: Number(runtimeInfo.checkinIntervalHours) >= 1
+          ? Math.min(24, Math.trunc(Number(runtimeInfo.checkinIntervalHours)))
+          : 6,
         balanceRefreshCron: runtimeInfo.balanceRefreshCron || '0 * * * *',
         logCleanupCron: runtimeInfo.logCleanupCron || '0 6 * * *',
         logCleanupUsageLogsEnabled: !!runtimeInfo.logCleanupUsageLogsEnabled,
@@ -397,6 +427,14 @@ export default function Settings() {
         logCleanupRetentionDays: Number(runtimeInfo.logCleanupRetentionDays) >= 1
           ? Math.trunc(Number(runtimeInfo.logCleanupRetentionDays))
           : 30,
+        codexUpstreamWebsocketEnabled: !!runtimeInfo.codexUpstreamWebsocketEnabled,
+        disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
+        proxySessionChannelConcurrencyLimit: Number(runtimeInfo.proxySessionChannelConcurrencyLimit) >= 0
+          ? Math.trunc(Number(runtimeInfo.proxySessionChannelConcurrencyLimit))
+          : 2,
+        proxySessionChannelQueueWaitMs: Number(runtimeInfo.proxySessionChannelQueueWaitMs) >= 0
+          ? Math.trunc(Number(runtimeInfo.proxySessionChannelQueueWaitMs))
+          : 1500,
         routingFallbackUnitCost: Number(runtimeInfo.routingFallbackUnitCost) > 0
           ? Number(runtimeInfo.routingFallbackUnitCost)
           : 1,
@@ -405,12 +443,25 @@ export default function Settings() {
           ...(runtimeInfo.routingWeights || {}),
         },
         systemProxyUrl: typeof runtimeInfo.systemProxyUrl === 'string' ? runtimeInfo.systemProxyUrl : '',
+        proxyErrorKeywords: Array.isArray(runtimeInfo.proxyErrorKeywords)
+          ? runtimeInfo.proxyErrorKeywords.filter((item: unknown) => typeof item === 'string')
+          : [],
+        proxyEmptyContentFailEnabled: !!runtimeInfo.proxyEmptyContentFailEnabled,
         proxyTokenMasked: runtimeInfo.proxyTokenMasked || '',
         adminIpAllowlist: Array.isArray(runtimeInfo.adminIpAllowlist)
           ? runtimeInfo.adminIpAllowlist.filter((item: unknown) => typeof item === 'string')
           : [],
         currentAdminIp: typeof runtimeInfo.currentAdminIp === 'string' ? runtimeInfo.currentAdminIp : '',
+        globalBlockedBrands: Array.isArray(runtimeInfo.globalBlockedBrands) ? runtimeInfo.globalBlockedBrands : [],
+        globalAllowedModels: Array.isArray(runtimeInfo.globalAllowedModels) ? runtimeInfo.globalAllowedModels : [],
       });
+      setBlockedBrands(Array.isArray(runtimeInfo.globalBlockedBrands) ? runtimeInfo.globalBlockedBrands : []);
+      setAllowedModels(Array.isArray(runtimeInfo.globalAllowedModels) ? runtimeInfo.globalAllowedModels : []);
+      setProxyErrorKeywordsText(
+        Array.isArray(runtimeInfo.proxyErrorKeywords)
+          ? runtimeInfo.proxyErrorKeywords.filter((item: unknown) => typeof item === 'string').join('\n')
+          : '',
+      );
       setAdminIpAllowlistText(
         Array.isArray(runtimeInfo.adminIpAllowlist)
           ? runtimeInfo.adminIpAllowlist.join('\n')
@@ -448,6 +499,18 @@ export default function Settings() {
     } finally {
       setLoading(false);
     }
+    // Load brand list in background (non-blocking, best-effort)
+    api.getBrandList()
+      .then((res: any) => setAllBrandNames(Array.isArray(res?.brands) ? res.brands : []))
+      .catch(() => setAllBrandNames([]));
+    // Load available models in background (non-blocking, best-effort)
+    api.getModelTokenCandidates()
+      .then((res: any) => {
+        const models = res?.models || {};
+        const modelNames = Object.keys(models);
+        setAvailableModels(modelNames.sort());
+      })
+      .catch(() => setAvailableModels([]));
   };
 
   useEffect(() => {
@@ -462,11 +525,18 @@ export default function Settings() {
     return compact;
   };
 
+  const parseProxyErrorKeywords = (raw: string) => raw
+    .split(/\r?\n|,/g)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
   const saveSchedule = async () => {
     setSavingSchedule(true);
     try {
       await api.updateRuntimeSettings({
         checkinCron: runtime.checkinCron,
+        checkinScheduleMode: runtime.checkinScheduleMode,
+        checkinIntervalHours: runtime.checkinIntervalHours,
         balanceRefreshCron: runtime.balanceRefreshCron,
         logCleanupCron: runtime.logCleanupCron,
         logCleanupUsageLogsEnabled: runtime.logCleanupUsageLogsEnabled,
@@ -478,6 +548,18 @@ export default function Settings() {
       toast.error(err?.message || '保存失败');
     } finally {
       setSavingSchedule(false);
+    }
+  };
+
+  const triggerScheduleCheckin = async () => {
+    setTestingCheckin(true);
+    try {
+      await api.triggerCheckinAll();
+      toast.success('已开始全部签到，请稍后查看签到日志');
+    } catch (err: any) {
+      toast.error(err?.message || '触发签到失败');
+    } finally {
+      setTestingCheckin(false);
     }
   };
 
@@ -517,6 +599,86 @@ export default function Settings() {
       toast.error(err?.message || '保存失败');
     } finally {
       setSavingSystemProxy(false);
+    }
+  };
+
+  const saveProxyTransportSettings = async () => {
+    setSavingProxyTransport(true);
+    try {
+      const res = await api.updateRuntimeSettings({
+        codexUpstreamWebsocketEnabled: runtime.codexUpstreamWebsocketEnabled,
+        proxySessionChannelConcurrencyLimit: runtime.proxySessionChannelConcurrencyLimit,
+        proxySessionChannelQueueWaitMs: runtime.proxySessionChannelQueueWaitMs,
+      });
+      setRuntime((prev) => ({
+        ...prev,
+        codexUpstreamWebsocketEnabled: typeof res?.codexUpstreamWebsocketEnabled === 'boolean'
+          ? res.codexUpstreamWebsocketEnabled
+          : prev.codexUpstreamWebsocketEnabled,
+        proxySessionChannelConcurrencyLimit: Number(res?.proxySessionChannelConcurrencyLimit) >= 0
+          ? Math.trunc(Number(res.proxySessionChannelConcurrencyLimit))
+          : prev.proxySessionChannelConcurrencyLimit,
+        proxySessionChannelQueueWaitMs: Number(res?.proxySessionChannelQueueWaitMs) >= 0
+          ? Math.trunc(Number(res.proxySessionChannelQueueWaitMs))
+          : prev.proxySessionChannelQueueWaitMs,
+      }));
+      toast.success('传输与会话并发设置已保存');
+    } catch (err: any) {
+      toast.error(err?.message || '保存失败');
+    } finally {
+      setSavingProxyTransport(false);
+    }
+  };
+
+  const testSystemProxy = async () => {
+    const proxyUrl = runtime.systemProxyUrl.trim();
+    if (!proxyUrl) {
+      const message = '请先填写系统代理地址';
+      setSystemProxyTestState({ kind: 'error', text: message });
+      toast.info(message);
+      return;
+    }
+
+    setTestingSystemProxy(true);
+    setSystemProxyTestState(null);
+    try {
+      const res = await api.testSystemProxy({ proxyUrl });
+      const summary = `连通成功，延迟 ${res.latencyMs} ms`;
+      setSystemProxyTestState({ kind: 'success', text: summary });
+      toast.success(`系统代理测试成功（${res.latencyMs} ms）`);
+    } catch (err: any) {
+      const message = err?.message || '系统代理测试失败';
+      setSystemProxyTestState({ kind: 'error', text: message });
+      toast.error(message);
+    } finally {
+      setTestingSystemProxy(false);
+    }
+  };
+
+  const saveProxyFailureRules = async () => {
+    setSavingProxyFailureRules(true);
+    try {
+      const keywords = parseProxyErrorKeywords(proxyErrorKeywordsText);
+      const res = await api.updateRuntimeSettings({
+        proxyErrorKeywords: keywords,
+        proxyEmptyContentFailEnabled: runtime.proxyEmptyContentFailEnabled,
+      });
+      const nextKeywords = Array.isArray(res?.proxyErrorKeywords)
+        ? res.proxyErrorKeywords
+        : keywords;
+      setRuntime((prev) => ({
+        ...prev,
+        proxyErrorKeywords: nextKeywords,
+        proxyEmptyContentFailEnabled: typeof res?.proxyEmptyContentFailEnabled === 'boolean'
+          ? res.proxyEmptyContentFailEnabled
+          : prev.proxyEmptyContentFailEnabled,
+      }));
+      setProxyErrorKeywordsText(nextKeywords.join('\n'));
+      toast.success('代理失败规则已保存');
+    } catch (err: any) {
+      toast.error(err?.message || '保存失败');
+    } finally {
+      setSavingProxyFailureRules(false);
     }
   };
 
@@ -683,6 +845,7 @@ export default function Settings() {
       await api.updateRuntimeSettings({
         routingWeights: runtime.routingWeights,
         routingFallbackUnitCost: runtime.routingFallbackUnitCost,
+        disableCrossProtocolFallback: runtime.disableCrossProtocolFallback,
       });
       toast.success('Routing weights saved');
     } catch (err: any) {
@@ -697,6 +860,48 @@ export default function Settings() {
       ...prev,
       routingWeights: applyRoutingProfilePreset(preset),
     }));
+  };
+
+  const handleSaveBrandFilter = async () => {
+    setSavingBrandFilter(true);
+    try {
+      const res = await api.updateRuntimeSettings({ globalBlockedBrands: blockedBrands });
+      const resolved = Array.isArray(res?.globalBlockedBrands) ? res.globalBlockedBrands : blockedBrands;
+      setRuntime((prev) => ({ ...prev, globalBlockedBrands: resolved }));
+      setBlockedBrands(resolved);
+      toast.success('品牌屏蔽设置已保存');
+      try {
+        await api.rebuildRoutes(false);
+        toast.success('路由已重建');
+      } catch {
+        toast.error('品牌屏蔽已保存，但路由重建失败，请手动重建');
+      }
+    } catch (err: any) {
+      toast.error(err?.message || '保存品牌屏蔽设置失败');
+    } finally {
+      setSavingBrandFilter(false);
+    }
+  };
+
+  const handleSaveAllowedModels = async () => {
+    setSavingAllowedModels(true);
+    try {
+      const res = await api.updateRuntimeSettings({ globalAllowedModels: allowedModels });
+      const resolved = Array.isArray(res?.globalAllowedModels) ? res.globalAllowedModels : allowedModels;
+      setRuntime((prev) => ({ ...prev, globalAllowedModels: resolved }));
+      setAllowedModels(resolved);
+      toast.success('模型白名单设置已保存');
+      try {
+        await api.rebuildRoutes(false);
+        toast.success('路由已重建');
+      } catch {
+        toast.error('模型白名单已保存，但路由重建失败，请手动重建');
+      }
+    } catch (err: any) {
+      toast.error(err?.message || '保存模型白名单设置失败');
+    } finally {
+      setSavingAllowedModels(false);
+    }
   };
 
   const saveSecuritySettings = async () => {
@@ -905,13 +1110,47 @@ export default function Settings() {
 
         <div className="card animate-slide-up stagger-2" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12 }}>定时任务</div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '180px 180px auto', gap: 12, alignItems: 'end', marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>签到方式</div>
+              <ModernSelect
+                value={runtime.checkinScheduleMode}
+                onChange={(value) => setRuntime((prev) => ({
+                  ...prev,
+                  checkinScheduleMode: value === 'interval' ? 'interval' : 'cron',
+                }))}
+                options={CHECKIN_SCHEDULE_MODE_OPTIONS.map((item) => ({ ...item }))}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>签到间隔</div>
+              <ModernSelect
+                value={String(runtime.checkinIntervalHours)}
+                onChange={(value) => setRuntime((prev) => ({
+                  ...prev,
+                  checkinIntervalHours: Math.min(24, Math.max(1, Math.trunc(Number(value) || 1))),
+                }))}
+                disabled={runtime.checkinScheduleMode !== 'interval'}
+                options={CHECKIN_INTERVAL_OPTIONS}
+              />
+            </div>
+            <button
+              onClick={triggerScheduleCheckin}
+              disabled={testingCheckin}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)', whiteSpace: 'nowrap' }}
+            >
+              {testingCheckin ? '触发中...' : '测试一次签到'}
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
             <div>
               <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>签到 Cron</div>
               <input
                 value={runtime.checkinCron}
                 onChange={(e) => setRuntime((prev) => ({ ...prev, checkinCron: e.target.value }))}
                 style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
+                disabled={runtime.checkinScheduleMode !== 'cron'}
               />
             </div>
             <div>
@@ -933,7 +1172,7 @@ export default function Settings() {
             }}
           >
             <div style={{ fontWeight: 600, fontSize: 13 }}>自动清理日志</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px', gap: 12 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 160px', gap: 12 }}>
               <div>
                 <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>清理 Cron</div>
                 <input
@@ -997,13 +1236,137 @@ export default function Settings() {
           </div>
           <input
             value={runtime.systemProxyUrl}
-            onChange={(e) => setRuntime((prev) => ({ ...prev, systemProxyUrl: e.target.value }))}
+            onChange={(e) => {
+              setRuntime((prev) => ({ ...prev, systemProxyUrl: e.target.value }));
+              setSystemProxyTestState(null);
+            }}
             placeholder="系统代理 URL（可选，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）"
             style={{ ...inputStyle, fontFamily: 'var(--font-mono)', marginBottom: 10 }}
           />
-          <button onClick={saveSystemProxy} disabled={savingSystemProxy} className="btn btn-primary">
-            {savingSystemProxy ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存系统代理'}
-          </button>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button onClick={saveSystemProxy} disabled={savingSystemProxy} className="btn btn-primary">
+              {savingSystemProxy ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存系统代理'}
+            </button>
+            <button
+              onClick={testSystemProxy}
+              disabled={testingSystemProxy}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)' }}
+            >
+              {testingSystemProxy ? <><span className="spinner spinner-sm" /> 测试中...</> : '测试系统代理'}
+            </button>
+          </div>
+          {systemProxyTestState && (
+            <div
+              style={{
+                fontSize: 12,
+                marginTop: 10,
+                color: systemProxyTestState.kind === 'success'
+                  ? 'var(--color-success)'
+                  : 'var(--color-danger)',
+              }}
+            >
+              {systemProxyTestState.text}
+            </div>
+          )}
+        </div>
+
+        <div className="card animate-slide-up stagger-4" style={{ padding: 20 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>代理失败判定</div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
+            命中任一关键词或空内容时判定失败，可触发重试。
+          </div>
+          <textarea
+            value={proxyErrorKeywordsText}
+            onChange={(e) => setProxyErrorKeywordsText(e.target.value)}
+            placeholder="一行一个关键词，或逗号分隔"
+            style={{
+              ...inputStyle,
+              fontFamily: 'var(--font-mono)',
+              minHeight: 96,
+              resize: 'vertical',
+              marginBottom: 12,
+            }}
+          />
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 12 }}>
+            <input
+              type="checkbox"
+              checked={runtime.proxyEmptyContentFailEnabled}
+              onChange={(e) => setRuntime((prev) => ({ ...prev, proxyEmptyContentFailEnabled: e.target.checked }))}
+            />
+            空内容（completion=0，即使 prompt 有 token 也算）判定失败
+          </label>
+          <div>
+            <button onClick={saveProxyFailureRules} disabled={savingProxyFailureRules} className="btn btn-primary">
+              {savingProxyFailureRules ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存失败规则'}
+            </button>
+          </div>
+        </div>
+
+        <div className="card animate-slide-up stagger-4" style={{ padding: 20 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>Codex 上游传输与会话并发</div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
+            默认采用 HTTP 优先。只有这里开启后，metapi 才会在 Codex 请求上尝试把上游升级为 WebSocket。
+            下游 Codex 客户端也必须同时启用 `/v1/responses` websocket，单开这里不会生效。
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
+            从旧版本升级时，原先账号 `extraConfig.websockets` 的行为不再单独生效；现在统一以这里的全局设置和下游客户端是否开启为准。
+          </div>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 14 }}>
+            <input
+              type="checkbox"
+              checked={runtime.codexUpstreamWebsocketEnabled}
+              onChange={(e) => setRuntime((prev) => ({ ...prev, codexUpstreamWebsocketEnabled: e.target.checked }))}
+            />
+            允许 metapi 到 Codex 上游使用 WebSocket
+          </label>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>会话通道并发上限</div>
+              <input
+                type="number"
+                min={0}
+                value={runtime.proxySessionChannelConcurrencyLimit}
+                onChange={(e) => {
+                  const nextValue = Number(e.target.value);
+                  setRuntime((prev) => ({
+                    ...prev,
+                    proxySessionChannelConcurrencyLimit: Number.isFinite(nextValue) && nextValue >= 0
+                      ? Math.trunc(nextValue)
+                      : prev.proxySessionChannelConcurrencyLimit,
+                  }));
+                }}
+                style={inputStyle}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>排队等待时间（毫秒）</div>
+              <input
+                type="number"
+                min={0}
+                step={100}
+                value={runtime.proxySessionChannelQueueWaitMs}
+                onChange={(e) => {
+                  const nextValue = Number(e.target.value);
+                  setRuntime((prev) => ({
+                    ...prev,
+                    proxySessionChannelQueueWaitMs: Number.isFinite(nextValue) && nextValue >= 0
+                      ? Math.trunc(nextValue)
+                      : prev.proxySessionChannelQueueWaitMs,
+                  }));
+                }}
+                style={inputStyle}
+              />
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
+            这组 lease 只作用于能识别稳定 `session_id` 的会话型请求；没有稳定会话标识的普通请求不会进入这个池。
+          </div>
+          <div>
+            <button onClick={saveProxyTransportSettings} disabled={savingProxyTransport} className="btn btn-primary">
+              {savingProxyTransport ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存传输与并发'}
+            </button>
+          </div>
         </div>
 
         <div className="card animate-slide-up stagger-4" style={{ padding: 20 }}>
@@ -1016,42 +1379,83 @@ export default function Settings() {
           </code>
           <div
             style={{
-              ...inputStyle,
-              marginBottom: 10,
-              padding: 0,
               display: 'flex',
-              alignItems: 'center',
-              overflow: 'hidden',
+              gap: 10,
+              alignItems: 'stretch',
+              marginBottom: 10,
+              minWidth: 0,
+              flexWrap: 'wrap',
             }}
           >
-            <span
+            <div
               style={{
-                padding: '10px 12px',
-                borderRight: '1px solid var(--color-border-light)',
-                fontFamily: 'var(--font-mono)',
-                fontSize: 13,
-                color: 'var(--color-text-secondary)',
-                userSelect: 'none',
+                ...inputStyle,
+                flex: 1,
+                minWidth: 200,
+                marginBottom: 0,
+                padding: 0,
+                display: 'flex',
+                alignItems: 'center',
+                overflow: 'hidden',
               }}
             >
-              {PROXY_TOKEN_PREFIX}
-            </span>
-            <input
-              type="password"
-              value={proxyTokenSuffix}
-              onChange={(e) => setProxyTokenSuffix(normalizeProxyTokenSuffix(e.target.value))}
-              placeholder="请输入 sk- 后的令牌内容"
+              <span
+                style={{
+                  padding: '10px 12px',
+                  borderRight: '1px solid var(--color-border-light)',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 13,
+                  color: 'var(--color-text-secondary)',
+                  userSelect: 'none',
+                  background: 'color-mix(in srgb, var(--color-text-muted) 6%, transparent)',
+                }}
+              >
+                {PROXY_TOKEN_PREFIX}
+              </span>
+              <input
+                type="text"
+                value={proxyTokenSuffix}
+                onChange={(e) => setProxyTokenSuffix(normalizeProxyTokenSuffix(e.target.value))}
+                placeholder="请输入 sk- 后的令牌内容"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  border: 'none',
+                  outline: 'none',
+                  background: 'transparent',
+                  color: 'var(--color-text-primary)',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 13,
+                  padding: '10px 12px',
+                }}
+              />
+            </div>
+            <button
+              type="button"
+              className="btn btn-soft-primary"
+              aria-label="随机生成访问令牌后缀"
+              title="生成高熵随机后缀（不会自动保存）"
               style={{
-                flex: 1,
-                border: 'none',
-                outline: 'none',
-                background: 'transparent',
-                color: 'var(--color-text-primary)',
-                fontFamily: 'var(--font-mono)',
+                flexShrink: 0,
+                padding: '10px 18px',
                 fontSize: 13,
-                padding: '10px 12px',
+                gap: 8,
+                alignSelf: 'stretch',
               }}
-            />
+              onClick={() => {
+                const full = generateDownstreamSkKey(PROXY_TOKEN_PREFIX);
+                setProxyTokenSuffix(full.slice(PROXY_TOKEN_PREFIX.length));
+              }}
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"
+                />
+              </svg>
+              随机生成
+            </button>
           </div>
           <button onClick={saveProxyToken} disabled={savingToken} className="btn btn-primary">
             {savingToken ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '更新下游访问令牌'}
@@ -1134,9 +1538,29 @@ export default function Settings() {
             </button>
           </div>
 
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={runtime.disableCrossProtocolFallback}
+              onChange={(e) => setRuntime((prev) => ({
+                ...prev,
+                disableCrossProtocolFallback: e.target.checked,
+              }))}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                失败时不尝试其他协议
+              </span>
+              <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
+                仅影响 chat / messages / responses 之间的协议切换；不会关闭同协议兼容重试、OAuth 刷新或通道级重试。
+              </span>
+            </span>
+          </label>
+
           <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()}>
             <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
               {([
                 ['baseWeightFactor', '基础权重因子'],
                 ['valueScoreFactor', '价值分因子'],
@@ -1176,13 +1600,173 @@ export default function Settings() {
           </div>
         </div>
 
+        {/* Global Brand Filter */}
         <div className="card animate-slide-up stagger-6" style={{ padding: 20 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>全局品牌屏蔽</div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.6 }}>
+            屏蔽选定品牌后，路由重建时将自动跳过匹配该品牌的所有模型。点击品牌切换屏蔽状态，保存后自动触发路由重建。
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+            {(allBrandNames || []).map((brand) => {
+              const isBlocked = blockedBrands.includes(brand);
+              return (
+                <button
+                  key={brand}
+                  type="button"
+                  role="switch"
+                  aria-checked={isBlocked}
+                  onClick={() => {
+                    if (isBlocked) {
+                      setBlockedBrands((prev) => prev.filter((b) => b !== brand));
+                    } else {
+                      setBlockedBrands((prev) => [...prev, brand]);
+                    }
+                  }}
+                  className={`badge ${isBlocked ? 'badge-warning' : 'badge-muted'}`}
+                  style={{
+                    fontSize: 12, cursor: 'pointer', border: 'none', padding: '5px 12px',
+                    transition: 'all 0.15s ease',
+                  }}
+                >
+                  {brand}
+                </button>
+              );
+            })}
+            {allBrandNames === null && (
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>加载品牌列表中...</span>
+            )}
+            {allBrandNames !== null && allBrandNames.length === 0 && (
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>暂无可用品牌</span>
+            )}
+          </div>
+          {blockedBrands.length > 0 && (
+            <div style={{ fontSize: 12, color: 'var(--color-warning)', marginBottom: 10 }}>
+              已屏蔽 {blockedBrands.length} 个品牌：{blockedBrands.join('、')}
+            </div>
+          )}
+          <button onClick={handleSaveBrandFilter} disabled={savingBrandFilter} className="btn btn-primary" style={{ fontSize: 12, padding: '6px 16px' }}>
+            {savingBrandFilter ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存品牌屏蔽'}
+          </button>
+        </div>
+
+        {/* Global Allowed Models Whitelist */}
+        <div className="card animate-slide-up stagger-7" style={{ padding: 20 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>全局模型白名单</div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.6 }}>
+            配置白名单后，路由重建和候选生成将只针对白名单中的模型。留空表示允许所有模型（向后兼容）。保存后自动触发路由重建。
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input
+                type="text"
+                placeholder="输入模型名称，如：gpt-4"
+                value={allowedModelsInput}
+                onChange={(e) => setAllowedModelsInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && allowedModelsInput.trim()) {
+                    const model = allowedModelsInput.trim();
+                    if (!allowedModels.includes(model)) {
+                      setAllowedModels((prev) => [...prev, model]);
+                    }
+                    setAllowedModelsInput('');
+                  }
+                }}
+                style={{ flex: 1, ...inputStyle }}
+              />
+              <button
+                onClick={() => {
+                  if (allowedModelsInput.trim()) {
+                    const model = allowedModelsInput.trim();
+                    if (!allowedModels.includes(model)) {
+                      setAllowedModels((prev) => [...prev, model]);
+                    }
+                    setAllowedModelsInput('');
+                  }
+                }}
+                className="btn btn-ghost"
+                style={{ border: '1px solid var(--color-border)', fontSize: 12, padding: '6px 12px' }}
+              >
+                添加
+              </button>
+            </div>
+            {availableModels && availableModels.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
+                  或从当前可用模型中选择：
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto', border: '1px solid var(--color-border)', padding: 8, borderRadius: 4 }}>
+                  {availableModels.map((model) => {
+                    const isAllowed = allowedModels.includes(model);
+                    return (
+                      <button
+                        key={model}
+                        type="button"
+                        onClick={() => {
+                          if (isAllowed) {
+                            setAllowedModels((prev) => prev.filter((m) => m !== model));
+                          } else {
+                            setAllowedModels((prev) => [...prev, model]);
+                          }
+                        }}
+                        className={`badge ${isAllowed ? 'badge-success' : 'badge-muted'}`}
+                        style={{
+                          fontSize: 11, cursor: 'pointer', border: 'none', padding: '4px 10px',
+                          transition: 'all 0.15s ease',
+                        }}
+                      >
+                        {model}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {allowedModels.length > 0 && (
+              <div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
+                  已选择 {allowedModels.length} 个模型：
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {allowedModels.map((model) => (
+                    <div
+                      key={model}
+                      className="badge badge-success"
+                      style={{ fontSize: 11, padding: '4px 10px', display: 'flex', alignItems: 'center', gap: 4 }}
+                    >
+                      {model}
+                      <button
+                        onClick={() => setAllowedModels((prev) => prev.filter((m) => m !== model))}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: 'inherit',
+                          cursor: 'pointer',
+                          padding: 0,
+                          fontSize: 14,
+                          lineHeight: 1,
+                        }}
+                        title="移除"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <button onClick={handleSaveAllowedModels} disabled={savingAllowedModels} className="btn btn-primary" style={{ fontSize: 12, padding: '6px 16px' }}>
+            {savingAllowedModels ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存模型白名单'}
+          </button>
+        </div>
+
+        <div className="card animate-slide-up stagger-8" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 10 }}>数据库迁移（SQLite / MySQL / PostgreSQL）</div>
           <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
             可先测试连接，再迁移数据；迁移完成后可保存为运行数据库配置（重启容器后生效）。
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 10, marginBottom: 10, alignItems: 'center' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '180px 1fr', gap: 10, marginBottom: 10, alignItems: 'center' }}>
             <ModernSelect
               value={migrationDialect}
               onChange={(value) => setMigrationDialect(value as DbDialect)}
@@ -1223,7 +1807,7 @@ export default function Settings() {
             />
           ) : (
             <div style={{ marginBottom: 10 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 8 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr 1fr', gap: 10, marginBottom: 8 }}>
                 <input
                   value={shorthandConnection.host}
                   onChange={(e) => setShorthandConnection((prev) => ({ ...prev, host: e.target.value }))}
@@ -1254,7 +1838,7 @@ export default function Settings() {
                 </button>
               </div>
               {showShorthandOptional && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 8 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 10, marginBottom: 8 }}>
                   <input
                     value={shorthandConnection.port}
                     onChange={(e) => setShorthandConnection((prev) => ({ ...prev, port: e.target.value }))}
@@ -1347,6 +1931,8 @@ export default function Settings() {
           )}
         </div>
 
+        <UpdateCenterSection />
+
         <div className="card animate-slide-up stagger-6" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12 }}>维护工具</div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -1406,381 +1992,50 @@ export default function Settings() {
           </div>
         </div>
       </div>
-      {downstreamModalPresence.shouldRender && (() => {
-        const modal = (
-          <div className={`modal-backdrop ${downstreamModalPresence.isVisible ? '' : 'is-closing'}`.trim()} onClick={closeDownstreamModal}>
-            <div
-              className={`modal-content ${downstreamModalPresence.isVisible ? '' : 'is-closing'}`.trim()}
-              style={{ maxWidth: 860 }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="modal-header">
-                {editingDownstreamId ? '编辑下游 API Key' : '新增下游 API Key'}
-              </div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
-                  <input
-                    value={downstreamCreate.name}
-                    onChange={(e) => setDownstreamCreate((prev) => ({ ...prev, name: e.target.value }))}
-                    placeholder="Name (e.g. cc-project)"
-                    style={inputStyle}
-                  />
-                  <input
-                    value={downstreamCreate.key}
-                    onChange={(e) => setDownstreamCreate((prev) => ({ ...prev, key: e.target.value.trim() }))}
-                    placeholder="sk-xxxx"
-                    style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
-                  />
-                  <input
-                    value={downstreamCreate.maxCost}
-                    onChange={(e) => setDownstreamCreate((prev) => ({ ...prev, maxCost: e.target.value }))}
-                    placeholder="最大费用（可选）"
-                    type="number"
-                    min={0}
-                    step={0.000001}
-                    style={inputStyle}
-                  />
-                  <input
-                    value={downstreamCreate.maxRequests}
-                    onChange={(e) => setDownstreamCreate((prev) => ({ ...prev, maxRequests: e.target.value }))}
-                    placeholder="最大请求数（可选）"
-                    type="number"
-                    min={0}
-                    step={1}
-                    style={inputStyle}
-                  />
-                  <input
-                    value={downstreamCreate.expiresAt}
-                    onChange={(e) => setDownstreamCreate((prev) => ({ ...prev, expiresAt: e.target.value }))}
-                    type="datetime-local"
-                    placeholder="过期时间（可选）"
-                    style={inputStyle}
-                  />
-                  <input
-                    value={downstreamCreate.description}
-                    onChange={(e) => setDownstreamCreate((prev) => ({ ...prev, description: e.target.value }))}
-                    placeholder="备注（可选）"
-                    style={inputStyle}
-                  />
-                </div>
-
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                    已选模型 {downstreamCreate.selectedModels.length} 个，已选群组 {downstreamCreate.selectedGroupRouteIds.length} 个
-                  </div>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <button
-                      onClick={async () => {
-                        if (selectorRoutes.length === 0) await loadRouteSelectorRoutes();
-                        setSelectorModelSearch('');
-                        setSelectorGroupSearch('');
-                        setSelectorOpen(true);
-                      }}
-                      className="btn btn-ghost"
-                      style={{ border: '1px solid var(--color-border)' }}
-                    >
-                      勾选模型和群组
-                    </button>
-                    {(downstreamCreate.selectedModels.length > 0 || downstreamCreate.selectedGroupRouteIds.length > 0) && (
-                      <button
-                        onClick={() => setDownstreamCreate((prev) => ({ ...prev, selectedModels: [], selectedGroupRouteIds: [] }))}
-                        className="btn btn-link btn-link-warning"
-                      >
-                        清空选择
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button onClick={closeDownstreamModal} className="btn btn-ghost">取消</button>
-                <button onClick={saveDownstreamKey} disabled={downstreamSaving} className="btn btn-primary">
-                  {downstreamSaving
-                    ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</>
-                    : (editingDownstreamId ? '更新 API Key' : '新增 API Key')}
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-        return typeof document !== 'undefined' ? createPortal(modal, document.body) : modal;
-      })()}
-      {factoryResetPresence.shouldRender && (() => {
-        const confirmLabel = factoryResetting
-          ? '重新初始化中...'
-          : (factoryResetSecondsLeft > 0
-            ? `确认重新初始化系统（${factoryResetSecondsLeft}s）`
-            : '确认重新初始化系统');
-        const modal = (
-          <div className={`modal-backdrop ${factoryResetPresence.isVisible ? '' : 'is-closing'}`.trim()} onClick={closeFactoryResetModal}>
-            <div
-              className={`modal-content ${factoryResetPresence.isVisible ? '' : 'is-closing'}`.trim()}
-              style={{ maxWidth: 720, border: '1px solid color-mix(in srgb, var(--color-danger) 35%, var(--color-border))' }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="modal-header" style={{ color: 'var(--color-danger)' }}>确认重新初始化系统</div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ padding: 12, borderRadius: 'var(--radius-sm)', background: 'var(--color-danger-bg)', color: 'var(--color-danger)', fontSize: 12, lineHeight: 1.8 }}>
-                  这是不可逆操作。系统会清空当前 metapi 使用中的全部数据库内容，并在成功后立即退出当前登录状态。
-                </div>
-                <div style={{ fontSize: 13, color: 'var(--color-text-secondary)', lineHeight: 1.9 }}>
-                  <div>• 当前若使用外部 MySQL/Postgres，也会先清空该外部库中的 metapi 数据。</div>
-                  <div>• 系统随后会强制切回默认 SQLite。</div>
-                  <div>• 管理员 Token 将重置为 <code style={{ fontFamily: 'var(--font-mono)' }}>{FACTORY_RESET_ADMIN_TOKEN}</code>。</div>
-                  <div>• 完成后会立即退出登录并刷新页面，回到当前首装初始状态。</div>
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button onClick={closeFactoryResetModal} disabled={factoryResetting} className="btn btn-ghost">取消</button>
-                <button onClick={handleFactoryReset} disabled={factoryResetting || factoryResetSecondsLeft > 0} className="btn btn-danger">
-                  {factoryResetting
-                    ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> {confirmLabel}</>
-                    : confirmLabel}
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-        return typeof document !== 'undefined' ? createPortal(modal, document.body) : modal;
-      })()}
-      {selectorModalPresence.shouldRender && (() => {
-        const modal = (
-          <div className={`modal-backdrop ${selectorModalPresence.isVisible ? '' : 'is-closing'}`.trim()} onClick={closeSelectorModal}>
-            <div
-              className={`modal-content ${selectorModalPresence.isVisible ? '' : 'is-closing'}`.trim()}
-              style={{ maxWidth: 860 }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="modal-header">勾选模型和群组</div>
-              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                  选择结果会保存到当前下游 API Key：精确模型用于模型白名单，群组用于路由范围限制。
-                </div>
-                {selectorLoading ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-muted)' }}>
-                    <span className="spinner spinner-sm" />
-                    加载路由中...
-                  </div>
-                ) : (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 }}>
-                    <div style={{ border: '1px solid var(--color-border-light)', borderRadius: 'var(--radius-sm)', padding: 10 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
-                        精确模型 ({selectorModelSearch.trim()
-                          ? `${filteredExactModelOptions.length}/${exactModelOptions.length}`
-                          : exactModelOptions.length})
-                      </div>
-                      <input
-                        value={selectorModelSearch}
-                        onChange={(e) => setSelectorModelSearch(e.target.value)}
-                        placeholder="搜索精确模型（支持模糊匹配）"
-                        style={{ ...inputStyle, padding: '8px 10px', fontSize: 12, marginBottom: 8 }}
-                      />
-                      <div style={{ maxHeight: 280, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                        {exactModelOptions.length === 0 ? (
-                          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>暂无可选精确模型</div>
-                        ) : filteredExactModelOptions.length === 0 ? (
-                          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>没有匹配的精确模型</div>
-                        ) : filteredExactModelOptions.map((modelName) => {
-                          const checked = downstreamCreate.selectedModels.includes(modelName);
-                          const brand = getBrand(modelName);
-                          return (
-                            <label
-                              key={modelName}
-                              style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: 10,
-                                cursor: 'pointer',
-                                border: `1px solid ${checked ? 'color-mix(in srgb, var(--color-primary) 45%, transparent)' : 'var(--color-border-light)'}`,
-                                borderRadius: 10,
-                                padding: '8px 10px',
-                                background: checked
-                                  ? 'color-mix(in srgb, var(--color-primary) 9%, var(--color-bg-card))'
-                                  : 'var(--color-bg-card)',
-                                transition: 'all 0.15s ease',
-                              }}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={() => toggleModelSelection(modelName)}
-                                style={{ width: 18, height: 18, accentColor: 'var(--color-primary)', flexShrink: 0 }}
-                              />
-                              <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                                <code
-                                  style={{
-                                    fontWeight: 600,
-                                    fontSize: 12,
-                                    background: 'var(--color-bg)',
-                                    padding: '4px 10px',
-                                    borderRadius: 8,
-                                    color: 'var(--color-text-primary)',
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: 6,
-                                    maxWidth: '100%',
-                                  }}
-                                >
-                                  {brand ? (
-                                    <InlineBrandIcon model={modelName} size={18} />
-                                  ) : (
-                                    <span
-                                      style={{
-                                        width: 18,
-                                        height: 18,
-                                        borderRadius: 6,
-                                        background: 'var(--color-bg-card)',
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        justifyContent: 'center',
-                                        fontSize: 10,
-                                        color: 'var(--color-text-muted)',
-                                        flexShrink: 0,
-                                      }}
-                                    >
-                                      {modelName.slice(0, 1).toUpperCase()}
-                                    </span>
-                                  )}
-                                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                    {modelName}
-                                  </span>
-                                </code>
-                                {brand && (
-                                  <div style={{ fontSize: 11, color: 'var(--color-text-muted)', paddingLeft: 6 }}>
-                                    {brand.name}
-                                  </div>
-                                )}
-                              </div>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div style={{ border: '1px solid var(--color-border-light)', borderRadius: 'var(--radius-sm)', padding: 10 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
-                        群组 ({selectorGroupSearch.trim()
-                          ? `${filteredGroupRouteOptions.length}/${groupRouteOptions.length}`
-                          : groupRouteOptions.length})
-                      </div>
-                      <input
-                        value={selectorGroupSearch}
-                        onChange={(e) => setSelectorGroupSearch(e.target.value)}
-                        placeholder="Search groups (name / pattern)"
-                        style={{ ...inputStyle, padding: '8px 10px', fontSize: 12, marginBottom: 8 }}
-                      />
-                      <div style={{ maxHeight: 280, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                        {groupRouteOptions.length === 0 ? (
-                          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>暂无可选群组</div>
-                        ) : filteredGroupRouteOptions.length === 0 ? (
-                          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>没有匹配的群组</div>
-                        ) : filteredGroupRouteOptions.map((route) => {
-                          const checked = downstreamCreate.selectedGroupRouteIds.includes(route.id);
-                          const explicitBrandIcon = parseBrandIconValue(route.displayIcon);
-                          const textIcon = explicitBrandIcon ? '' : (route.displayIcon || '').trim();
-                          return (
-                            <label
-                              key={route.id}
-                              style={{
-                                display: 'flex',
-                                alignItems: 'flex-start',
-                                gap: 10,
-                                cursor: 'pointer',
-                                border: `1px solid ${checked ? 'color-mix(in srgb, var(--color-primary) 45%, transparent)' : 'var(--color-border-light)'}`,
-                                borderRadius: 10,
-                                padding: '8px 10px',
-                                background: checked
-                                  ? 'color-mix(in srgb, var(--color-primary) 9%, var(--color-bg-card))'
-                                  : 'var(--color-bg-card)',
-                                transition: 'all 0.15s ease',
-                              }}
-                            >
-                              <input
-                                type="checkbox"
-                                style={{ marginTop: 4, width: 18, height: 18, accentColor: 'var(--color-primary)', flexShrink: 0 }}
-                                checked={checked}
-                                onChange={() => toggleGroupRouteSelection(route.id)}
-                              />
-                              <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                                <code
-                                  style={{
-                                    fontWeight: 600,
-                                    fontSize: 12,
-                                    background: 'var(--color-bg)',
-                                    padding: '4px 10px',
-                                    borderRadius: 8,
-                                    color: 'var(--color-text-primary)',
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: 6,
-                                    maxWidth: '100%',
-                                  }}
-                                >
-                                  <span
-                                    style={{
-                                      width: 18,
-                                      height: 18,
-                                      display: 'inline-flex',
-                                      alignItems: 'center',
-                                      justifyContent: 'center',
-                                      borderRadius: 6,
-                                      background: 'var(--color-bg-card)',
-                                      flexShrink: 0,
-                                      overflow: 'hidden',
-                                      fontSize: 12,
-                                      lineHeight: 1,
-                                    }}
-                                  >
-                                    {explicitBrandIcon ? (
-                                      <BrandGlyph
-                                        icon={explicitBrandIcon}
-                                        alt={routeTitle(route)}
-                                        size={18}
-                                        fallbackText={routeTitle(route)}
-                                      />
-                                    ) : textIcon ? (
-                                      textIcon
-                                    ) : (
-                                      <InlineBrandIcon model={resolveRouteBrandSource(route)} size={18} />
-                                    )}
-                                  </span>
-                                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                    {routeTitle(route)}
-                                  </span>
-                                  {!route.enabled && (
-                                    <span
-                                      style={{
-                                        fontSize: 10,
-                                        padding: '1px 6px',
-                                        borderRadius: 999,
-                                        background: 'var(--color-danger-bg)',
-                                        color: 'var(--color-danger)',
-                                      }}
-                                    >
-                                      已禁用
-                                    </span>
-                                  )}
-                                </code>
-                                <code style={{ fontSize: 11, color: 'var(--color-text-muted)', fontFamily: 'var(--font-mono)', paddingLeft: 6 }}>
-                                  {route.modelPattern}
-                                </code>
-                              </div>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div className="modal-footer">
-                <button onClick={closeSelectorModal} className="btn btn-ghost">关闭</button>
-              </div>
-            </div>
-          </div>
-        );
-        return typeof document !== 'undefined' ? createPortal(modal, document.body) : modal;
-      })()}
+      <DownstreamApiKeyModal
+        presence={downstreamModalPresence}
+        editingDownstreamId={editingDownstreamId}
+        downstreamCreate={downstreamCreate}
+        downstreamSaving={downstreamSaving}
+        inputStyle={inputStyle}
+        onChange={(updater) => setDownstreamCreate((prev) => updater(prev))}
+        onOpenSelector={async () => {
+          if (selectorRoutes.length === 0) await loadRouteSelectorRoutes();
+          setSelectorModelSearch('');
+          setSelectorGroupSearch('');
+          setSelectorOpen(true);
+        }}
+        onClose={closeDownstreamModal}
+        onSave={saveDownstreamKey}
+      />
+      <FactoryResetModal
+        presence={factoryResetPresence}
+        factoryResetting={factoryResetting}
+        factoryResetSecondsLeft={factoryResetSecondsLeft}
+        adminToken={FACTORY_RESET_ADMIN_TOKEN}
+        onClose={closeFactoryResetModal}
+        onConfirm={handleFactoryReset}
+      />
+      <RouteSelectorModal
+        presence={selectorModalPresence}
+        loading={selectorLoading}
+        exactModelOptions={exactModelOptions}
+        filteredExactModelOptions={filteredExactModelOptions}
+        groupRouteOptions={groupRouteOptions}
+        filteredGroupRouteOptions={filteredGroupRouteOptions}
+        selectorModelSearch={selectorModelSearch}
+        selectorGroupSearch={selectorGroupSearch}
+        onSelectorModelSearchChange={setSelectorModelSearch}
+        onSelectorGroupSearchChange={setSelectorGroupSearch}
+        selection={{
+          selectedModels: downstreamCreate.selectedModels,
+          selectedGroupRouteIds: downstreamCreate.selectedGroupRouteIds,
+        }}
+        onToggleModelSelection={toggleModelSelection}
+        onToggleGroupRouteSelection={toggleGroupRouteSelection}
+        onClose={closeSelectorModal}
+        inputStyle={inputStyle}
+      />
     </div>
   );
 }

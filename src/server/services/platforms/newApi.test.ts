@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { AddressInfo } from 'node:net';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { NewApiAdapter } from './newApi.js';
+import { AnyRouterAdapter } from './anyrouter.js';
 
 interface RequestSnapshot {
   method: string;
@@ -14,6 +16,8 @@ const COOKIE_SESSION_TOKEN = 'cookie-session-token';
 const COOKIE_REQUIRES_USER_TOKEN = 'cookie-requires-user';
 const CHECKIN_ALREADY_TOKEN = 'checkin-already-token';
 const CHECKIN_INVALID_URL_TOKEN = 'checkin-invalid-url-token';
+const CHECKIN_INVALID_URL_EXPIRED_SESSION_TOKEN = 'checkin-invalid-url-expired-session-token';
+const CHECKIN_INVALID_URL_FORBIDDEN_SESSION_TOKEN = 'checkin-invalid-url-forbidden-session-token';
 const CHECKIN_CLOUDFLARE_530_TOKEN = 'checkin-cloudflare-530-token';
 const BALANCE_FAIL_TOKEN = 'balance-fail-token';
 const GROUP_EXPIRED_TOKEN = 'group-expired-token';
@@ -24,6 +28,7 @@ const SHIELD_LOGIN_COOKIE = 'challenge-seed';
 const COOKIE_ONLY_LOGIN_USERNAME = 'cookie-only-user';
 const COOKIE_ONLY_LOGIN_PASSWORD = 'cookie-only-pass';
 const COOKIE_ONLY_LOGIN_SESSION = 'cookie-only-session';
+const OPENAI_MODELS_SHIELDED_TOKEN = 'openai-models-shielded-token';
 const COOKIE_SHIELDED_TOKEN = Buffer.from(
   `1771864970|${Buffer.from('username=linuxdo_131936').toString('base64')}|sig`,
 ).toString('base64');
@@ -66,6 +71,34 @@ describe('NewApiAdapter', () => {
       });
 
       if (req.url === '/v1/models') {
+        if (typeof req.headers.authorization === 'string' && req.headers.authorization === `Bearer ${OPENAI_MODELS_SHIELDED_TOKEN}`) {
+          const cookieHeader = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+          if (!cookieHeader.includes(`acw_sc__v2=${ANYROUTER_CHALLENGE_ACW}`)) {
+            res.writeHead(200, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Set-Cookie': `cdn_sec_tc=${SHIELD_LOGIN_COOKIE}; Path=/; HttpOnly`,
+            });
+            res.end(ANYROUTER_CHALLENGE_HTML);
+            return;
+          }
+          if (
+            !cookieHeader.includes(`cdn_sec_tc=${SHIELD_LOGIN_COOKIE}`)
+            || !cookieHeader.includes(`session=${OPENAI_MODELS_SHIELDED_TOKEN}`)
+          ) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'missing shield cookie context' } }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            data: [
+              { id: 'claude-sonnet-4-5-20250929' },
+              { id: 'claude-opus-4-6' },
+            ],
+          }));
+          return;
+        }
+
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'invalid token' } }));
         return;
@@ -139,6 +172,15 @@ describe('NewApiAdapter', () => {
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ data: ['gpt-4o', 'gpt-4.1'] }));
+        return;
+      }
+
+      if (req.url === '/api/notice') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          data: 'Welcome to the site',
+        }));
         return;
       }
 
@@ -314,6 +356,28 @@ describe('NewApiAdapter', () => {
           return;
         }
 
+        if (
+          typeof req.headers.cookie === 'string'
+          && (
+            req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_TOKEN}`)
+            || req.headers.cookie.includes(`token=${CHECKIN_INVALID_URL_TOKEN}`)
+          )
+        ) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'temporary self probe failure' }));
+          return;
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_EXPIRED_SESSION_TOKEN}`)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: '无权进行此操作，未登录且未提供 access token' }));
+          return;
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_FORBIDDEN_SESSION_TOKEN}`)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'forbidden' }));
+          return;
+        }
+
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, message: 'unauthorized' }));
         return;
@@ -331,6 +395,26 @@ describe('NewApiAdapter', () => {
           return;
         }
         if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_TOKEN}`)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Invalid URL (POST /api/user/checkin)' } }));
+          return;
+        }
+        if (typeof req.headers.authorization === 'string' && req.headers.authorization === `Bearer ${CHECKIN_INVALID_URL_EXPIRED_SESSION_TOKEN}`) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Invalid URL (POST /api/user/checkin)' } }));
+          return;
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_EXPIRED_SESSION_TOKEN}`)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Invalid URL (POST /api/user/checkin)' } }));
+          return;
+        }
+        if (typeof req.headers.authorization === 'string' && req.headers.authorization === `Bearer ${CHECKIN_INVALID_URL_FORBIDDEN_SESSION_TOKEN}`) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Invalid URL (POST /api/user/checkin)' } }));
+          return;
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_FORBIDDEN_SESSION_TOKEN}`)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'Invalid URL (POST /api/user/checkin)' } }));
           return;
@@ -381,6 +465,16 @@ describe('NewApiAdapter', () => {
       }
 
       if (req.url === '/api/user/sign_in') {
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_EXPIRED_SESSION_TOKEN}`)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({}));
+          return;
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_INVALID_URL_FORBIDDEN_SESSION_TOKEN}`)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({}));
+          return;
+        }
         if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${CHECKIN_ALREADY_TOKEN}`)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, message: '无权进行此操作，未登录且未提供 access token' }));
@@ -413,6 +507,29 @@ describe('NewApiAdapter', () => {
     expect(requests.some((r) => r.url === '/v1/models')).toBe(true);
     expect(
       requests.some((r) => r.url === '/api/user/models' && r.headers['new-api-user'] === '11494'),
+    ).toBe(true);
+  });
+
+  it('reuses shield cookie retry when anyrouter /v1/models returns challenge html', async () => {
+    const adapter = new AnyRouterAdapter();
+    const models = await adapter.getModels(baseUrl, OPENAI_MODELS_SHIELDED_TOKEN);
+
+    expect(models).toEqual(['claude-sonnet-4-5-20250929', 'claude-opus-4-6']);
+    expect(
+      requests.some(
+        (r) =>
+          r.url === '/v1/models'
+          && typeof r.headers.cookie === 'string'
+          && r.headers.cookie.includes(`session=${OPENAI_MODELS_SHIELDED_TOKEN}`),
+      ),
+    ).toBe(true);
+    expect(
+      requests.some(
+        (r) =>
+          r.url === '/v1/models'
+          && typeof r.headers.cookie === 'string'
+          && r.headers.cookie.includes(`acw_sc__v2=${ANYROUTER_CHALLENGE_ACW}`),
+      ),
     ).toBe(true);
   });
 
@@ -554,6 +671,24 @@ describe('NewApiAdapter', () => {
     expect(result.message).toContain('Invalid URL');
   });
 
+  it('prefers cookie session auth failure over invalid-url fallback when cookie session is expired', async () => {
+    const adapter = new NewApiAdapter();
+    const result = await adapter.checkin(baseUrl, CHECKIN_INVALID_URL_EXPIRED_SESSION_TOKEN, 131936);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('access token');
+    expect(result.message).not.toContain('Invalid URL');
+  });
+
+  it('treats forbidden self probe responses as cookie session auth failures', async () => {
+    const adapter = new NewApiAdapter();
+    const result = await adapter.checkin(baseUrl, CHECKIN_INVALID_URL_FORBIDDEN_SESSION_TOKEN, 131936);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('forbidden');
+    expect(result.message).not.toContain('Invalid URL');
+  });
+
   it('summarizes cloudflare tunnel HTML failures to concise checkin error', async () => {
     const adapter = new NewApiAdapter();
     const result = await adapter.checkin(baseUrl, CHECKIN_CLOUDFLARE_530_TOKEN, 11494);
@@ -615,5 +750,21 @@ describe('NewApiAdapter', () => {
     expect(receivedHeaders['user-id']).toBe('42');
     expect(receivedHeaders['rix-api-user']).toBe('42');
     expect(receivedHeaders['neo-api-user']).toBe('42');
+  });
+
+  it('normalizes the global site notice from /api/notice', async () => {
+    const adapter = new NewApiAdapter();
+    const rows = await adapter.getSiteAnnouncements(baseUrl, 'session-token');
+
+    expect(rows).toEqual([
+      {
+        sourceKey: `notice:${createHash('sha1').update('Welcome to the site').digest('hex')}`,
+        title: 'Site notice',
+        content: 'Welcome to the site',
+        level: 'info',
+        sourceUrl: '/api/notice',
+        rawPayload: { success: true, data: 'Welcome to the site' },
+      },
+    ]);
   });
 });

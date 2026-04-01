@@ -11,6 +11,7 @@ describe('TokenRouter patterns and model mapping', () => {
   let schema: DbModule['schema'];
   let TokenRouter: TokenRouterModule['TokenRouter'];
   let invalidateTokenRouterCache: TokenRouterModule['invalidateTokenRouterCache'];
+  let tokenRouterTestUtils: TokenRouterModule['__tokenRouterTestUtils'];
   let dataDir = '';
   let idSeed = 0;
 
@@ -30,6 +31,7 @@ describe('TokenRouter patterns and model mapping', () => {
     schema = dbModule.schema;
     TokenRouter = tokenRouterModule.TokenRouter;
     invalidateTokenRouterCache = tokenRouterModule.invalidateTokenRouterCache;
+    tokenRouterTestUtils = tokenRouterModule.__tokenRouterTestUtils;
   });
 
   beforeEach(async () => {
@@ -93,6 +95,27 @@ describe('TokenRouter patterns and model mapping', () => {
     return { route, channel };
   }
 
+  async function createExplicitGroupRoute(
+    displayName: string,
+    sourceRouteIds: number[],
+  ) {
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: displayName,
+      displayName,
+      routeMode: 'explicit_group',
+      enabled: true,
+    }).returning().get();
+
+    await db.insert(schema.routeGroupSources).values(
+      sourceRouteIds.map((sourceRouteId) => ({
+        groupRouteId: route.id,
+        sourceRouteId,
+      })),
+    ).run();
+
+    return route;
+  }
+
   it('matches routes with re: regex patterns', async () => {
     await createRouteWithSingleChannel('re:^claude-(opus|sonnet)-4-6$');
     const router = new TokenRouter();
@@ -132,6 +155,17 @@ describe('TokenRouter patterns and model mapping', () => {
     expect(exact?.actualModel).toBe('target-exact');
     expect(glob?.actualModel).toBe('target-glob');
     expect(regex?.actualModel).toBe('target-regex');
+  });
+
+  it('resolves mapped models from parsed object input for helper-level callers', () => {
+    expect(tokenRouterTestUtils.resolveMappedModel('claude-sonnet-4-6', {
+      'claude-sonnet-4-6': 'target-exact',
+      'claude-sonnet-*': 'target-glob',
+    })).toBe('target-exact');
+    expect(tokenRouterTestUtils.resolveMappedModel('claude-sonnet-4-7', {
+      'claude-sonnet-4-6': 'target-exact',
+      'claude-sonnet-*': 'target-glob',
+    })).toBe('target-glob');
   });
 
   it('matches a route by display name alias as an exposed model', async () => {
@@ -180,5 +214,20 @@ describe('TokenRouter patterns and model mapping', () => {
     expect(selected?.channel.id).toBe(exact.channel.id);
     expect(selected?.actualModel).toBe('claude-opus-4-6');
     expect(decision.actualModel).toBe('claude-opus-4-6');
+  });
+
+  it('falls back to the source exact-route model when explicit-group channels omit sourceModel', async () => {
+    const source = await createRouteWithSingleChannel('claude-opus-4-5');
+    await createExplicitGroupRoute('claude-test-4.6-sonnet', [source.route.id]);
+    const router = new TokenRouter();
+
+    const selected = await router.selectChannel('claude-test-4.6-sonnet');
+    const decision = await router.explainSelection('claude-test-4.6-sonnet');
+
+    expect(selected).toBeTruthy();
+    expect(selected?.actualModel).toBe('claude-opus-4-5');
+    expect(decision.actualModel).toBe('claude-opus-4-5');
+    expect(decision.summary).toContain('按显示名命中：claude-test-4.6-sonnet');
+    expect(decision.summary).toContain('实际转发模型：claude-opus-4-5');
   });
 });

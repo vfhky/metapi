@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { api } from '../api.js';
+import { api, type RuntimeSettingsPayload } from '../api.js';
 import { useToast } from '../components/Toast.js';
 import { tr } from '../i18n.js';
 
@@ -12,6 +12,8 @@ type RuntimeSettings = {
     telegramEnabled: boolean;
     telegramApiBaseUrl: string;
     telegramChatId: string;
+    telegramUseSystemProxy: boolean;
+    telegramMessageThreadId: string;
     smtpEnabled: boolean;
     smtpHost: string;
     smtpPort: number;
@@ -35,6 +37,8 @@ export default function NotificationSettings() {
         telegramEnabled: false,
         telegramApiBaseUrl: 'https://api.telegram.org',
         telegramChatId: '',
+        telegramUseSystemProxy: false,
+        telegramMessageThreadId: '',
         smtpEnabled: false,
         smtpHost: '',
         smtpPort: 587,
@@ -78,6 +82,8 @@ export default function NotificationSettings() {
                 telegramEnabled: !!runtimeInfo.telegramEnabled,
                 telegramApiBaseUrl: runtimeInfo.telegramApiBaseUrl || 'https://api.telegram.org',
                 telegramChatId: runtimeInfo.telegramChatId || '',
+                telegramUseSystemProxy: !!runtimeInfo.telegramUseSystemProxy,
+                telegramMessageThreadId: runtimeInfo.telegramMessageThreadId || '',
                 smtpEnabled: !!runtimeInfo.smtpEnabled,
                 smtpHost: runtimeInfo.smtpHost || '',
                 smtpPort: Number(runtimeInfo.smtpPort) || 587,
@@ -106,7 +112,7 @@ export default function NotificationSettings() {
     const saveNotify = async () => {
         setSavingNotify(true);
         try {
-            const payload: any = {
+            const payload: RuntimeSettingsPayload = {
                 webhookUrl: runtime.webhookUrl,
                 barkUrl: runtime.barkUrl,
                 webhookEnabled: runtime.webhookEnabled,
@@ -115,6 +121,8 @@ export default function NotificationSettings() {
                 telegramEnabled: runtime.telegramEnabled,
                 telegramApiBaseUrl: runtime.telegramApiBaseUrl,
                 telegramChatId: runtime.telegramChatId,
+                telegramUseSystemProxy: runtime.telegramUseSystemProxy,
+                telegramMessageThreadId: runtime.telegramMessageThreadId,
                 smtpEnabled: runtime.smtpEnabled,
                 smtpHost: runtime.smtpHost,
                 smtpPort: runtime.smtpPort,
@@ -215,7 +223,7 @@ export default function NotificationSettings() {
                             </div>
                             <div>
                                 <div style={{ fontWeight: 600, fontSize: 15 }}>Webhook & Bark</div>
-                                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>通过 HTTP URL 推送简单消息通知</div>
+                                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>通过 HTTP URL 推送消息通知（自动识别企业微信、飞书格式）</div>
                             </div>
                         </div>
 
@@ -317,15 +325,26 @@ export default function NotificationSettings() {
                             </div>
                         </div>
 
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
-                            <span style={{ fontSize: 13, fontWeight: 500, color: runtime.telegramEnabled ? 'var(--color-primary)' : 'var(--color-text-muted)' }}>启用 Telegram</span>
-                            <input
-                                type="checkbox"
-                                style={{ width: 16, height: 16, cursor: 'pointer' }}
-                                checked={runtime.telegramEnabled}
-                                onChange={(e) => setRuntime((prev) => ({ ...prev, telegramEnabled: e.target.checked }))}
-                            />
-                        </label>
+                        <div style={{ display: 'flex', gap: 16 }}>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                                <span style={{ fontSize: 13, fontWeight: 500, color: runtime.telegramUseSystemProxy ? 'var(--color-primary)' : 'var(--color-text-muted)' }}>使用系统代理</span>
+                                <input
+                                    type="checkbox"
+                                    style={{ width: 16, height: 16, cursor: 'pointer' }}
+                                    checked={runtime.telegramUseSystemProxy}
+                                    onChange={(e) => setRuntime((prev) => ({ ...prev, telegramUseSystemProxy: e.target.checked }))}
+                                />
+                            </label>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                                <span style={{ fontSize: 13, fontWeight: 500, color: runtime.telegramEnabled ? 'var(--color-primary)' : 'var(--color-text-muted)' }}>启用 Telegram</span>
+                                <input
+                                    type="checkbox"
+                                    style={{ width: 16, height: 16, cursor: 'pointer' }}
+                                    checked={runtime.telegramEnabled}
+                                    onChange={(e) => setRuntime((prev) => ({ ...prev, telegramEnabled: e.target.checked }))}
+                                />
+                            </label>
+                        </div>
                     </div>
 
                     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '16px 20px', opacity: runtime.telegramEnabled ? 1 : 0.6, transition: 'opacity 0.2s' }}>
@@ -348,6 +367,16 @@ export default function NotificationSettings() {
                                 value={runtime.telegramChatId}
                                 onChange={(e) => setRuntime((prev) => ({ ...prev, telegramChatId: e.target.value }))}
                                 placeholder="例如: -1001234567890 或 @your_channel"
+                                style={inputStyle}
+                                disabled={!runtime.telegramEnabled}
+                            />
+                        </div>
+                        <div>
+                            <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8, color: 'var(--color-text-secondary)' }}>Telegram Topic ID</div>
+                            <input
+                                value={runtime.telegramMessageThreadId}
+                                onChange={(e) => setRuntime((prev) => ({ ...prev, telegramMessageThreadId: e.target.value }))}
+                                placeholder="例如: 77"
                                 style={inputStyle}
                                 disabled={!runtime.telegramEnabled}
                             />

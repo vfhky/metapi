@@ -36,6 +36,34 @@ describe('buildConfig', () => {
     const config = buildConfig({});
 
     expect(config.telegramApiBaseUrl).toBe('https://api.telegram.org');
+    expect(config.telegramMessageThreadId).toBe('');
+  });
+
+  it('accepts telegram message thread id from environment', () => {
+    const config = buildConfig({
+      TELEGRAM_MESSAGE_THREAD_ID: '77',
+    });
+
+    expect(config.telegramMessageThreadId).toBe('77');
+  });
+
+  it('ships CLI-aligned OAuth defaults', () => {
+    const config = buildConfig({});
+
+    expect(config.codexClientId).toBe('app_EMoamEEZ73f0CkXaXp7hrann');
+    expect(config.codexResponsesWebsocketBeta).toBe('responses_websockets=2026-02-06');
+    expect(config.claudeClientId).toBe('9d1c250a-e61b-44d9-88ed-5944d1962f5e');
+    expect(config.claudeClientSecret).toBe('');
+    expect(config.geminiCliClientId).toBe('681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com');
+    expect(config.geminiCliClientSecret).toBe('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');
+  });
+
+  it('allows overriding the codex websocket beta gate from environment', () => {
+    const config = buildConfig({
+      CODEX_RESPONSES_WEBSOCKET_BETA: 'responses_websockets=2099-01-01',
+    });
+
+    expect(config.codexResponsesWebsocketBeta).toBe('responses_websockets=2099-01-01');
   });
 
   it('accepts JSON request bodies larger than Fastify default 1 MiB', async () => {
@@ -55,6 +83,27 @@ describe('buildConfig', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ textLength: largeText.length });
+    await app.close();
+  });
+
+  it('trusts forwarded client IP headers for reverse-proxy deployments', async () => {
+    const app = Fastify(buildFastifyOptions(buildConfig({})));
+
+    app.get('/ip', async (request) => ({
+      ip: request.ip,
+    }));
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/ip',
+      remoteAddress: '10.0.0.8',
+      headers: {
+        'x-forwarded-for': '203.0.113.5, 10.0.0.8',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ ip: '203.0.113.5' });
     await app.close();
   });
 });

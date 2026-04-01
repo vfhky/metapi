@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api.js";
 import { MobileCard, MobileField } from "../components/MobileCard.js";
-import { MobileDrawer } from "../components/MobileDrawer.js";
+import ResponsiveFilterPanel from "../components/ResponsiveFilterPanel.js";
 import { useToast } from "../components/Toast.js";
 import { useIsMobile } from "../components/useIsMobile.js";
 import {
@@ -71,7 +71,7 @@ export default function CheckinLog() {
   const [filter, setFilter] = useState<LogFilter>("all");
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
   const [showFilters, setShowFilters] = useState(false);
-  const isMobile = useIsMobile(768);
+  const isMobile = useIsMobile();
   const toast = useToast();
 
   function getStatus(log: any): "success" | "failed" | "skipped" {
@@ -268,53 +268,44 @@ export default function CheckinLog() {
         </button>
       </div>
 
-      {isMobile ? (
-        <>
-          <div className="mobile-filter-row">
-            <button
-              type="button"
-              className="btn btn-ghost"
-              style={{ border: "1px solid var(--color-border)" }}
-              onClick={() => setShowFilters(true)}
-            >
-              筛选
-            </button>
-          </div>
-          <MobileDrawer
-            open={showFilters}
-            onClose={() => setShowFilters(false)}
-          >
-            <div className="mobile-filter-panel" style={{ gap: 12 }}>
-              {timeRangeControls}
-              {hasInvalidTimeRange && (
-                <div className="alert alert-error">
-                  结束时间必须晚于开始时间
-                </div>
-              )}
-              {filterTabs}
-            </div>
-          </MobileDrawer>
-        </>
-      ) : (
-        <div className="toolbar" style={{ marginBottom: "12px" }}>
-          <div style={{ minWidth: 280 }}>{filterTabs}</div>
-          <div
-            style={{
-              flex: "0 0 auto",
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-            }}
-          >
+      <ResponsiveFilterPanel
+        isMobile={isMobile}
+        mobileOpen={showFilters}
+        onMobileOpen={() => setShowFilters(true)}
+        onMobileClose={() => setShowFilters(false)}
+        mobileTitle="筛选签到记录"
+        mobileContent={(
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {timeRangeControls}
+            {hasInvalidTimeRange && (
+              <div className="alert alert-error">
+                结束时间必须晚于开始时间
+              </div>
+            )}
+            {filterTabs}
           </div>
-          {hasInvalidTimeRange && (
-            <div className="alert alert-error" style={{ width: "100%" }}>
-              结束时间必须晚于开始时间
+        )}
+        desktopContent={(
+          <div className="toolbar" style={{ marginBottom: "12px" }}>
+            <div style={{ minWidth: 280 }}>{filterTabs}</div>
+            <div
+              style={{
+                flex: "0 0 auto",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+              }}
+            >
+              {timeRangeControls}
             </div>
-          )}
-        </div>
-      )}
+            {hasInvalidTimeRange && (
+              <div className="alert alert-error" style={{ width: "100%" }}>
+                结束时间必须晚于开始时间
+              </div>
+            )}
+          </div>
+        )}
+      />
 
       <div
         className="card"
@@ -356,13 +347,24 @@ export default function CheckinLog() {
                 <MobileCard
                   key={logId}
                   title={log.accounts?.username || "未知"}
-                  actions={
+                  headerActions={
                     <span
                       className={`badge ${statusClass(status)}`}
                       style={{ fontSize: 10 }}
                     >
                       {statusLabel(status)}
                     </span>
+                  }
+                  footerActions={
+                    <button
+                      type="button"
+                      className="btn btn-link"
+                      onClick={() =>
+                        setExpandedLogId(isExpanded ? null : logId)
+                      }
+                    >
+                      {isExpanded ? "收起" : "详情"}
+                    </button>
                   }
                 >
                   <MobileField
@@ -421,25 +423,16 @@ export default function CheckinLog() {
                     <div className="mobile-card-extra">
                       <MobileField
                         label="信息"
+                        stacked
                         value={log.checkin_logs?.message || log.message}
                       />
                       <MobileField
                         label="建议"
+                        stacked
                         value={reason?.actionHint || "-"}
                       />
                     </div>
                   ) : null}
-                  <div className="mobile-card-actions">
-                    <button
-                      type="button"
-                      className="btn btn-link"
-                      onClick={() =>
-                        setExpandedLogId(isExpanded ? null : logId)
-                      }
-                    >
-                      {isExpanded ? "收起" : "详情"}
-                    </button>
-                  </div>
                 </MobileCard>
               );
             })}

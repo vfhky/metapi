@@ -6,7 +6,7 @@ export const sites = sqliteTable('sites', {
   name: text('name').notNull(),
   url: text('url').notNull(),
   externalCheckinUrl: text('external_checkin_url'),
-  platform: text('platform').notNull(), // 'new-api' | 'one-api' | 'veloera' | 'one-hub' | 'done-hub' | 'sub2api' | 'openai' | 'claude' | 'gemini'
+  platform: text('platform').notNull(), // 'new-api' | 'one-api' | 'veloera' | 'one-hub' | 'done-hub' | 'sub2api' | 'openai' | 'claude' | 'gemini' | 'codex' | 'gemini-cli' | 'antigravity'
   proxyUrl: text('proxy_url'),
   useSystemProxy: integer('use_system_proxy', { mode: 'boolean' }).default(false),
   customHeaders: text('custom_headers'),
@@ -19,6 +19,7 @@ export const sites = sqliteTable('sites', {
   updatedAt: text('updated_at').default(sql`(datetime('now'))`),
 }, (table) => ({
   statusIdx: index('sites_status_idx').on(table.status),
+  platformUrlUnique: uniqueIndex('sites_platform_url_unique').on(table.platform, table.url),
 }));
 
 export const siteDisabledModels = sqliteTable('site_disabled_models', {
@@ -48,6 +49,9 @@ export const accounts = sqliteTable('accounts', {
   checkinEnabled: integer('checkin_enabled', { mode: 'boolean' }).default(true),
   lastCheckinAt: text('last_checkin_at'),
   lastBalanceRefresh: text('last_balance_refresh'),
+  oauthProvider: text('oauth_provider'),
+  oauthAccountKey: text('oauth_account_key'),
+  oauthProjectId: text('oauth_project_id'),
   extraConfig: text('extra_config'), // JSON string
   createdAt: text('created_at').default(sql`(datetime('now'))`),
   updatedAt: text('updated_at').default(sql`(datetime('now'))`),
@@ -55,6 +59,8 @@ export const accounts = sqliteTable('accounts', {
   siteIdIdx: index('accounts_site_id_idx').on(table.siteId),
   statusIdx: index('accounts_status_idx').on(table.status),
   siteStatusIdx: index('accounts_site_status_idx').on(table.siteId, table.status),
+  oauthProviderIdx: index('accounts_oauth_provider_idx').on(table.oauthProvider),
+  oauthIdentityIdx: index('accounts_oauth_identity_idx').on(table.oauthProvider, table.oauthAccountKey, table.oauthProjectId),
 }));
 
 export const accountTokens = sqliteTable('account_tokens', {
@@ -121,6 +127,7 @@ export const tokenRoutes = sqliteTable('token_routes', {
   modelPattern: text('model_pattern').notNull(),
   displayName: text('display_name'),
   displayIcon: text('display_icon'),
+  routeMode: text('route_mode').default('pattern'),
   modelMapping: text('model_mapping'), // JSON
   decisionSnapshot: text('decision_snapshot'), // JSON
   decisionRefreshedAt: text('decision_refreshed_at'),
@@ -131,6 +138,15 @@ export const tokenRoutes = sqliteTable('token_routes', {
 }, (table) => ({
   modelPatternIdx: index('token_routes_model_pattern_idx').on(table.modelPattern),
   enabledIdx: index('token_routes_enabled_idx').on(table.enabled),
+}));
+
+export const routeGroupSources = sqliteTable('route_group_sources', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  groupRouteId: integer('group_route_id').notNull().references(() => tokenRoutes.id, { onDelete: 'cascade' }),
+  sourceRouteId: integer('source_route_id').notNull().references(() => tokenRoutes.id, { onDelete: 'cascade' }),
+}, (table) => ({
+  groupSourceUnique: uniqueIndex('route_group_sources_group_source_unique').on(table.groupRouteId, table.sourceRouteId),
+  sourceRouteIdx: index('route_group_sources_source_route_id_idx').on(table.sourceRouteId),
 }));
 
 export const routeChannels = sqliteTable('route_channels', {
@@ -177,6 +193,10 @@ export const proxyLogs = sqliteTable('proxy_logs', {
   totalTokens: integer('total_tokens'),
   estimatedCost: real('estimated_cost'),
   billingDetails: text('billing_details'),
+  clientFamily: text('client_family'),
+  clientAppId: text('client_app_id'),
+  clientAppName: text('client_app_name'),
+  clientConfidence: text('client_confidence'),
   errorMessage: text('error_message'),
   retryCount: integer('retry_count').default(0),
   createdAt: text('created_at').default(sql`(datetime('now'))`),
@@ -186,6 +206,66 @@ export const proxyLogs = sqliteTable('proxy_logs', {
   statusCreatedIdx: index('proxy_logs_status_created_at_idx').on(table.status, table.createdAt),
   modelActualCreatedIdx: index('proxy_logs_model_actual_created_at_idx').on(table.modelActual, table.createdAt),
   downstreamKeyCreatedIdx: index('proxy_logs_downstream_api_key_created_at_idx').on(table.downstreamApiKeyId, table.createdAt),
+  clientAppCreatedIdx: index('proxy_logs_client_app_id_created_at_idx').on(table.clientAppId, table.createdAt),
+  clientFamilyCreatedIdx: index('proxy_logs_client_family_created_at_idx').on(table.clientFamily, table.createdAt),
+}));
+
+export const proxyDebugTraces = sqliteTable('proxy_debug_traces', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  downstreamPath: text('downstream_path').notNull(),
+  clientKind: text('client_kind'),
+  sessionId: text('session_id'),
+  traceHint: text('trace_hint'),
+  requestedModel: text('requested_model'),
+  downstreamApiKeyId: integer('downstream_api_key_id'),
+  requestHeadersJson: text('request_headers_json'),
+  requestBodyJson: text('request_body_json'),
+  stickySessionKey: text('sticky_session_key'),
+  stickyHitChannelId: integer('sticky_hit_channel_id'),
+  selectedChannelId: integer('selected_channel_id'),
+  selectedRouteId: integer('selected_route_id'),
+  selectedAccountId: integer('selected_account_id'),
+  selectedSiteId: integer('selected_site_id'),
+  selectedSitePlatform: text('selected_site_platform'),
+  endpointCandidatesJson: text('endpoint_candidates_json'),
+  endpointRuntimeStateJson: text('endpoint_runtime_state_json'),
+  decisionSummaryJson: text('decision_summary_json'),
+  finalStatus: text('final_status'),
+  finalHttpStatus: integer('final_http_status'),
+  finalUpstreamPath: text('final_upstream_path'),
+  finalResponseHeadersJson: text('final_response_headers_json'),
+  finalResponseBodyJson: text('final_response_body_json'),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+  updatedAt: text('updated_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  createdAtIdx: index('proxy_debug_traces_created_at_idx').on(table.createdAt),
+  sessionCreatedIdx: index('proxy_debug_traces_session_created_at_idx').on(table.sessionId, table.createdAt),
+  modelCreatedIdx: index('proxy_debug_traces_model_created_at_idx').on(table.requestedModel, table.createdAt),
+  finalStatusCreatedIdx: index('proxy_debug_traces_final_status_created_at_idx').on(table.finalStatus, table.createdAt),
+}));
+
+export const proxyDebugAttempts = sqliteTable('proxy_debug_attempts', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  traceId: integer('trace_id').notNull().references(() => proxyDebugTraces.id, { onDelete: 'cascade' }),
+  attemptIndex: integer('attempt_index').notNull(),
+  endpoint: text('endpoint').notNull(),
+  requestPath: text('request_path').notNull(),
+  targetUrl: text('target_url').notNull(),
+  runtimeExecutor: text('runtime_executor'),
+  requestHeadersJson: text('request_headers_json'),
+  requestBodyJson: text('request_body_json'),
+  responseStatus: integer('response_status'),
+  responseHeadersJson: text('response_headers_json'),
+  responseBodyJson: text('response_body_json'),
+  rawErrorText: text('raw_error_text'),
+  recoverApplied: integer('recover_applied', { mode: 'boolean' }).default(false),
+  downgradeDecision: integer('downgrade_decision', { mode: 'boolean' }).default(false),
+  downgradeReason: text('downgrade_reason'),
+  memoryWriteJson: text('memory_write_json'),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  traceAttemptUnique: uniqueIndex('proxy_debug_attempts_trace_attempt_unique').on(table.traceId, table.attemptIndex),
+  traceCreatedIdx: index('proxy_debug_attempts_trace_created_at_idx').on(table.traceId, table.createdAt),
 }));
 
 export const proxyVideoTasks = sqliteTable('proxy_video_tasks', {
@@ -258,6 +338,30 @@ export const downstreamApiKeys = sqliteTable('downstream_api_keys', {
   nameIdx: index('downstream_api_keys_name_idx').on(table.name),
   enabledIdx: index('downstream_api_keys_enabled_idx').on(table.enabled),
   expiresAtIdx: index('downstream_api_keys_expires_at_idx').on(table.expiresAt),
+}));
+
+export const siteAnnouncements = sqliteTable('site_announcements', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  siteId: integer('site_id').notNull().references(() => sites.id, { onDelete: 'cascade' }),
+  platform: text('platform').notNull(),
+  sourceKey: text('source_key').notNull(),
+  title: text('title').notNull(),
+  content: text('content').notNull(),
+  level: text('level').notNull().default('info'),
+  sourceUrl: text('source_url'),
+  startsAt: text('starts_at'),
+  endsAt: text('ends_at'),
+  upstreamCreatedAt: text('upstream_created_at'),
+  upstreamUpdatedAt: text('upstream_updated_at'),
+  firstSeenAt: text('first_seen_at').default(sql`(datetime('now'))`),
+  lastSeenAt: text('last_seen_at').default(sql`(datetime('now'))`),
+  readAt: text('read_at'),
+  dismissedAt: text('dismissed_at'),
+  rawPayload: text('raw_payload'),
+}, (table) => ({
+  siteSourceKeyUnique: uniqueIndex('site_announcements_site_source_key_unique').on(table.siteId, table.sourceKey),
+  siteIdFirstSeenAtIdx: index('site_announcements_site_id_first_seen_at_idx').on(table.siteId, table.firstSeenAt),
+  readAtIdx: index('site_announcements_read_at_idx').on(table.readAt),
 }));
 
 export const events = sqliteTable('events', {

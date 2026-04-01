@@ -58,6 +58,9 @@ vi.mock('../../db/index.js', () => ({
   db: {
     insert: (arg: any) => dbInsertMock(arg),
   },
+  hasProxyLogBillingDetailsColumn: async () => false,
+  hasProxyLogClientColumns: async () => false,
+  hasProxyLogDownstreamApiKeyIdColumn: async () => false,
   schema: {
     proxyLogs: {},
   },
@@ -138,6 +141,79 @@ describe('/v1/images/edits route', () => {
     expect(response.statusCode).toBe(200);
     const [targetUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(targetUrl).toBe('https://upstream.example.com/v1/images/edits');
+  });
+
+  it('retries the next channel when image generation JSON is malformed', async () => {
+    selectNextChannelMock.mockReturnValueOnce({
+      channel: { id: 12, routeId: 23 },
+      site: { id: 45, name: 'fallback-site', url: 'https://fallback.example.com', platform: 'openai' },
+      account: { id: 34, username: 'fallback-user' },
+      tokenName: 'fallback',
+      tokenValue: 'sk-fallback',
+      actualModel: 'fallback-gpt-image',
+    });
+    fetchMock
+      .mockResolvedValueOnce(new Response('not-json', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        created: 2,
+        data: [{ b64_json: 'ZmFsbGJhY2s=' }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload: {
+        model: 'gpt-image-1',
+        prompt: 'draw a cat',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      created: 2,
+      data: [{ b64_json: 'ZmFsbGJhY2s=' }],
+    });
+    expect(selectNextChannelMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps returning a successful image edit response when post-success accounting fails', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: 'iVBORw0KGgo=' }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    estimateProxyCostMock.mockRejectedValueOnce(new Error('cost failed'));
+
+    const boundary = 'metapi-boundary-accounting';
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/edits',
+      headers: {
+        authorization: 'Bearer sk-demo',
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: buildMultipartBody(boundary),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      created: 1,
+      data: [{ b64_json: 'iVBORw0KGgo=' }],
+    });
+    expect(selectNextChannelMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).not.toHaveBeenCalled();
   });
 
   it('returns explicit not-supported error for /v1/images/variations', async () => {

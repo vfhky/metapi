@@ -5,6 +5,8 @@ import { tr } from '../../i18n.js';
 import type { GroupFilter, GroupRouteItem } from './types.js';
 import { resolveEndpointTypeIconModel, siteAvatarLetters } from './utils.js';
 
+export type EnabledFilter = 'all' | 'enabled' | 'disabled';
+
 type RouteFilterBarProps = {
   totalRouteCount: number;
   activeBrand: string | null;
@@ -15,6 +17,9 @@ type RouteFilterBarProps = {
   setActiveEndpointType: (endpointType: string | null) => void;
   activeGroupFilter: GroupFilter;
   setActiveGroupFilter: (filter: GroupFilter) => void;
+  enabledFilter: EnabledFilter;
+  setEnabledFilter: (filter: EnabledFilter) => void;
+  enabledCounts: { enabled: number; disabled: number };
   brandList: { list: [string, { count: number; brand: BrandInfo }][]; otherCount: number };
   siteList: [string, { count: number; siteId: number }][];
   endpointTypeList: [string, number][];
@@ -63,8 +68,11 @@ function ActiveFilterSummary({
   activeSite,
   activeGroupFilter,
   activeEndpointType,
-}: Pick<RouteFilterBarProps, 'activeBrand' | 'activeSite' | 'activeGroupFilter' | 'activeEndpointType'>) {
+  enabledFilter,
+}: Pick<RouteFilterBarProps, 'activeBrand' | 'activeSite' | 'activeGroupFilter' | 'activeEndpointType' | 'enabledFilter'>) {
   const tags: string[] = [];
+  if (enabledFilter === 'enabled') tags.push('状态=启用');
+  else if (enabledFilter === 'disabled') tags.push('状态=禁用');
   if (activeBrand) tags.push(`品牌=${activeBrand === '__other__' ? '其他' : activeBrand}`);
   if (activeSite) tags.push(`站点=${activeSite}`);
   if (activeGroupFilter === '__all__') tags.push('群组=全部');
@@ -86,6 +94,9 @@ export default function RouteFilterBar(props: RouteFilterBarProps) {
     setActiveEndpointType,
     activeGroupFilter,
     setActiveGroupFilter,
+    enabledFilter,
+    setEnabledFilter,
+    enabledCounts,
     brandList,
     siteList,
     endpointTypeList,
@@ -117,12 +128,38 @@ export default function RouteFilterBar(props: RouteFilterBarProps) {
           activeSite={activeSite}
           activeGroupFilter={activeGroupFilter}
           activeEndpointType={activeEndpointType}
+          enabledFilter={enabledFilter}
         />
       </button>
 
       {/* Expanded panel */}
       {expandPresence.shouldRender && (
         <div className={`route-filter-bar-expanded ${expandPresence.isVisible ? '' : 'is-closing'}`.trim()}>
+          {/* Status row */}
+          <FilterRow label={tr('状态')}>
+            <FilterChip
+              active={enabledFilter === 'all'}
+              label={tr('全部')}
+              count={totalRouteCount}
+              icon={<span style={{ fontSize: 10 }}>✦</span>}
+              onClick={() => setEnabledFilter('all')}
+            />
+            <FilterChip
+              active={enabledFilter === 'enabled'}
+              label={tr('仅启用')}
+              count={enabledCounts.enabled}
+              icon={<span style={{ fontSize: 10, color: 'var(--color-success)' }}>●</span>}
+              onClick={() => setEnabledFilter(enabledFilter === 'enabled' ? 'all' : 'enabled')}
+            />
+            <FilterChip
+              active={enabledFilter === 'disabled'}
+              label={tr('仅禁用')}
+              count={enabledCounts.disabled}
+              icon={<span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>●</span>}
+              onClick={() => setEnabledFilter(enabledFilter === 'disabled' ? 'all' : 'disabled')}
+            />
+          </FilterRow>
+
           {/* Brand row */}
           <FilterRow label={tr('品牌')}>
             <FilterChip
@@ -203,17 +240,17 @@ export default function RouteFilterBar(props: RouteFilterBarProps) {
                 key={groupRoute.id}
                 active={activeGroupFilter === groupRoute.id}
                 label={groupRoute.title}
-                count={groupRoute.channelCount}
+                count={groupRoute.sourceRouteCount > 0 ? groupRoute.sourceRouteCount : groupRoute.channelCount}
                 icon={
                   groupRoute.icon.kind === 'brand' ? (
                     <BrandGlyph icon={groupRoute.icon.value} alt={groupRoute.title} size={12} fallbackText={groupRoute.title} />
                   ) : groupRoute.icon.kind === 'text' ? (
                     <span style={{ fontSize: 10, lineHeight: 1 }}>{groupRoute.icon.value}</span>
-                  ) : groupRoute.brand ? (
+                  ) : groupRoute.icon.kind === 'auto' && groupRoute.brand ? (
                     <BrandGlyph brand={groupRoute.brand} alt={groupRoute.title} size={12} fallbackText={groupRoute.title} />
-                  ) : (
+                  ) : groupRoute.icon.kind === 'auto' ? (
                     <InlineBrandIcon model={groupRoute.modelPattern} size={12} />
-                  )
+                  ) : undefined
                 }
                 onClick={() => setActiveGroupFilter(activeGroupFilter === groupRoute.id ? null : groupRoute.id)}
               />

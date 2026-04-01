@@ -3,11 +3,15 @@ import { db, schema, runtimeDbDialect } from '../../db/index.js';
 import { and, eq, gte, lt, sql } from 'drizzle-orm';
 import { refreshBalance } from '../../services/balanceService.js';
 import { getAdapter } from '../../services/platforms/index.js';
-import { refreshModelsForAccount, rebuildTokenRoutesFromAvailability } from '../../services/modelService.js';
-import { ensureDefaultTokenForAccount, syncTokensFromUpstream } from '../../services/accountTokenService.js';
+import {
+  convergeAccountMutation,
+  rebuildRoutesBestEffort,
+} from '../../services/accountMutationWorkflow.js';
 import {
   getCredentialModeFromExtraConfig,
+  getProxyUrlFromExtraConfig,
   guessPlatformUserIdFromUsername,
+  hasOauthProvider,
   getSub2ApiAuthFromExtraConfig,
   mergeAccountExtraConfig,
   normalizeCredentialMode as normalizeCredentialModeInput,
@@ -25,8 +29,18 @@ import {
   type RuntimeHealthState,
 } from '../../services/accountHealthService.js';
 import { appendSessionTokenRebindHint } from '../../services/alertRules.js';
-import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
+import { parseSiteProxyUrlInput, withAccountProxyOverride, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { createRateLimitGuard } from '../../middleware/requestRateLimit.js';
+import {
+  parseAccountBatchPayload,
+  parseAccountCreatePayload,
+  parseAccountHealthRefreshPayload,
+  parseAccountLoginPayload,
+  parseAccountManualModelsPayload,
+  parseAccountRebindSessionPayload,
+  parseAccountUpdatePayload,
+  parseAccountVerifyTokenPayload,
+} from '../../contracts/accountsRoutePayloads.js';
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -46,6 +60,17 @@ type AccountCapabilities = {
   canCheckin: boolean;
   canRefreshBalance: boolean;
   proxyOnly: boolean;
+};
+
+type AccountInitializationParams = {
+  accountId: number;
+  site: typeof schema.sites.$inferSelect;
+  adapter: NonNullable<ReturnType<typeof getAdapter>>;
+  tokenType: 'session' | 'apikey' | 'unknown';
+  accessToken: string;
+  apiToken: string;
+  platformUserId?: number;
+  skipModelFetch?: boolean;
 };
 
 type VerifyFailureReason = 'needs-user-id' | 'invalid-user-id' | 'shield-blocked' | null;
@@ -79,7 +104,15 @@ function resolveStoredCredentialMode(account: typeof schema.accounts.$inferSelec
 function buildCapabilitiesFromCredentialMode(
   credentialMode: AccountCredentialMode,
   hasSessionToken: boolean,
+  extraConfig?: string | null,
 ): AccountCapabilities {
+  if (hasOauthProvider(extraConfig)) {
+    return {
+      canCheckin: false,
+      canRefreshBalance: false,
+      proxyOnly: true,
+    };
+  }
   const sessionCapable = credentialMode === 'session'
     ? hasSessionToken
     : (credentialMode === 'apikey' ? false : hasSessionToken);
@@ -92,7 +125,7 @@ function buildCapabilitiesFromCredentialMode(
 
 function buildCapabilitiesForAccount(account: typeof schema.accounts.$inferSelect): AccountCapabilities {
   const credentialMode = resolveStoredCredentialMode(account);
-  return buildCapabilitiesFromCredentialMode(credentialMode, hasSessionTokenValue(account.accessToken));
+  return buildCapabilitiesFromCredentialMode(credentialMode, hasSessionTokenValue(account.accessToken), account.extraConfig);
 }
 
 function normalizeBatchIds(input: unknown): number[] {
@@ -112,6 +145,67 @@ function normalizePinnedFlag(input: unknown): boolean | null {
     if (normalized === 'false' || normalized === '0') return false;
   }
   return null;
+}
+
+async function initializeAccountInBackground({
+  accountId,
+  site,
+  adapter,
+  tokenType,
+  accessToken,
+  apiToken,
+  platformUserId,
+  skipModelFetch,
+}: AccountInitializationParams) {
+  const summary = {
+    accountId,
+    syncedTokenCount: 0,
+    refreshedBalance: false,
+    refreshedModels: false,
+    rebuiltRoutes: false,
+  };
+
+  let fetchedUpstreamTokens: Array<{ name?: string | null; key?: string | null; enabled?: boolean | null; tokenGroup?: string | null }> = [];
+  if (tokenType === 'session' && accessToken) {
+    try {
+      const syncedTokens = await adapter.getApiTokens(site.url, accessToken, platformUserId);
+      summary.syncedTokenCount = Array.isArray(syncedTokens) ? syncedTokens.length : 0;
+      fetchedUpstreamTokens = Array.isArray(syncedTokens) ? syncedTokens : [];
+    } catch {}
+  }
+
+  const convergence = await convergeAccountMutation({
+    accountId,
+    preferredApiToken: tokenType === 'session' ? apiToken : null,
+    defaultTokenSource: 'manual',
+    ensurePreferredTokenBeforeSync: tokenType === 'session',
+    upstreamTokens: fetchedUpstreamTokens,
+    refreshBalance: tokenType === 'session',
+    refreshModels: skipModelFetch !== true,
+    rebuildRoutes: skipModelFetch !== true,
+    continueOnError: true,
+  });
+  summary.refreshedBalance = convergence.refreshedBalance;
+  summary.refreshedModels = convergence.refreshedModels;
+  summary.rebuiltRoutes = convergence.rebuiltRoutes;
+
+  return summary;
+}
+
+function buildQueuedAccountInitializationMessage(
+  tokenType: 'session' | 'apikey' | 'unknown',
+  skipModelFetch?: boolean,
+) {
+  if (tokenType === 'session' && skipModelFetch === true) {
+    return '账号已添加，后台正在同步令牌和余额信息。';
+  }
+  if (tokenType === 'session') {
+    return '账号已添加，后台正在同步令牌、余额和模型信息。';
+  }
+  if (skipModelFetch === true) {
+    return '已添加为 API Key 账号（可用于代理转发）。';
+  }
+  return '已添加为 API Key 账号，后台正在同步模型和路由信息。';
 }
 
 function normalizeSortOrder(input: unknown): number | null {
@@ -410,6 +504,7 @@ export async function accountsRoutes(app: FastifyInstance) {
         capabilities: buildCapabilitiesFromCredentialMode(
           credentialMode,
           hasSessionTokenValue(r.accounts.accessToken),
+          r.accounts.extraConfig,
         ),
         todaySpend: Math.round((spendByAccount[r.accounts.id] || 0) * 1_000_000) / 1_000_000,
         todayReward: Math.round(estimateRewardWithTodayIncomeFallback({
@@ -426,6 +521,7 @@ export async function accountsRoutes(app: FastifyInstance) {
           sessionCapable: buildCapabilitiesFromCredentialMode(
             credentialMode,
             hasSessionTokenValue(r.accounts.accessToken),
+            r.accounts.extraConfig,
           ).canRefreshBalance,
           hasDiscoveredModels: (modelCountByAccount[r.accounts.id] || 0) > 0,
         }),
@@ -434,11 +530,16 @@ export async function accountsRoutes(app: FastifyInstance) {
   });
 
   // Login to a site and auto-create account
-  app.post<{ Body: { siteId: number; username: string; password: string } }>(
+  app.post<{ Body: unknown }>(
     '/api/accounts/login',
     { preHandler: [limitAccountLogin] },
-    async (request) => {
-    const { siteId, username, password } = request.body;
+    async (request, reply) => {
+    const parsedBody = parseAccountLoginPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    const { siteId, username, password } = parsedBody.data;
 
     // Get site info
     const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
@@ -520,22 +621,16 @@ export async function accountsRoutes(app: FastifyInstance) {
       return { success: false, message: 'account create failed' };
     }
 
-    if (apiTokens.length > 0) {
-      try {
-        await syncTokensFromUpstream(result.id, apiTokens);
-      } catch { }
-    } else if (preferredApiToken) {
-      try {
-        await ensureDefaultTokenForAccount(result.id, preferredApiToken, { name: 'default', source: 'sync' });
-      } catch { }
-    }
-
-    // Auto-refresh balance
-    try { await refreshBalance(result.id); } catch { }
-    try {
-      await refreshModelsForAccount(result.id);
-      await rebuildTokenRoutesFromAvailability();
-    } catch { }
+    await convergeAccountMutation({
+      accountId: result.id,
+      preferredApiToken,
+      defaultTokenSource: 'sync',
+      upstreamTokens: apiTokens,
+      refreshBalance: true,
+      refreshModels: true,
+      rebuildRoutes: true,
+      continueOnError: true,
+    });
 
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, result.id)).get();
     return {
@@ -549,13 +644,18 @@ export async function accountsRoutes(app: FastifyInstance) {
   );
 
   // Verify credentials against a site.
-  app.post<{ Body: { siteId: number; accessToken: string; platformUserId?: number; credentialMode?: AccountCredentialMode } }>(
+  app.post<{ Body: unknown }>(
     '/api/accounts/verify-token',
     { preHandler: [limitAccountVerifyToken] },
-    async (request) => {
-    const { siteId, platformUserId } = request.body;
-    const accessToken = (request.body.accessToken || '').trim();
-    const credentialMode = resolveRequestedCredentialMode(request.body.credentialMode);
+    async (request, reply) => {
+    const parsedBody = parseAccountVerifyTokenPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    const { siteId, platformUserId } = parsedBody.data;
+    const accessToken = (parsedBody.data.accessToken || '').trim();
+    const credentialMode = resolveRequestedCredentialMode(parsedBody.data.credentialMode);
     const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
     if (!site) return { success: false, message: 'site not found' };
 
@@ -854,15 +954,20 @@ export async function accountsRoutes(app: FastifyInstance) {
     },
   );
 
-  app.post<{ Params: { id: string }; Body: { accessToken: string; platformUserId?: number; refreshToken?: string; tokenExpiresAt?: number | string } }>(
+  app.post<{ Params: { id: string }; Body: unknown }>(
     '/api/accounts/:id/rebind-session',
     async (request, reply) => {
+      const parsedBody = parseAccountRebindSessionPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({ success: false, message: parsedBody.error });
+      }
+
       const accountId = Number.parseInt(request.params.id, 10);
       if (!Number.isFinite(accountId) || accountId <= 0) {
         return reply.code(400).send({ success: false, message: '账号 ID 无效' });
       }
 
-      const nextAccessToken = (request.body?.accessToken || '').trim();
+      const nextAccessToken = (parsedBody.data.accessToken || '').trim();
       if (!nextAccessToken) {
         return reply.code(400).send({ success: false, message: '请提供新的 Session Token' });
       }
@@ -883,14 +988,17 @@ export async function accountsRoutes(app: FastifyInstance) {
         return reply.code(400).send({ success: false, message: `platform not supported: ${site.platform}` });
       }
 
-      const bodyPlatformUserId = Number.parseInt(String(request.body?.platformUserId ?? ''), 10);
+      const bodyPlatformUserId = Number.parseInt(String(parsedBody.data.platformUserId ?? ''), 10);
       const candidatePlatformUserId = Number.isFinite(bodyPlatformUserId) && bodyPlatformUserId > 0
         ? bodyPlatformUserId
         : resolvePlatformUserId(account.extraConfig, account.username);
 
       let verifyResult: any;
       try {
-        verifyResult = await adapter.verifyToken(site.url, nextAccessToken, candidatePlatformUserId);
+        verifyResult = await withAccountProxyOverride(
+          getProxyUrlFromExtraConfig(account.extraConfig),
+          () => adapter.verifyToken(site.url, nextAccessToken, candidatePlatformUserId),
+        );
       } catch (err: any) {
         return reply.code(400).send({
           success: false,
@@ -934,8 +1042,8 @@ export async function accountsRoutes(app: FastifyInstance) {
       }
       if ((site.platform || '').toLowerCase() === 'sub2api') {
         const existingManagedAuth = getSub2ApiAuthFromExtraConfig(account.extraConfig);
-        const requestedRefreshToken = normalizeManagedRefreshToken(request.body?.refreshToken);
-        const requestedTokenExpiresAt = normalizeManagedTokenExpiresAt(request.body?.tokenExpiresAt);
+        const requestedRefreshToken = normalizeManagedRefreshToken(parsedBody.data.refreshToken);
+        const requestedTokenExpiresAt = normalizeManagedTokenExpiresAt(parsedBody.data.tokenExpiresAt);
         const nextRefreshToken = requestedRefreshToken || existingManagedAuth?.refreshToken;
         const nextTokenExpiresAt = requestedTokenExpiresAt ?? existingManagedAuth?.tokenExpiresAt;
         if (nextRefreshToken) {
@@ -948,19 +1056,15 @@ export async function accountsRoutes(app: FastifyInstance) {
 
       await db.update(schema.accounts).set(updates).where(eq(schema.accounts.id, accountId)).run();
 
-      if (nextApiToken) {
-        try {
-          await ensureDefaultTokenForAccount(accountId, nextApiToken, { name: 'default', source: 'sync' });
-        } catch {}
-      }
-
-      try {
-        await refreshBalance(accountId);
-      } catch {}
-      try {
-        await refreshModelsForAccount(accountId);
-        await rebuildTokenRoutesFromAvailability();
-      } catch {}
+      await convergeAccountMutation({
+        accountId,
+        preferredApiToken: nextApiToken,
+        defaultTokenSource: 'sync',
+        refreshBalance: true,
+        refreshModels: true,
+        rebuildRoutes: true,
+        continueOnError: true,
+      });
 
       const latest = await db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
       return {
@@ -968,15 +1072,20 @@ export async function accountsRoutes(app: FastifyInstance) {
         account: latest,
         tokenType: 'session',
         credentialMode: 'session',
-        capabilities: latest ? buildCapabilitiesForAccount(latest) : buildCapabilitiesFromCredentialMode('session', true),
+        capabilities: latest ? buildCapabilitiesForAccount(latest) : buildCapabilitiesFromCredentialMode('session', true, null),
         apiTokenFound: !!nextApiToken,
       };
     },
   );
 
   // Add an account (manual credential input)
-  app.post<{ Body: { siteId: number; username?: string; accessToken: string; apiToken?: string; platformUserId?: number; checkinEnabled?: boolean; credentialMode?: AccountCredentialMode; refreshToken?: string; tokenExpiresAt?: number | string; skipModelFetch?: boolean } }>('/api/accounts', async (request, reply) => {
-    const body = request.body;
+  app.post<{ Body: unknown }>('/api/accounts', async (request, reply) => {
+    const parsedBody = parseAccountCreatePayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    const body = parsedBody.data;
     const site = await db.select().from(schema.sites).where(eq(schema.sites.id, body.siteId)).get();
     if (!site) {
       return reply.code(400).send({ success: false, message: 'site not found' });
@@ -1106,39 +1215,40 @@ export async function accountsRoutes(app: FastifyInstance) {
       return reply.code(500).send({ success: false, message: '创建账号失败' });
     }
 
-    if (tokenType === 'session' && apiToken) {
-      try {
-        await ensureDefaultTokenForAccount(result.id, apiToken, { name: 'default', source: 'manual' });
-      } catch { }
-    }
-
-    if (tokenType === 'session' && accessToken) {
-      try {
-        const syncedTokens = await adapter.getApiTokens(site.url, accessToken, resolvedPlatformUserId);
-        if (syncedTokens.length > 0) {
-          await syncTokensFromUpstream(result.id, syncedTokens);
-        }
-      } catch { }
-    }
-
-    // Try to refresh balance
-    if (tokenType === 'session') {
-      try { await refreshBalance(result.id); } catch { }
-    }
-
-    // Try to refresh models only if not skipping.
-    if (body.skipModelFetch !== true) {
-      try {
-        await refreshModelsForAccount(result.id);
-        await rebuildTokenRoutesFromAvailability();
-      } catch { }
+    const shouldQueueInitialization = tokenType === 'session' || body.skipModelFetch !== true;
+    let queuedTaskId: string | undefined;
+    let queuedMessage: string | undefined;
+    if (shouldQueueInitialization) {
+      const taskTitle = `初始化连接 #${result.id}`;
+      const { task } = startBackgroundTask(
+        {
+          type: 'account-init',
+          title: taskTitle,
+          dedupeKey: `account-init-${result.id}`,
+          notifyOnFailure: true,
+          successMessage: () => `${taskTitle}已完成`,
+          failureMessage: (currentTask) => `${taskTitle}失败：${currentTask.error || 'unknown error'}`,
+        },
+        async () => initializeAccountInBackground({
+          accountId: result.id,
+          site,
+          adapter,
+          tokenType,
+          accessToken,
+          apiToken,
+          platformUserId: resolvedPlatformUserId,
+          skipModelFetch: body.skipModelFetch,
+        }),
+      );
+      queuedTaskId = task.id;
+      queuedMessage = buildQueuedAccountInitializationMessage(tokenType, body.skipModelFetch);
     }
 
     const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, result.id)).get();
     const finalCredentialMode = account ? resolveStoredCredentialMode(account) : resolvedCredentialMode;
     const capabilities = account
       ? buildCapabilitiesForAccount(account)
-      : buildCapabilitiesFromCredentialMode(finalCredentialMode, tokenType === 'session');
+      : buildCapabilitiesFromCredentialMode(finalCredentialMode, tokenType === 'session', null);
     return {
       ...account,
       tokenType,
@@ -1147,13 +1257,20 @@ export async function accountsRoutes(app: FastifyInstance) {
       modelCount: verifiedModels.length,
       apiTokenFound: !!apiToken,
       usernameDetected: !!(!body.username && username),
+      queued: !!queuedTaskId,
+      jobId: queuedTaskId,
+      message: queuedMessage,
     };
   });
 
   // Update an account
-  app.put<{ Params: { id: string }; Body: any }>('/api/accounts/:id', async (request, reply) => {
+  app.put<{ Params: { id: string }; Body: unknown }>('/api/accounts/:id', async (request, reply) => {
     const id = parseInt(request.params.id);
-    const body = request.body as Record<string, unknown>;
+    const parsedBody = parseAccountUpdatePayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ message: parsedBody.error });
+    }
+    const body = parsedBody.data as Record<string, unknown>;
     const row = await db.select()
       .from(schema.accounts)
       .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
@@ -1210,6 +1327,18 @@ export async function accountsRoutes(app: FastifyInstance) {
       updates.sortOrder = normalizedSortOrder;
     }
 
+    if (Object.prototype.hasOwnProperty.call(body, 'proxyUrl')) {
+      const baseExtraConfig = typeof updates.extraConfig === 'string'
+        ? updates.extraConfig : account.extraConfig;
+      const { present, valid, proxyUrl: normalizedProxy } = parseSiteProxyUrlInput(body.proxyUrl);
+      if (present && !valid) {
+        return reply.code(400).send({ message: 'Invalid proxy URL format' });
+      }
+      updates.extraConfig = mergeAccountExtraConfig(baseExtraConfig, {
+        proxyUrl: normalizedProxy ?? undefined,
+      });
+    }
+
     updates.updatedAt = new Date().toISOString();
     await db.update(schema.accounts).set(updates).where(eq(schema.accounts.id, id)).run();
 
@@ -1220,17 +1349,21 @@ export async function accountsRoutes(app: FastifyInstance) {
       explicitNextMode && explicitNextMode !== 'auto'
         ? explicitNextMode
         : (hasSessionTokenValue(nextAccessToken) ? 'session' : 'apikey');
+    const needsModelRefresh =
+      Object.prototype.hasOwnProperty.call(body, 'accessToken')
+      || Object.prototype.hasOwnProperty.call(body, 'apiToken')
+      || Object.prototype.hasOwnProperty.call(body, 'extraConfig')
+      || Object.prototype.hasOwnProperty.call(body, 'proxyUrl')
+      || wantsManagedSub2ApiAuthPatch;
 
-    if (nextCredentialMode !== 'apikey' && typeof updates.apiToken === 'string' && updates.apiToken.trim()) {
-      try {
-        await ensureDefaultTokenForAccount(id, updates.apiToken, { name: 'default', source: 'manual' });
-      } catch { }
-    }
-
-    try {
-      await refreshModelsForAccount(id);
-      await rebuildTokenRoutesFromAvailability();
-    } catch { }
+    await convergeAccountMutation({
+      accountId: id,
+      preferredApiToken: nextCredentialMode !== 'apikey' ? updates.apiToken : null,
+      defaultTokenSource: 'manual',
+      refreshModels: needsModelRefresh,
+      rebuildRoutes: true,
+      continueOnError: true,
+    });
 
     return await db.select().from(schema.accounts).where(eq(schema.accounts.id, id)).get();
   });
@@ -1239,15 +1372,18 @@ export async function accountsRoutes(app: FastifyInstance) {
   app.delete<{ Params: { id: string } }>('/api/accounts/:id', async (request) => {
     const id = parseInt(request.params.id);
     await db.delete(schema.accounts).where(eq(schema.accounts.id, id)).run();
-    try {
-      await rebuildTokenRoutesFromAvailability();
-    } catch { }
+    await rebuildRoutesBestEffort();
     return { success: true };
   });
 
-  app.post<{ Body?: { ids?: number[]; action?: string } }>('/api/accounts/batch', async (request, reply) => {
-    const ids = normalizeBatchIds(request.body?.ids);
-    const action = String(request.body?.action || '').trim();
+  app.post<{ Body: unknown }>('/api/accounts/batch', async (request, reply) => {
+    const parsedBody = parseAccountBatchPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ message: parsedBody.error });
+    }
+
+    const ids = normalizeBatchIds(parsedBody.data.ids);
+    const action = String(parsedBody.data.action || '').trim();
     if (ids.length === 0) {
       return reply.code(400).send({ message: 'ids is required' });
     }
@@ -1295,9 +1431,7 @@ export async function accountsRoutes(app: FastifyInstance) {
     }
 
     if (shouldRebuildRoutes) {
-      try {
-        await rebuildTokenRoutesFromAvailability();
-      } catch { }
+      await rebuildRoutesBestEffort();
     }
 
     return {
@@ -1307,15 +1441,14 @@ export async function accountsRoutes(app: FastifyInstance) {
     };
   });
 
-  app.post<{ Body?: { accountId?: number; wait?: boolean } }>('/api/accounts/health/refresh', async (request, reply) => {
-    const rawAccountId = request.body?.accountId as unknown;
-    const hasAccountId = rawAccountId !== undefined && rawAccountId !== null && String(rawAccountId).trim() !== '';
-    const accountId = hasAccountId ? Number.parseInt(String(rawAccountId), 10) : undefined;
-    const wait = request.body?.wait === true;
-
-    if (hasAccountId && (!Number.isFinite(accountId) || (accountId as number) <= 0)) {
-      return reply.code(400).send({ success: false, message: '账号 ID 无效' });
+  app.post<{ Body: unknown }>('/api/accounts/health/refresh', async (request, reply) => {
+    const parsedBody = parseAccountHealthRefreshPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
     }
+
+    const accountId = parsedBody.data.accountId;
+    const wait = parsedBody.data.wait === true;
 
     if (wait) {
       const result = await executeRefreshAccountRuntimeHealth(accountId);
@@ -1432,13 +1565,18 @@ export async function accountsRoutes(app: FastifyInstance) {
   });
 
   // Add models manually to an account
-  app.post<{ Params: { id: string }; Body: { models: string[] } }>('/api/accounts/:id/models/manual', async (request, reply) => {
+  app.post<{ Params: { id: string }; Body: unknown }>('/api/accounts/:id/models/manual', async (request, reply) => {
+    const parsedBody = parseAccountManualModelsPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ message: parsedBody.error });
+    }
+
     const accountId = parseInt(request.params.id, 10);
     if (!Number.isFinite(accountId) || accountId <= 0) {
       return reply.code(400).send({ message: '账号 ID 无效' });
     }
 
-    const { models } = request.body;
+    const { models } = parsedBody.data;
     if (!Array.isArray(models) || models.length === 0) {
       return reply.code(400).send({ message: '模型列表不能为空' });
     }
@@ -1505,10 +1643,7 @@ export async function accountsRoutes(app: FastifyInstance) {
           }
         }
       });
-
-      try {
-        await rebuildTokenRoutesFromAvailability();
-      } catch { }
+      await rebuildRoutesBestEffort();
 
       return { success: true };
     } catch (err: any) {
@@ -1516,4 +1651,3 @@ export async function accountsRoutes(app: FastifyInstance) {
     }
   });
 }
-

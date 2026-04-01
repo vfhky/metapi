@@ -1,6 +1,7 @@
 import {
   decodeAnthropicReasoningSignature,
 } from './reasoningTransport.js';
+import { toOpenAiChatFileBlock } from './inputFile.js';
 import {
   consumeThinkTaggedText,
   createThinkTagParserState,
@@ -22,6 +23,11 @@ export type StreamTransformContext = {
   roleSent: boolean;
   doneSent: boolean;
   toolCalls: Record<number, { id?: string; name?: string; arguments?: string }>;
+  responsesToolCallIndexByOutputIndex: Record<number, number>;
+  responsesToolCallIndexById: Record<string, number>;
+  nextResponsesToolCallIndex: number;
+  responsesTextByIndex: Record<number, string>;
+  responsesReasoningByIndex: Record<number, string>;
   thinkTagParser: ThinkTagParserState;
 };
 
@@ -86,6 +92,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function asTrimmedString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
 function pickFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -98,6 +108,24 @@ function ensureIntegerTimestamp(value: unknown, fallback: number): number {
 
 function joinNonEmpty(parts: string[]): string {
   return parts.map((item) => item.trim()).filter((item) => item.length > 0).join('\n\n');
+}
+
+function joinIndexedResponsesText(partsByIndex: Record<number, string>): string {
+  const indexedParts = Object.entries(partsByIndex)
+    .map(([rawIndex, text]) => ({
+      index: Number(rawIndex),
+      text,
+    }))
+    .filter((entry) => Number.isFinite(entry.index) && entry.index >= 0 && typeof entry.text === 'string' && entry.text.length > 0)
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.text);
+
+  if (indexedParts.length > 0) {
+    return indexedParts.join('\n\n');
+  }
+
+  const snapshot = partsByIndex[-1];
+  return typeof snapshot === 'string' ? snapshot : '';
 }
 
 function textFromPart(part: unknown): string {
@@ -251,6 +279,11 @@ export function createStreamTransformContext(modelName: string): StreamTransform
     roleSent: false,
     doneSent: false,
     toolCalls: {},
+    responsesToolCallIndexByOutputIndex: {},
+    responsesToolCallIndexById: {},
+    nextResponsesToolCallIndex: 0,
+    responsesTextByIndex: {},
+    responsesReasoningByIndex: {},
     thinkTagParser: createThinkTagParserState(),
   };
 }
@@ -333,6 +366,90 @@ function parseClaudeMessageContent(content: unknown): string {
   return extractTextAndReasoning(content).content;
 }
 
+function buildOpenAiImageUrlBlock(url: string): Record<string, unknown> {
+  return {
+    type: 'image_url',
+    image_url: { url },
+  };
+}
+
+function buildOpenAiFileBlock(input: {
+  fileData?: string;
+  fileUrl?: string;
+  filename?: string;
+  mimeType?: string;
+}): Record<string, unknown> | null {
+  const fileData = typeof input.fileData === 'string' ? input.fileData.trim() : '';
+  const fileUrl = typeof input.fileUrl === 'string' ? input.fileUrl.trim() : '';
+  const filename = typeof input.filename === 'string' ? input.filename.trim() : '';
+  const mimeType = typeof input.mimeType === 'string' ? input.mimeType.trim() : '';
+  if (!fileData && !fileUrl) return null;
+
+  const file: Record<string, unknown> = {};
+  if (fileData) file.file_data = fileData;
+  if (fileUrl && !fileData) file.file_url = fileUrl;
+  if (filename) file.filename = filename;
+  if (mimeType) file.mime_type = mimeType;
+  return {
+    type: 'file',
+    file,
+  };
+}
+
+function convertClaudeContentBlockToOpenAi(block: Record<string, unknown>): Record<string, unknown> | null {
+  const blockType = typeof block.type === 'string' ? block.type : '';
+
+  if (blockType === 'text') {
+    const text = parseClaudeMessageContent(block);
+    return text ? { type: 'text', text } : null;
+  }
+
+  if (blockType === 'image') {
+    const source = isRecord(block.source) ? block.source : null;
+    const sourceType = typeof source?.type === 'string' ? source.type : '';
+    if (sourceType === 'url' && typeof source?.url === 'string' && source.url.trim()) {
+      return buildOpenAiImageUrlBlock(source.url.trim());
+    }
+    if (
+      sourceType === 'base64'
+      && typeof source?.media_type === 'string'
+      && source.media_type.trim()
+      && typeof source?.data === 'string'
+      && source.data.trim()
+    ) {
+      return buildOpenAiImageUrlBlock(`data:${source.media_type.trim()};base64,${source.data.trim()}`);
+    }
+    return null;
+  }
+
+  if (blockType === 'document') {
+    const source = isRecord(block.source) ? block.source : null;
+    const sourceType = typeof source?.type === 'string' ? source.type : '';
+    return buildOpenAiFileBlock({
+      fileData: sourceType === 'base64' && typeof source?.data === 'string' ? source.data : undefined,
+      fileUrl: sourceType === 'url' && typeof source?.url === 'string' ? source.url : undefined,
+      filename: typeof block.title === 'string' ? block.title : undefined,
+      mimeType: typeof source?.media_type === 'string' ? source.media_type : undefined,
+    });
+  }
+
+  const text = parseClaudeMessageContent(block);
+  return text ? { type: 'text', text } : null;
+}
+
+function buildOpenAiMessageContent(
+  contentBlocks: Array<Record<string, unknown>>,
+): string | Array<Record<string, unknown>> | undefined {
+  if (contentBlocks.length <= 0) return undefined;
+  if (contentBlocks.every((block) => block.type === 'text' && typeof block.text === 'string')) {
+    return contentBlocks
+      .map((block) => String(block.text).trim())
+      .filter(Boolean)
+      .join('\n\n');
+  }
+  return contentBlocks;
+}
+
 function parseResponsesOutputText(payload: Record<string, unknown>): string {
   const direct = typeof payload.output_text === 'string' ? payload.output_text : '';
   if (direct) return direct;
@@ -346,6 +463,58 @@ function parseResponsesOutputText(payload: Record<string, unknown>): string {
   }
 
   return parts.join('\n\n');
+}
+
+function parseResponsesReasoning(payload: Record<string, unknown>): {
+  reasoningContent: string;
+  reasoningSignature?: string;
+} {
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  const reasoningParts: string[] = [];
+  let reasoningSignature = '';
+
+  for (const item of output) {
+    if (!isRecord(item)) continue;
+    if (asTrimmedString(item.type).toLowerCase() !== 'reasoning') continue;
+
+    const parsed = extractTextAndReasoning(item.summary ?? item.content ?? item);
+    const text = joinNonEmpty([parsed.content, parsed.reasoning]);
+    if (text) reasoningParts.push(text);
+
+    const encrypted = asTrimmedString(item.encrypted_content);
+    if (!reasoningSignature && encrypted) {
+      reasoningSignature = encrypted;
+    }
+  }
+
+  return {
+    reasoningContent: joinNonEmpty(reasoningParts),
+    ...(reasoningSignature ? { reasoningSignature } : {}),
+  };
+}
+
+function unwrapTerminalResponsesEnvelope(
+  payload: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const type = asTrimmedString(payload.type).toLowerCase();
+  if (
+    type !== 'response.completed'
+    && type !== 'response.failed'
+    && type !== 'response.incomplete'
+  ) {
+    return null;
+  }
+  if (!isRecord(payload.response)) return null;
+
+  const responsePayload = payload.response as Record<string, unknown>;
+  if (isNonEmptyString(responsePayload.status)) {
+    return responsePayload;
+  }
+
+  return {
+    ...responsePayload,
+    status: type.slice('response.'.length),
+  };
 }
 
 function stringifyUnknownValue(value: unknown): string {
@@ -441,7 +610,7 @@ function collectToolCallsFromResponsesPayload(payload: Record<string, unknown>):
   for (let index = 0; index < output.length; index += 1) {
     const item = output[index];
     if (!isRecord(item)) continue;
-    if (item.type !== 'function_call') continue;
+    if (item.type !== 'function_call' && item.type !== 'custom_tool_call') continue;
 
     const id = (
       typeof item.call_id === 'string' && item.call_id.trim().length > 0
@@ -452,7 +621,9 @@ function collectToolCallsFromResponsesPayload(payload: Record<string, unknown>):
     const argumentsText = (
       typeof item.arguments === 'string'
         ? item.arguments
-        : stringifyUnknownValue(item.arguments)
+        : (typeof item.input === 'string'
+          ? item.input
+          : stringifyUnknownValue(item.arguments ?? item.input))
     );
     toolCalls.push({
       id,
@@ -464,7 +635,396 @@ function collectToolCallsFromResponsesPayload(payload: Record<string, unknown>):
   return toolCalls;
 }
 
-function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
+function collectIndexedToolCallsFromResponsesPayload(
+  payload: Record<string, unknown>,
+): Array<{ id: string; name: string; arguments: string; outputIndex: number }> {
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  const toolCalls: Array<{ id: string; name: string; arguments: string; outputIndex: number }> = [];
+
+  for (let index = 0; index < output.length; index += 1) {
+    const item = output[index];
+    if (!isRecord(item)) continue;
+    if (item.type !== 'function_call' && item.type !== 'custom_tool_call') continue;
+
+    const id = (
+      typeof item.call_id === 'string' && item.call_id.trim().length > 0
+        ? item.call_id.trim()
+        : (typeof item.id === 'string' && item.id.trim().length > 0 ? item.id.trim() : `call_${index}`)
+    );
+    const name = typeof item.name === 'string' ? item.name.trim() : '';
+    const argumentsText = (
+      typeof item.arguments === 'string'
+        ? item.arguments
+        : (typeof item.input === 'string'
+          ? item.input
+          : stringifyUnknownValue(item.arguments ?? item.input))
+    );
+    toolCalls.push({
+      id,
+      name,
+      arguments: argumentsText,
+      outputIndex: index,
+    });
+  }
+
+  return toolCalls;
+}
+
+function computeNovelResponsesDelta(existingText: string, incomingText: string): string {
+  if (!incomingText) return '';
+  if (!existingText) return incomingText;
+  if (incomingText.startsWith(existingText)) return incomingText.slice(existingText.length);
+  if (existingText.endsWith(incomingText)) return '';
+
+  const maxOverlap = Math.min(existingText.length, incomingText.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (existingText.endsWith(incomingText.slice(0, overlap))) {
+      return incomingText.slice(overlap);
+    }
+  }
+
+  return incomingText;
+}
+
+function extractResponsesOutputIndex(payload: Record<string, unknown>): number {
+  return (
+    typeof payload.output_index === 'number' && Number.isFinite(payload.output_index)
+      ? Math.max(0, Math.trunc(payload.output_index))
+      : 0
+  );
+}
+
+function extractResponsesItemText(item: Record<string, unknown>): string {
+  const itemType = asTrimmedString(item.type).toLowerCase();
+  if (itemType === 'message') {
+    return extractTextAndReasoning(item.content ?? item).content;
+  }
+  if (itemType === 'reasoning') {
+    const parsed = extractTextAndReasoning(item.summary ?? item.content ?? item);
+    return joinNonEmpty([parsed.content, parsed.reasoning]);
+  }
+  return '';
+}
+
+function rememberResponsesToolCallIndex(
+  context: StreamTransformContext,
+  canonicalIndex: number,
+  input: {
+    outputIndex?: number;
+    itemId?: unknown;
+    callId?: unknown;
+  },
+): void {
+  if (typeof input.outputIndex === 'number' && Number.isFinite(input.outputIndex)) {
+    context.responsesToolCallIndexByOutputIndex[Math.max(0, Math.trunc(input.outputIndex))] = canonicalIndex;
+  }
+  const itemId = asTrimmedString(input.itemId);
+  if (itemId) {
+    context.responsesToolCallIndexById[`item:${itemId}`] = canonicalIndex;
+  }
+  const callId = asTrimmedString(input.callId);
+  if (callId) {
+    context.responsesToolCallIndexById[`call:${callId}`] = canonicalIndex;
+  }
+}
+
+function resolveResponsesToolCallIndex(
+  context: StreamTransformContext,
+  input: {
+    outputIndex?: number;
+    itemId?: unknown;
+    callId?: unknown;
+  },
+): number {
+  const normalizedOutputIndex = (
+    typeof input.outputIndex === 'number' && Number.isFinite(input.outputIndex)
+      ? Math.max(0, Math.trunc(input.outputIndex))
+      : undefined
+  );
+  if (
+    normalizedOutputIndex !== undefined
+    && context.responsesToolCallIndexByOutputIndex[normalizedOutputIndex] !== undefined
+  ) {
+    const canonicalIndex = context.responsesToolCallIndexByOutputIndex[normalizedOutputIndex]!;
+    rememberResponsesToolCallIndex(context, canonicalIndex, {
+      outputIndex: normalizedOutputIndex,
+      itemId: input.itemId,
+      callId: input.callId,
+    });
+    return canonicalIndex;
+  }
+
+  const itemId = asTrimmedString(input.itemId);
+  if (itemId && context.responsesToolCallIndexById[`item:${itemId}`] !== undefined) {
+    const canonicalIndex = context.responsesToolCallIndexById[`item:${itemId}`]!;
+    rememberResponsesToolCallIndex(context, canonicalIndex, {
+      outputIndex: normalizedOutputIndex,
+      itemId,
+      callId: input.callId,
+    });
+    return canonicalIndex;
+  }
+
+  const callId = asTrimmedString(input.callId);
+  if (callId && context.responsesToolCallIndexById[`call:${callId}`] !== undefined) {
+    const canonicalIndex = context.responsesToolCallIndexById[`call:${callId}`]!;
+    rememberResponsesToolCallIndex(context, canonicalIndex, {
+      outputIndex: normalizedOutputIndex,
+      itemId: input.itemId,
+      callId,
+    });
+    return canonicalIndex;
+  }
+
+  const canonicalIndex = context.nextResponsesToolCallIndex;
+  context.nextResponsesToolCallIndex += 1;
+  rememberResponsesToolCallIndex(context, canonicalIndex, {
+    outputIndex: normalizedOutputIndex,
+    itemId: input.itemId,
+    callId: input.callId,
+  });
+  return canonicalIndex;
+}
+
+function buildResponsesToolCallDeltaFromItem(
+  item: Record<string, unknown>,
+  outputIndex: number,
+  context: StreamTransformContext,
+): NormalizedStreamEvent | null {
+  const itemType = asTrimmedString(item.type).toLowerCase();
+  if (itemType !== 'function_call' && itemType !== 'custom_tool_call') return null;
+
+  const toolCallId = (
+    isNonEmptyString(item.call_id) ? item.call_id
+      : (isNonEmptyString(item.id) ? item.id : undefined)
+  );
+  const toolName = isNonEmptyString(item.name) ? item.name : undefined;
+  const rawArguments = itemType === 'custom_tool_call'
+    ? (typeof item.input === 'string' ? item.input : stringifyUnknownValue(item.input))
+    : (typeof item.arguments === 'string' ? item.arguments : stringifyUnknownValue(item.arguments));
+  const canonicalIndex = resolveResponsesToolCallIndex(context, {
+    outputIndex,
+    itemId: item.id,
+    callId: item.call_id,
+  });
+  const existingArguments = context.toolCalls[canonicalIndex]?.arguments || '';
+  const argumentsDelta = computeNovelResponsesDelta(existingArguments, rawArguments);
+  const knownTool = context.toolCalls[canonicalIndex] || {};
+  const shouldBackfillId = !!toolCallId && !knownTool.id;
+  const shouldBackfillName = !!toolName && !knownTool.name;
+
+  if (!argumentsDelta && !shouldBackfillId && !shouldBackfillName) {
+    return null;
+  }
+
+  return {
+    toolCallDeltas: [{
+      index: canonicalIndex,
+      id: toolCallId,
+      name: toolName,
+      argumentsDelta: argumentsDelta || undefined,
+    }],
+  };
+}
+
+function formatAnthropicBase64DataUrl(mimeType: string, data: string): string {
+  return `data:${mimeType};base64,${data}`;
+}
+
+function parseAnthropicBase64Source(
+  source: unknown,
+): { mimeType: string; data: string } | null {
+  if (!isRecord(source)) return null;
+  const sourceType = asTrimmedString(source.type).toLowerCase();
+  if (sourceType !== 'base64') return null;
+  const mimeType = (
+    asTrimmedString(source.media_type)
+    || asTrimmedString(source.mime_type)
+    || asTrimmedString(source.mediaType)
+    || asTrimmedString(source.mimeType)
+    || 'application/octet-stream'
+  );
+  const data = asTrimmedString(source.data);
+  if (!data) return null;
+  return { mimeType, data };
+}
+
+function parseAnthropicUrlSource(
+  source: unknown,
+): { url: string; mimeType: string | null } | null {
+  if (!isRecord(source)) return null;
+  const sourceType = asTrimmedString(source.type).toLowerCase();
+  if (sourceType !== 'url') return null;
+  const url = asTrimmedString(source.url);
+  if (!url) return null;
+  const mimeType = (
+    asTrimmedString(source.media_type)
+    || asTrimmedString(source.mime_type)
+    || asTrimmedString(source.mediaType)
+    || asTrimmedString(source.mimeType)
+    || null
+  );
+  return { url, mimeType };
+}
+
+function toOpenAiContentBlockFromClaudeBlock(
+  block: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const blockType = asTrimmedString(block.type).toLowerCase();
+
+  if (blockType === 'text') {
+    const text = asTrimmedString(block.text);
+    return text ? { type: 'text', text } : null;
+  }
+
+  if (blockType !== 'image' && blockType !== 'document') {
+    return null;
+  }
+
+  const title = asTrimmedString(block.title);
+  const base64Source = parseAnthropicBase64Source(block.source);
+  const urlSource = parseAnthropicUrlSource(block.source);
+  const mimeType = (base64Source?.mimeType || urlSource?.mimeType || '').toLowerCase();
+  const treatAsImage = blockType === 'image' || mimeType.startsWith('image/');
+
+  if (treatAsImage) {
+    const imageUrl = base64Source
+      ? formatAnthropicBase64DataUrl(base64Source.mimeType, base64Source.data)
+      : (urlSource?.url || '');
+    return imageUrl
+      ? {
+        type: 'image_url',
+        image_url: { url: imageUrl },
+      }
+      : null;
+  }
+
+  if (base64Source) {
+    return toOpenAiChatFileBlock({
+      fileData: base64Source.data,
+      filename: title || undefined,
+      mimeType: base64Source.mimeType,
+    });
+  }
+
+  if (urlSource) {
+    return toOpenAiChatFileBlock({
+      fileUrl: urlSource.url,
+      filename: title || undefined,
+      mimeType: urlSource.mimeType,
+    });
+  }
+
+  return null;
+}
+
+function collapseOpenAiContentBlocks(
+  blocks: Array<Record<string, unknown>>,
+): string | Array<Record<string, unknown>> | null {
+  if (blocks.length <= 0) return null;
+  const textOnly = blocks.every((block) => block.type === 'text' && typeof block.text === 'string');
+  if (!textOnly) return blocks;
+
+  const text = blocks
+    .map((block) => (typeof block.text === 'string' ? block.text : ''))
+    .join('\n\n')
+    .trim();
+  return text || null;
+}
+
+function pickPositiveInteger(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.trunc(value);
+  }
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
+
+function convertClaudeToolsToOpenAiChat(rawTools: unknown): unknown {
+  if (!Array.isArray(rawTools)) return rawTools;
+
+  return rawTools.map((item) => {
+    if (!isRecord(item)) return item;
+
+    const type = asTrimmedString(item.type).toLowerCase();
+    if (type === 'function' || type === 'custom' || type === 'image_generation') {
+      return item;
+    }
+
+    const name = asTrimmedString(item.name);
+    if (!name) return item;
+
+    return {
+      type: 'function',
+      function: {
+        name,
+        ...(asTrimmedString(item.description)
+          ? { description: asTrimmedString(item.description) }
+          : {}),
+        parameters: isRecord(item.input_schema)
+          ? item.input_schema
+          : (isRecord(item.parameters) ? item.parameters : { type: 'object' }),
+      },
+    };
+  });
+}
+
+function convertClaudeToolChoiceToOpenAiChat(rawToolChoice: unknown): unknown {
+  if (rawToolChoice === undefined) return undefined;
+  if (typeof rawToolChoice === 'string') {
+    const normalized = rawToolChoice.trim().toLowerCase();
+    if (normalized === 'any') return 'required';
+    return normalized || rawToolChoice;
+  }
+  if (!isRecord(rawToolChoice)) return rawToolChoice;
+
+  const type = asTrimmedString(rawToolChoice.type).toLowerCase();
+  if (type === 'auto' || type === 'none') return type;
+  if (type === 'any' || type === 'required') return 'required';
+  if (type === 'function' && isRecord(rawToolChoice.function)) {
+    const name = asTrimmedString(rawToolChoice.function.name);
+    return name
+      ? {
+        type: 'function',
+        function: { name },
+      }
+      : 'required';
+  }
+  if (type !== 'tool') return rawToolChoice;
+
+  const name = asTrimmedString(
+    rawToolChoice.name
+    ?? (isRecord(rawToolChoice.tool) ? rawToolChoice.tool.name : undefined),
+  );
+  return name
+    ? {
+      type: 'function',
+      function: { name },
+    }
+    : 'required';
+}
+
+function extractClaudeReasoningRequest(
+  body: Record<string, unknown>,
+): { reasoningEffort?: string; reasoningBudget?: number } {
+  const thinking = isRecord(body.thinking) ? body.thinking : null;
+  const outputConfig = isRecord(body.output_config) ? body.output_config : null;
+  const reasoningEffort = asTrimmedString(outputConfig?.effort).toLowerCase();
+  const reasoningBudget = pickPositiveInteger(
+    thinking?.budget_tokens
+    ?? thinking?.budgetTokens,
+  );
+
+  return {
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(reasoningBudget !== undefined ? { reasoningBudget } : {}),
+  };
+}
+
+export function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
   model: string;
   stream: boolean;
   messages: Array<Record<string, unknown>>;
@@ -474,6 +1034,42 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
   const stream = body.stream === true;
 
   const messages: Array<Record<string, unknown>> = [];
+
+  const convertToolResultContent = (content: unknown): string | Array<Record<string, unknown>> | null => {
+    const blocks: Array<Record<string, unknown>> = [];
+
+    const appendContentBlock = (item: unknown) => {
+      if (isRecord(item)) {
+        const block = toOpenAiContentBlockFromClaudeBlock(item);
+        if (block) {
+          blocks.push(block);
+          return;
+        }
+      }
+      const text = parseClaudeMessageContent(item);
+      if (text) {
+        blocks.push({ type: 'text', text });
+      }
+    };
+
+    const valueToProcess = (isRecord(content) && Array.isArray(content.content))
+      ? (content.content as unknown[])
+      : content;
+
+    if (Array.isArray(valueToProcess)) {
+      for (const item of valueToProcess) {
+        appendContentBlock(item);
+      }
+    } else {
+      appendContentBlock(valueToProcess);
+    }
+
+    if (blocks.length <= 0) return null;
+    const collapsed = collapseOpenAiContentBlocks(blocks);
+    if (!collapsed) return null;
+    if (typeof collapsed === 'string' && collapsed.length === 0) return null;
+    return collapsed;
+  };
 
   const appendMessage = (role: string, content: unknown) => {
     const text = parseClaudeMessageContent(content);
@@ -485,16 +1081,13 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
     const toolCallId = typeof toolUseId === 'string' ? toolUseId.trim() : '';
     if (!toolCallId) return;
 
-    const text = (
-      parseClaudeMessageContent(content)
-      || stringifyUnknownValue(content)
-    ).trim();
-    if (!text) return;
+    const contentPayload = convertToolResultContent(content);
+    if (!contentPayload) return;
 
     messages.push({
       role: 'tool',
       tool_call_id: toolCallId,
-      content: text,
+      content: contentPayload,
     });
   };
 
@@ -521,14 +1114,15 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
     // Claude tool blocks need explicit OpenAI mapping:
     // - assistant.tool_use  -> assistant.tool_calls
     // - user.tool_result    -> tool messages with tool_call_id
-    const textParts: string[] = [];
+    const contentBlocks: Array<Record<string, unknown>> = [];
     const toolCalls: Array<Record<string, unknown>> = [];
+    const reasoningParts: string[] = [];
 
-    const flushTextAsMessage = () => {
-      const merged = textParts.map((item) => item.trim()).filter(Boolean).join('\n\n');
-      textParts.length = 0;
-      if (!merged) return;
-      messages.push({ role: mappedRole, content: merged });
+    const flushContentAsMessage = () => {
+      const contentPayload = collapseOpenAiContentBlocks(contentBlocks);
+      contentBlocks.length = 0;
+      if (contentPayload === null) return;
+      messages.push({ role: mappedRole, content: contentPayload });
     };
 
     for (const block of content) {
@@ -536,7 +1130,6 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
       const blockType = typeof block.type === 'string' ? block.type : '';
 
       if (blockType === 'tool_result') {
-        flushTextAsMessage();
         appendToolResultMessage(block.tool_use_id, block.content);
         continue;
       }
@@ -564,23 +1157,47 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
         continue;
       }
 
-      const text = parseClaudeMessageContent(block);
-      if (text) textParts.push(text);
+      const extracted = extractTextAndReasoning(block);
+      if (mappedRole === 'assistant' && extracted.reasoning) {
+        reasoningParts.push(extracted.reasoning);
+      }
+
+      const contentBlock = toOpenAiContentBlockFromClaudeBlock(block);
+      if (contentBlock) {
+        contentBlocks.push(contentBlock);
+        continue;
+      }
+
+      const text = extracted.content || parseClaudeMessageContent(block);
+      if (text) {
+        contentBlocks.push({
+          type: 'text',
+          text,
+        });
+      }
     }
 
-    const merged = textParts.map((item) => item.trim()).filter(Boolean).join('\n\n');
+    const merged = collapseOpenAiContentBlocks(contentBlocks);
     if (toolCalls.length > 0) {
       const assistantMessage: Record<string, unknown> = {
         role: 'assistant',
         tool_calls: toolCalls,
       };
-      // Keep textual assistant preface when present.
       assistantMessage.content = merged || '';
+      const reasoningContent = joinNonEmpty(reasoningParts);
+      if (reasoningContent) assistantMessage.reasoning_content = reasoningContent;
       messages.push(assistantMessage);
-    } else if (merged) {
-      messages.push({
+    } else if (merged !== null || (mappedRole === 'assistant' && reasoningParts.length > 0)) {
+      const nextMessage: Record<string, unknown> = {
         role: mappedRole,
-        content: merged,
+        content: merged ?? '',
+      };
+      if (mappedRole === 'assistant') {
+        const reasoningContent = joinNonEmpty(reasoningParts);
+        if (reasoningContent) nextMessage.reasoning_content = reasoningContent;
+      }
+      messages.push({
+        ...nextMessage,
       });
     }
   }
@@ -597,6 +1214,8 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
   const topP = pickFiniteNumber(body.top_p);
   if (topP !== undefined) payload.top_p = topP;
 
+  if (isRecord(body.metadata)) payload.metadata = body.metadata;
+
   const maxTokens = pickFiniteNumber(body.max_tokens);
   if (maxTokens !== undefined) {
     payload.max_tokens = maxTokens;
@@ -608,8 +1227,12 @@ function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
     payload.stop = body.stop_sequences;
   }
 
-  if (body.tools !== undefined) payload.tools = body.tools;
-  if (body.tool_choice !== undefined) payload.tool_choice = body.tool_choice;
+  const reasoningRequest = extractClaudeReasoningRequest(body);
+  if (reasoningRequest.reasoningEffort) payload.reasoning_effort = reasoningRequest.reasoningEffort;
+  if (reasoningRequest.reasoningBudget !== undefined) payload.reasoning_budget = reasoningRequest.reasoningBudget;
+
+  if (body.tools !== undefined) payload.tools = convertClaudeToolsToOpenAiChat(body.tools);
+  if (body.tool_choice !== undefined) payload.tool_choice = convertClaudeToolChoiceToOpenAiChat(body.tool_choice);
 
   return { model, stream, messages, payload };
 }
@@ -690,6 +1313,13 @@ export function normalizeUpstreamFinalResponse(
   const now = Math.floor(Date.now() / 1000);
   const fallbackId = `chatcmpl-meta-${Date.now()}`;
 
+  if (isRecord(payload)) {
+    const terminalResponsesPayload = unwrapTerminalResponsesEnvelope(payload);
+    if (terminalResponsesPayload) {
+      return normalizeUpstreamFinalResponse(terminalResponsesPayload, fallbackModel, fallbackText);
+    }
+  }
+
   if (isRecord(payload) && Array.isArray(payload.choices)) {
     const choice = payload.choices[0] ?? {};
     const content = extractAssistantContent(choice) || extractAssistantContent(payload);
@@ -723,12 +1353,14 @@ export function normalizeUpstreamFinalResponse(
 
   if (isRecord(payload) && ((payload as any).object === 'response' || Array.isArray((payload as any).output))) {
     const toolCalls = collectToolCallsFromResponsesPayload(payload);
+    const responsesReasoning = parseResponsesReasoning(payload);
     return {
       id: isNonEmptyString(payload.id) ? payload.id : fallbackId,
       model: isNonEmptyString(payload.model) ? payload.model : fallbackModel,
-      created: ensureIntegerTimestamp(payload.created, now),
+      created: ensureIntegerTimestamp((payload as any).created_at ?? payload.created, now),
       content: parseResponsesOutputText(payload) || (toolCalls.length > 0 ? '' : fallbackText),
-      reasoningContent: '',
+      reasoningContent: responsesReasoning.reasoningContent,
+      ...(responsesReasoning.reasoningSignature ? { reasoningSignature: responsesReasoning.reasoningSignature } : {}),
       finishReason: toolCalls.length > 0
         ? 'tool_calls'
         : (normalizeStopReason(payload.finish_reason ?? payload.status) || 'stop'),
@@ -859,19 +1491,39 @@ export function normalizeUpstreamStreamEvent(
 
   const type = typeof payload.type === 'string' ? payload.type : '';
   if (type.startsWith('response.output_text')) {
-    const parsed = extractStreamingTextAndReasoning(payload.delta, context.thinkTagParser);
+    const outputIndex = extractResponsesOutputIndex(payload);
+    const rawText = typeof payload.delta === 'string'
+      ? payload.delta
+      : (typeof (payload as any).text === 'string' ? (payload as any).text : '');
+    const parsed = extractStreamingTextAndReasoning(rawText, context.thinkTagParser);
+    const nextContent = type === 'response.output_text.done'
+      ? (parsed.content || context.responsesTextByIndex[outputIndex] || '')
+      : `${context.responsesTextByIndex[outputIndex] || ''}${parsed.content || ''}`;
+    const novelContent = type === 'response.output_text.done'
+      ? computeNovelResponsesDelta(context.responsesTextByIndex[outputIndex] || '', parsed.content || '')
+      : (parsed.content || '');
+    if (nextContent) context.responsesTextByIndex[outputIndex] = nextContent;
     return {
-      contentDelta: parsed.content || undefined,
+      contentDelta: novelContent || undefined,
       reasoningDelta: parsed.reasoning || undefined,
     };
   }
 
-  if (type === 'response.reasoning_summary_text.delta') {
-    const deltaText = typeof payload.delta === 'string'
-      ? payload.delta
-      : extractTextAndReasoning(payload.delta).content;
+  if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_summary_text.done') {
+    const outputIndex = extractResponsesOutputIndex(payload);
+    const deltaText = type === 'response.reasoning_summary_text.done'
+      ? (typeof (payload as any).text === 'string' ? (payload as any).text : extractTextAndReasoning(payload.text).content)
+      : (typeof payload.delta === 'string' ? payload.delta : extractTextAndReasoning(payload.delta).content);
+    const previousReasoning = context.responsesReasoningByIndex[outputIndex] || '';
+    const novelDelta = computeNovelResponsesDelta(previousReasoning, deltaText);
+    const nextReasoning = type === 'response.reasoning_summary_text.done'
+      ? (deltaText || previousReasoning)
+      : `${previousReasoning}${novelDelta}`;
+    if (nextReasoning) {
+      context.responsesReasoningByIndex[outputIndex] = nextReasoning;
+    }
     return {
-      reasoningDelta: deltaText || undefined,
+      reasoningDelta: novelDelta || undefined,
     };
   }
 
@@ -888,40 +1540,44 @@ export function normalizeUpstreamStreamEvent(
     };
   }
 
-  if (type === 'response.output_item.added' && isRecord((payload as any).item)) {
+  if ((type === 'response.output_item.added' || type === 'response.output_item.done') && isRecord((payload as any).item)) {
+    const outputIndex = extractResponsesOutputIndex(payload as Record<string, unknown>);
     const item = (payload as any).item as Record<string, unknown>;
     if (item.type === 'reasoning' && isNonEmptyString(item.encrypted_content)) {
+      const reasoningText = extractResponsesItemText(item);
+      const novelReasoning = computeNovelResponsesDelta(context.responsesReasoningByIndex[outputIndex] || '', reasoningText);
+      if (reasoningText) {
+        context.responsesReasoningByIndex[outputIndex] = reasoningText;
+      }
       return {
         reasoningSignature: item.encrypted_content,
+        reasoningDelta: novelReasoning || undefined,
       };
     }
-    if (item.type === 'function_call') {
-      const outputIndex = (
-        typeof (payload as any).output_index === 'number' && Number.isFinite((payload as any).output_index)
-          ? Math.max(0, Math.trunc((payload as any).output_index))
-          : 0
-      );
-      const toolCallId = (
-        isNonEmptyString(item.call_id) ? item.call_id
-          : (isNonEmptyString(item.id) ? item.id : undefined)
-      );
-      const toolName = isNonEmptyString(item.name) ? item.name : undefined;
+    const toolCallEvent = buildResponsesToolCallDeltaFromItem(item, outputIndex, context);
+    if (toolCallEvent) {
+      return toolCallEvent;
+    }
+    if (item.type === 'message') {
+      const fullText = extractResponsesItemText(item);
+      const novelDelta = computeNovelResponsesDelta(context.responsesTextByIndex[outputIndex] || '', fullText);
+      if (fullText) {
+        context.responsesTextByIndex[outputIndex] = fullText;
+      }
       return {
-        toolCallDeltas: [{
-          index: outputIndex,
-          id: toolCallId,
-          name: toolName,
-        }],
+        role: item.role === 'assistant' ? 'assistant' : undefined,
+        contentDelta: novelDelta || undefined,
       };
     }
   }
 
   if (type === 'response.function_call_arguments.delta' || type === 'response.function_call_arguments.done') {
-    const outputIndex = (
-      typeof (payload as any).output_index === 'number' && Number.isFinite((payload as any).output_index)
-        ? Math.max(0, Math.trunc((payload as any).output_index))
-        : 0
-    );
+    const outputIndex = extractResponsesOutputIndex(payload as Record<string, unknown>);
+    const canonicalIndex = resolveResponsesToolCallIndex(context, {
+      outputIndex,
+      itemId: (payload as any).item_id,
+      callId: (payload as any).call_id,
+    });
     const toolCallId = (
       isNonEmptyString((payload as any).call_id) ? (payload as any).call_id
         : (isNonEmptyString((payload as any).item_id) ? (payload as any).item_id : undefined)
@@ -938,7 +1594,7 @@ export function normalizeUpstreamStreamEvent(
     );
     let argumentsDelta = rawArguments;
     if (type === 'response.function_call_arguments.done' && typeof rawArguments === 'string') {
-      const existingArguments = context.toolCalls[outputIndex]?.arguments || '';
+      const existingArguments = context.toolCalls[canonicalIndex]?.arguments || '';
       if (existingArguments && rawArguments.startsWith(existingArguments)) {
         const missingSuffix = rawArguments.slice(existingArguments.length);
         argumentsDelta = missingSuffix.length > 0 ? missingSuffix : undefined;
@@ -947,7 +1603,7 @@ export function normalizeUpstreamStreamEvent(
       }
     }
 
-    const knownTool = context.toolCalls[outputIndex] || {};
+    const knownTool = context.toolCalls[canonicalIndex] || {};
     const shouldBackfillId = !!toolCallId && !knownTool.id;
     const shouldBackfillName = !!toolName && !knownTool.name;
     if (argumentsDelta === undefined && !shouldBackfillId && !shouldBackfillName) {
@@ -956,10 +1612,50 @@ export function normalizeUpstreamStreamEvent(
 
     return {
       toolCallDeltas: [{
-        index: outputIndex,
+        index: canonicalIndex,
         id: toolCallId,
         name: toolName,
         argumentsDelta,
+      }],
+    };
+  }
+
+  if (type === 'response.custom_tool_call_input.delta' || type === 'response.custom_tool_call_input.done') {
+    const outputIndex = extractResponsesOutputIndex(payload as Record<string, unknown>);
+    const canonicalIndex = resolveResponsesToolCallIndex(context, {
+      outputIndex,
+      itemId: (payload as any).item_id,
+      callId: (payload as any).call_id,
+    });
+    const toolCallId = (
+      isNonEmptyString((payload as any).call_id) ? (payload as any).call_id
+        : (isNonEmptyString((payload as any).item_id) ? (payload as any).item_id : undefined)
+    );
+    const toolName = isNonEmptyString((payload as any).name) ? (payload as any).name : undefined;
+    const rawArguments = (
+      type === 'response.custom_tool_call_input.done'
+        ? (typeof (payload as any).input === 'string' ? (payload as any).input : stringifyUnknownValue((payload as any).input))
+        : (
+          typeof payload.delta === 'string'
+            ? payload.delta
+            : stringifyUnknownValue((payload as any).input)
+        )
+    );
+    const existingArguments = context.toolCalls[canonicalIndex]?.arguments || '';
+    const argumentsDelta = computeNovelResponsesDelta(existingArguments, rawArguments);
+    const knownTool = context.toolCalls[canonicalIndex] || {};
+    const shouldBackfillId = !!toolCallId && !knownTool.id;
+    const shouldBackfillName = !!toolName && !knownTool.name;
+    if (!argumentsDelta && !shouldBackfillId && !shouldBackfillName) {
+      return {};
+    }
+
+    return {
+      toolCallDeltas: [{
+        index: canonicalIndex,
+        id: toolCallId,
+        name: toolName,
+        argumentsDelta: argumentsDelta || undefined,
       }],
     };
   }
@@ -968,8 +1664,53 @@ export function normalizeUpstreamStreamEvent(
     const responsePayload = (payload as any).response as Record<string, unknown>;
     if (isNonEmptyString(responsePayload.id)) context.id = responsePayload.id;
     if (isNonEmptyString(responsePayload.model)) context.model = responsePayload.model;
+    const content = parseResponsesOutputText(responsePayload);
+    const contentDelta = computeNovelResponsesDelta(joinIndexedResponsesText(context.responsesTextByIndex), content);
+    if (content) {
+      context.responsesTextByIndex = { ...context.responsesTextByIndex, [-1]: content } as Record<number, string>;
+    }
+    const responsesReasoning = parseResponsesReasoning(responsePayload);
+    const reasoningDelta = computeNovelResponsesDelta(
+      joinIndexedResponsesText(context.responsesReasoningByIndex),
+      responsesReasoning.reasoningContent,
+    );
+    if (responsesReasoning.reasoningContent) {
+      context.responsesReasoningByIndex = {
+        ...context.responsesReasoningByIndex,
+        [-1]: responsesReasoning.reasoningContent,
+      } as Record<number, string>;
+    }
+    const toolCalls = collectIndexedToolCallsFromResponsesPayload(responsePayload);
+    const toolCallDeltas = toolCalls
+      .map((toolCall) => {
+        const canonicalIndex = resolveResponsesToolCallIndex(context, {
+          outputIndex: toolCall.outputIndex,
+          callId: toolCall.id,
+        });
+        const knownTool = context.toolCalls[canonicalIndex] || {};
+        const argumentsDelta = computeNovelResponsesDelta(knownTool.arguments || '', toolCall.arguments);
+        const shouldBackfillId = !!toolCall.id && !knownTool.id;
+        const shouldBackfillName = !!toolCall.name && !knownTool.name;
+        if (!argumentsDelta && !shouldBackfillId && !shouldBackfillName) {
+          return null;
+        }
+        return {
+          index: canonicalIndex,
+          id: toolCall.id,
+          name: toolCall.name,
+          argumentsDelta: argumentsDelta || undefined,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => !!item);
     return {
-      finishReason: normalizeStopReason(responsePayload.status) || 'stop',
+      ...(contentDelta || reasoningDelta ? { role: 'assistant' as const } : {}),
+      ...(contentDelta ? { contentDelta } : {}),
+      ...(reasoningDelta ? { reasoningDelta } : {}),
+      ...(responsesReasoning.reasoningSignature ? { reasoningSignature: responsesReasoning.reasoningSignature } : {}),
+      ...(toolCallDeltas.length > 0 ? { toolCallDeltas } : {}),
+      finishReason: toolCallDeltas.length > 0
+        ? 'tool_calls'
+        : (normalizeStopReason(responsePayload.status) || 'stop'),
       done: true,
     };
   }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, create } from 'react-test-renderer';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import ModernSelect from '../components/ModernSelect.js';
 import { ToastProvider } from '../components/Toast.js';
@@ -10,6 +10,7 @@ const { apiMock } = vi.hoisted(() => ({
     getSites: vi.fn(),
     addSite: vi.fn(),
     getSiteDisabledModels: vi.fn().mockResolvedValue({ models: [] }),
+    getSiteAvailableModels: vi.fn().mockResolvedValue({ models: [] }),
   },
 }));
 
@@ -37,11 +38,14 @@ function LocationProbe() {
   return <div>{`${location.pathname}${location.search}`}</div>;
 }
 
-async function createSiteAndCollectLocation(createdSite: { id: number; platform?: string | null }) {
+async function createSiteAndClickModalChoice(
+  createdSite: { id: number; name: string; platform?: string | null; initializationPresetId?: string | null },
+  choice: 'session' | 'apikey' | 'later',
+) {
   apiMock.getSites.mockResolvedValue([]);
   apiMock.addSite.mockResolvedValue(createdSite);
 
-  let root: ReturnType<typeof create> | null = null;
+  let root!: ReactTestRenderer;
   try {
     await act(async () => {
       root = create(
@@ -50,6 +54,7 @@ async function createSiteAndCollectLocation(createdSite: { id: number; platform?
             <Routes>
               <Route path="/sites" element={<Sites />} />
               <Route path="/accounts" element={<LocationProbe />} />
+              <Route path="/oauth" element={<LocationProbe />} />
             </Routes>
           </MemoryRouter>
         </ToastProvider>,
@@ -94,6 +99,27 @@ async function createSiteAndCollectLocation(createdSite: { id: number; platform?
     });
     await flushMicrotasks();
 
+    // Find the modal dialog and click the appropriate button
+    const modalDialog = root.root.find((node) => node.type === 'dialog');
+    const modalButtons = modalDialog.findAll((node) => node.type === 'button');
+
+    // Find the button based on choice
+    let targetButton;
+    if (choice === 'session') {
+      targetButton = modalButtons.find((btn) => collectText(btn).includes('添加账号（用户名密码登录）'));
+    } else if (choice === 'apikey') {
+      targetButton = modalButtons.find((btn) => collectText(btn).includes('添加 API Key'));
+    } else {
+      targetButton = modalButtons.find((btn) => collectText(btn).includes('稍后配置'));
+    }
+
+    if (targetButton) {
+      await act(async () => {
+        targetButton.props.onClick();
+      });
+      await flushMicrotasks();
+    }
+
     return JSON.stringify(root.toJSON());
   } finally {
     root?.unmount();
@@ -109,19 +135,423 @@ describe('Sites create redirect', () => {
     vi.clearAllMocks();
   });
 
-  it('redirects a session-capable site to the session connection create flow', async () => {
-    const rendered = await createSiteAndCollectLocation({ id: 21, platform: 'new-api' });
+  it('shows modal after creating a site and navigates to session account when user chooses it', async () => {
+    const rendered = await createSiteAndClickModalChoice({ id: 21, name: 'Demo Site', platform: 'new-api' }, 'session');
 
     expect(rendered).toContain('/accounts?create=1&siteId=21');
     expect(rendered).not.toContain('segment=apikey');
   });
 
-  it('redirects an official API-key-only site to the apikey connection create flow', async () => {
-    const rendered = await createSiteAndCollectLocation({ id: 22, platform: 'openai' });
+  it('shows modal after creating a site and navigates to API key when user chooses it', async () => {
+    const rendered = await createSiteAndClickModalChoice({ id: 22, name: 'Demo Site', platform: 'openai' }, 'apikey');
 
     expect(rendered).toContain('/accounts?');
     expect(rendered).toContain('segment=apikey');
     expect(rendered).toContain('create=1');
     expect(rendered).toContain('siteId=22');
+  });
+
+  it('passes CodingPlan initialization preset into the API key flow', async () => {
+    const rendered = await createSiteAndClickModalChoice({
+      id: 25,
+      name: 'Aliyun CodingPlan',
+      platform: 'openai',
+      initializationPresetId: 'codingplan-openai',
+    }, 'apikey');
+
+    expect(rendered).toContain('/accounts?');
+    expect(rendered).toContain('segment=apikey');
+    expect(rendered).toContain('siteId=25');
+    expect(rendered).toContain('initPreset=codingplan-openai');
+  });
+
+  it('shows modal after creating a codex site and allows choosing later', async () => {
+    const rendered = await createSiteAndClickModalChoice({ id: 23, name: 'Demo Site', platform: 'codex' }, 'later');
+
+    // User chose "later", so should stay on sites page (no navigation to accounts or oauth)
+    expect(rendered).not.toContain('/oauth?');
+    expect(rendered).not.toContain('/accounts?');
+  });
+
+  it('shows modal after creating a codex site and navigates to OAuth when user chooses session', async () => {
+    const rendered = await createSiteAndClickModalChoice({ id: 24, name: 'Demo Site', platform: 'codex' }, 'session');
+
+    expect(rendered).toContain('/oauth?');
+    expect(rendered).toContain('provider=codex');
+    expect(rendered).toContain('create=1');
+    expect(rendered).toContain('siteId=24');
+  });
+
+  it('lists vendor-specific site types directly in the platform selector', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 30, name: 'Demo Site', platform: 'openai' });
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const addButton = root.root.find((node) => (
+        node.type === 'button'
+        && node.props.className?.includes('btn btn-primary')
+        && JSON.stringify(node.props.children).includes('添加站点')
+      ));
+      await act(async () => {
+        addButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const selects = root.root.findAllByType(ModernSelect);
+      const platformSelect = selects.at(-1);
+      expect(platformSelect?.props.options).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ label: '阿里云 CodingPlan / OpenAI' }),
+          expect.objectContaining({ label: '阿里云 CodingPlan / Claude' }),
+          expect.objectContaining({ label: '智谱 Coding Plan / OpenAI' }),
+          expect.objectContaining({ label: '智谱 Coding Plan / Claude' }),
+        ]),
+      );
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('adds compact descriptions to generic site types in the platform selector', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 34, name: 'Demo Site', platform: 'openai' });
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const addButton = root.root.find((node) => (
+        node.type === 'button'
+        && node.props.className?.includes('btn btn-primary')
+        && JSON.stringify(node.props.children).includes('添加站点')
+      ));
+      await act(async () => {
+        addButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const platformSelect = root.root.findAllByType(ModernSelect).at(-1);
+      expect(platformSelect?.props.options).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ value: 'new-api', description: expect.stringContaining('聚合面板') }),
+          expect.objectContaining({ value: 'openai', description: expect.stringContaining('OpenAI 兼容接口') }),
+          expect.objectContaining({ value: 'codex', description: expect.stringContaining('OAuth') }),
+          expect.objectContaining({ value: 'claude', description: expect.stringContaining('Claude') }),
+        ]),
+      );
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('prefills the official base url when selecting a vendor-specific site type', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 31, name: 'Demo Site', platform: 'openai' });
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const addButton = root.root.find((node) => (
+        node.type === 'button'
+        && node.props.className?.includes('btn btn-primary')
+        && JSON.stringify(node.props.children).includes('添加站点')
+      ));
+      await act(async () => {
+        addButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const urlInput = root.root.find((node) => (
+        node.type === 'input'
+        && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
+      ));
+      const selects = root.root.findAllByType(ModernSelect);
+      const platformSelect = selects.at(-1);
+
+      await act(async () => {
+        platformSelect?.props.onChange('preset:zhipu-coding-plan-openai');
+      });
+      await flushMicrotasks();
+
+      expect(urlInput.props.value).toBe('https://open.bigmodel.cn/api/coding/paas/v4');
+      expect(JSON.stringify(root.toJSON())).toContain('智谱 Coding Plan / OpenAI');
+
+      const presetAlerts = root.root.findAll((node) => (
+        typeof node.props.className === 'string'
+        && node.props.className.includes('alert alert-info')
+      ));
+      expect(presetAlerts).toHaveLength(1);
+      expect(collectText(presetAlerts[0]!)).toContain('已应用官方预设');
+      expect(collectText(presetAlerts[0]!)).not.toContain('建议地址：');
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('stops claiming the official base url is auto-filled after the user edits it', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 35, name: 'Demo Site', platform: 'openai' });
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const addButton = root.root.find((node) => (
+        node.type === 'button'
+        && node.props.className?.includes('btn btn-primary')
+        && JSON.stringify(node.props.children).includes('添加站点')
+      ));
+      await act(async () => {
+        addButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const urlInput = root.root.find((node) => (
+        node.type === 'input'
+        && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
+      ));
+      const platformSelect = root.root.findAllByType(ModernSelect).at(-1);
+
+      await act(async () => {
+        platformSelect?.props.onChange('preset:zhipu-coding-plan-openai');
+      });
+      await flushMicrotasks();
+
+      await act(async () => {
+        urlInput.props.onChange({ target: { value: 'https://gateway.example.com/coding' } });
+      });
+      await flushMicrotasks();
+
+      const presetAlert = root.root.find((node) => (
+        typeof node.props.className === 'string'
+        && node.props.className.includes('alert alert-info')
+      ));
+      expect(collectText(presetAlert)).toContain('已应用官方预设');
+      expect(collectText(presetAlert)).not.toContain('当前已自动填入官方地址');
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('keeps a manually selected generic openai platform even when the url matches a Coding Plan preset', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 32, name: 'Demo Site', platform: 'openai' });
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const addButton = root.root.find((node) => (
+        node.type === 'button'
+        && node.props.className?.includes('btn btn-primary')
+        && JSON.stringify(node.props.children).includes('添加站点')
+      ));
+      await act(async () => {
+        addButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const urlInput = root.root.find((node) => (
+        node.type === 'input'
+        && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
+      ));
+
+      await act(async () => {
+        urlInput.props.onChange({ target: { value: 'https://coding.dashscope.aliyuncs.com/v1' } });
+      });
+      await flushMicrotasks();
+
+      let platformSelect = root.root.findAllByType(ModernSelect).at(-1);
+      await act(async () => {
+        platformSelect?.props.onChange('openai');
+      });
+      await flushMicrotasks();
+
+      platformSelect = root.root.findAllByType(ModernSelect).at(-1);
+      expect(platformSelect?.props.value).toBe('openai');
+      expect(JSON.stringify(root.toJSON())).not.toContain('已应用官方预设');
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('sends explicit preset metadata only when the vendor-specific type is selected', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 33, name: 'Aliyun CodingPlan', platform: 'openai', initializationPresetId: 'codingplan-openai' });
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const addButton = root.root.find((node) => (
+        node.type === 'button'
+        && node.props.className?.includes('btn btn-primary')
+        && JSON.stringify(node.props.children).includes('添加站点')
+      ));
+      await act(async () => {
+        addButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const nameInput = root.root.find((node) => node.type === 'input' && node.props.placeholder === '站点名称');
+      let platformSelect = root.root.findAllByType(ModernSelect).at(-1);
+      const saveButton = root.root.find((node) => (
+        node.type === 'button'
+        && typeof node.props.onClick === 'function'
+        && collectText(node).includes('保存站点')
+      ));
+
+      await act(async () => {
+        nameInput.props.onChange({ target: { value: 'Aliyun CodingPlan' } });
+        platformSelect?.props.onChange('preset:codingplan-openai');
+      });
+      await flushMicrotasks();
+
+      await act(async () => {
+        await saveButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.addSite).toHaveBeenCalledWith(expect.objectContaining({
+        platform: 'openai',
+        initializationPresetId: 'codingplan-openai',
+      }));
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('shows modal with all three choices after creating a site', async () => {
+    apiMock.getSites.mockResolvedValue([]);
+    apiMock.addSite.mockResolvedValue({ id: 24, name: 'Demo Site', platform: 'new-api' });
+
+    let root!: ReactTestRenderer;
+    await act(async () => {
+      root = create(
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/sites']}>
+            <Routes>
+              <Route path="/sites" element={<Sites />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>,
+      );
+    });
+    await flushMicrotasks();
+
+    // Click add button
+    const addButton = root.root.find((node) => (
+      node.type === 'button'
+      && node.props.className?.includes('btn btn-primary')
+      && JSON.stringify(node.props.children).includes('添加站点')
+    ));
+    await act(async () => {
+      addButton.props.onClick();
+    });
+    await flushMicrotasks();
+
+    // Fill form
+    const nameInput = root.root.find((node) => node.type === 'input' && node.props.placeholder === '站点名称');
+    const urlInput = root.root.find((node) => (
+      node.type === 'input'
+      && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
+    ));
+    const selects = root.root.findAllByType(ModernSelect);
+    const platformSelect = selects.at(-1);
+    const saveButton = root.root.find((node) => (
+      node.type === 'button'
+      && typeof node.props.onClick === 'function'
+      && collectText(node).includes('保存站点')
+    ));
+
+    await act(async () => {
+      nameInput.props.onChange({ target: { value: 'Demo Site' } });
+      urlInput.props.onChange({ target: { value: 'https://demo.example.com' } });
+      platformSelect?.props.onChange('new-api');
+    });
+
+    await act(async () => {
+      await saveButton.props.onClick();
+    });
+    await flushMicrotasks();
+
+    // Check modal appears with all three buttons
+    const rendered = JSON.stringify(root.toJSON());
+    expect(rendered).toContain('站点创建成功');
+    expect(rendered).toContain('添加账号（用户名密码登录）');
+    expect(rendered).toContain('添加 API Key');
+    expect(rendered).toContain('稍后配置');
+
+    root.unmount();
   });
 });

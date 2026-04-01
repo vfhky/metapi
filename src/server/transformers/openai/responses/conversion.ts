@@ -1,8 +1,15 @@
 import {
-  normalizeResponsesInputForCompatibility as normalizeResponsesInputForCompatibilityViaCompatibility,
+  normalizeResponsesInputForCompatibility,
+  normalizeResponsesMessageContentBlocks,
   normalizeResponsesMessageItem,
-} from './compatibility.js';
+} from './normalization.js';
+import {
+  decodeResponsesMcpCompatToolCall,
+  isResponsesMcpItem,
+  toResponsesMcpCompatToolCall,
+} from './mcpCompatibility.js';
 import { normalizeInputFileBlock, toOpenAiChatFileBlock } from '../../shared/inputFile.js';
+import { buildShortToolNameMap, getShortToolName } from '../../shared/toolNameShortener.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
@@ -177,6 +184,20 @@ function normalizeResponsesRequestFieldParity(
     normalized.text = textConfig;
   }
 
+  if (!isRecord(normalized.reasoning)) {
+    const reasoning: Record<string, unknown> = {};
+    const effort = normalizeOptionalTrimmedString((normalized as Record<string, unknown>).reasoning_effort);
+    if (effort) reasoning.effort = effort;
+    const budgetTokens = toFiniteIntegerLike((normalized as Record<string, unknown>).reasoning_budget);
+    if (budgetTokens !== null) reasoning.budget_tokens = budgetTokens;
+    const summary = normalizeOptionalTrimmedString((normalized as Record<string, unknown>).reasoning_summary);
+    if (summary) reasoning.summary = summary;
+    if (Object.keys(reasoning).length > 0) normalized.reasoning = reasoning;
+  }
+  delete normalized.reasoning_effort;
+  delete normalized.reasoning_budget;
+  delete normalized.reasoning_summary;
+
   return normalized;
 }
 
@@ -225,18 +246,17 @@ function normalizeOpenAiToolArguments(raw: unknown): string {
   return '';
 }
 
-function normalizeToolOutput(raw: unknown): string {
-  const text = extractTextContent(raw).trim();
-  if (text) return text;
+function normalizeToolOutput(raw: unknown): string | Array<string | Record<string, unknown>> {
+  const normalizedContent = toOpenAiMessageContent(raw);
+  const hasNormalizedContent = typeof normalizedContent === 'string'
+    ? normalizedContent.trim().length > 0
+    : Array.isArray(normalizedContent) && normalizedContent.length > 0;
+  if (hasNormalizedContent) return normalizedContent;
   if (raw === undefined || raw === null) return '';
   if (typeof raw === 'string') return raw;
   if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw);
   if (Array.isArray(raw) || isRecord(raw)) return safeJsonStringify(raw);
   return '';
-}
-
-export function normalizeResponsesInputForCompatibility(input: unknown): unknown {
-  return normalizeResponsesInputForCompatibilityViaCompatibility(input);
 }
 
 function toResponsesInputMessageFromText(text: string): Record<string, unknown> {
@@ -247,7 +267,49 @@ function toResponsesInputMessageFromText(text: string): Record<string, unknown> 
   };
 }
 
-function convertOpenAiToolsToResponses(rawTools: unknown): unknown {
+function collectOpenAiToolNames(body: Record<string, unknown>): string[] {
+  const names: string[] = [];
+  const pushName = (value: unknown) => {
+    const name = asTrimmedString(value);
+    if (name) names.push(name);
+  };
+
+  const rawTools = Array.isArray(body.tools) ? body.tools : [];
+  for (const item of rawTools) {
+    if (!isRecord(item)) continue;
+    const type = asTrimmedString(item.type).toLowerCase();
+    if (type === 'function' && isRecord(item.function)) {
+      pushName(item.function.name);
+      continue;
+    }
+    if (type === 'function') {
+      pushName(item.name);
+    }
+  }
+
+  const toolChoice = isRecord(body.tool_choice) ? body.tool_choice : null;
+  if (toolChoice && asTrimmedString(toolChoice.type).toLowerCase() === 'function') {
+    pushName(isRecord(toolChoice.function) ? toolChoice.function.name : toolChoice.name);
+  }
+
+  const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+  for (const message of rawMessages) {
+    if (!isRecord(message) || asTrimmedString(message.role).toLowerCase() !== 'assistant') continue;
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    for (const toolCall of toolCalls) {
+      if (!isRecord(toolCall)) continue;
+      const functionPart = isRecord(toolCall.function) ? toolCall.function : null;
+      pushName(functionPart?.name ?? toolCall.name);
+    }
+  }
+
+  return names;
+}
+
+function convertOpenAiToolsToResponses(
+  rawTools: unknown,
+  toolNameMap: Record<string, string>,
+): unknown {
   if (!Array.isArray(rawTools)) return rawTools;
 
   const converted = rawTools
@@ -262,7 +324,7 @@ function convertOpenAiToolsToResponses(rawTools: unknown): unknown {
 
         const mapped: Record<string, unknown> = {
           type: 'function',
-          name,
+          name: getShortToolName(name, toolNameMap),
         };
         const description = asTrimmedString(fn.description);
         if (description) mapped.description = description;
@@ -272,7 +334,10 @@ function convertOpenAiToolsToResponses(rawTools: unknown): unknown {
       }
 
       if (type === 'function' && asTrimmedString(item.name)) {
-        return item;
+        return {
+          ...item,
+          name: getShortToolName(asTrimmedString(item.name), toolNameMap),
+        };
       }
 
       if (type === 'image_generation') {
@@ -287,10 +352,13 @@ function convertOpenAiToolsToResponses(rawTools: unknown): unknown {
     })
     .filter((item): item is Record<string, unknown> => !!item);
 
-  return converted.length > 0 ? converted : rawTools;
+  return converted;
 }
 
-function convertOpenAiToolChoiceToResponses(rawToolChoice: unknown): unknown {
+function convertOpenAiToolChoiceToResponses(
+  rawToolChoice: unknown,
+  toolNameMap: Record<string, string>,
+): unknown {
   if (rawToolChoice === undefined) return undefined;
   if (typeof rawToolChoice === 'string') return rawToolChoice;
   if (!isRecord(rawToolChoice)) return rawToolChoice;
@@ -299,7 +367,7 @@ function convertOpenAiToolChoiceToResponses(rawToolChoice: unknown): unknown {
   if (type === 'function' && isRecord(rawToolChoice.function)) {
     const name = asTrimmedString(rawToolChoice.function.name);
     if (!name) return 'required';
-    return { type: 'function', name };
+    return { type: 'function', name: getShortToolName(name, toolNameMap) };
   }
 
   return rawToolChoice;
@@ -316,52 +384,59 @@ function normalizeResponsesBodyForCompatibility(
   };
 }
 
-export function normalizeResponsesMessageContent(role: string, content: unknown): Array<Record<string, unknown>> {
-  const normalized = normalizeResponsesMessageItem({
-    type: 'message',
-    role,
-    content,
-  });
+const RESPONSES_TOOL_CALL_INPUT_TYPES = new Set([
+  'function_call',
+  'custom_tool_call',
+]);
 
-  if (isRecord(normalized) && Array.isArray(normalized.content)) {
-    return normalized.content.filter((item): item is Record<string, unknown> => isRecord(item));
+const RESPONSES_TOOL_CALL_OUTPUT_TYPES = new Set([
+  'function_call_output',
+  'custom_tool_call_output',
+]);
+
+function stripOrphanedResponsesToolOutputs(input: unknown): unknown {
+  if (!Array.isArray(input)) return input;
+
+  const seenToolCallIds = new Set<string>();
+  const sanitized: unknown[] = [];
+
+  for (const item of input) {
+    if (!isRecord(item)) {
+      sanitized.push(item);
+      continue;
+    }
+
+    const type = asTrimmedString(item.type).toLowerCase();
+    if (RESPONSES_TOOL_CALL_INPUT_TYPES.has(type)) {
+      const callId = asTrimmedString(item.call_id ?? item.id);
+      if (callId) seenToolCallIds.add(callId);
+      sanitized.push(item);
+      continue;
+    }
+
+    if (RESPONSES_TOOL_CALL_OUTPUT_TYPES.has(type)) {
+      const callId = asTrimmedString(item.call_id ?? item.id);
+      if (!callId || !seenToolCallIds.has(callId)) continue;
+      sanitized.push(item);
+      continue;
+    }
+
+    sanitized.push(item);
   }
 
-  return [];
+  return sanitized;
 }
 
-const ALLOWED_RESPONSES_FIELDS = new Set([
-  'model',
-  'input',
-  'instructions',
-  'max_output_tokens',
+export function normalizeResponsesMessageContent(role: string, content: unknown): Array<Record<string, unknown>> {
+  return normalizeResponsesMessageContentBlocks(role, content);
+}
+
+const RESPONSES_COMPATIBILITY_FILTER_FIELDS = new Set([
   'max_completion_tokens',
-  'temperature',
-  'top_p',
-  'truncation',
-  'tools',
-  'tool_choice',
-  'parallel_tool_calls',
-  'metadata',
-  'reasoning',
-  'store',
-  'safety_identifier',
-  'stream',
-  'stream_options',
-  'user',
-  'max_tool_calls',
-  'prompt_cache_key',
-  'prompt_cache_retention',
-  'background',
-  'previous_response_id',
-  'text',
-  'audio',
-  'include',
+  'messages',
+  'prompt',
   'response_format',
-  'service_tier',
-  'top_logprobs',
-  'stop',
-  'n',
+  'verbosity',
 ]);
 
 export function sanitizeResponsesBodyForProxy(
@@ -397,11 +472,9 @@ export function sanitizeResponsesBodyForProxy(
     defaultEncryptedReasoningInclude: options?.defaultEncryptedReasoningInclude,
   });
 
-  const sanitized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(normalized)) {
-    if (!ALLOWED_RESPONSES_FIELDS.has(key)) continue;
-    if (key === 'max_completion_tokens') continue;
-    sanitized[key] = value;
+  const sanitized: Record<string, unknown> = { ...normalized };
+  for (const key of RESPONSES_COMPATIBILITY_FILTER_FIELDS) {
+    delete sanitized[key];
   }
 
   const maxOutputTokens = toFiniteNumber(normalized.max_output_tokens);
@@ -427,6 +500,7 @@ export function convertOpenAiBodyToResponsesBody(
   const rawMessages = Array.isArray(openaiBody.messages) ? openaiBody.messages : [];
   const systemContents: string[] = [];
   const inputItems: Array<Record<string, unknown>> = [];
+  const toolNameMap = buildShortToolNameMap(collectOpenAiToolNames(openaiBody));
 
   for (const item of rawMessages) {
     if (!isRecord(item)) continue;
@@ -439,6 +513,28 @@ export function convertOpenAiBodyToResponsesBody(
     }
 
     if (role === 'assistant') {
+      const reasoningContent = extractTextContent(
+        item.reasoning_content
+        ?? item.reasoning
+        ?? item.thinking,
+      ).trim();
+      const reasoningSignature = asTrimmedString(item.reasoning_signature);
+      if (reasoningContent || reasoningSignature) {
+        const reasoningItem: Record<string, unknown> = {
+          type: 'reasoning',
+        };
+        if (reasoningContent) {
+          reasoningItem.summary = [{
+            type: 'summary_text',
+            text: reasoningContent,
+          }];
+        }
+        if (reasoningSignature) {
+          reasoningItem.encrypted_content = reasoningSignature;
+        }
+        inputItems.push(reasoningItem);
+      }
+
       const normalizedContent = normalizeResponsesMessageContent('assistant', item.content);
       if (normalizedContent.length > 0) {
         inputItems.push({
@@ -453,6 +549,14 @@ export function convertOpenAiBodyToResponsesBody(
         const toolCall = rawToolCalls[index];
         if (!isRecord(toolCall)) continue;
         const functionPart = isRecord(toolCall.function) ? toolCall.function : {};
+        const mcpItem = decodeResponsesMcpCompatToolCall(
+          functionPart.name ?? toolCall.name,
+          functionPart.arguments ?? toolCall.arguments,
+        );
+        if (mcpItem) {
+          inputItems.push(mcpItem);
+          continue;
+        }
         const callId = asTrimmedString(toolCall.id) || `call_${Date.now()}_${index}`;
         const name = (
           asTrimmedString(functionPart.name)
@@ -466,7 +570,7 @@ export function convertOpenAiBodyToResponsesBody(
         inputItems.push({
           type: 'function_call',
           call_id: callId,
-          name,
+          name: getShortToolName(name, toolNameMap),
           arguments: argumentsValue,
         });
       }
@@ -518,9 +622,14 @@ export function convertOpenAiBodyToResponsesBody(
   if (topP !== null) body.top_p = topP;
 
   if (openaiBody.metadata !== undefined) body.metadata = openaiBody.metadata;
+  if (openaiBody.modalities !== undefined) body.modalities = cloneJsonValue(openaiBody.modalities);
+  if (openaiBody.audio !== undefined) body.audio = cloneJsonValue(openaiBody.audio);
   if (openaiBody.reasoning !== undefined) body.reasoning = openaiBody.reasoning;
+  if (openaiBody.reasoning_effort !== undefined) body.reasoning_effort = openaiBody.reasoning_effort;
+  if (openaiBody.reasoning_budget !== undefined) body.reasoning_budget = openaiBody.reasoning_budget;
+  if (openaiBody.reasoning_summary !== undefined) body.reasoning_summary = openaiBody.reasoning_summary;
   if (openaiBody.parallel_tool_calls !== undefined) body.parallel_tool_calls = openaiBody.parallel_tool_calls;
-  if (openaiBody.tools !== undefined) body.tools = convertOpenAiToolsToResponses(openaiBody.tools);
+  if (openaiBody.tools !== undefined) body.tools = convertOpenAiToolsToResponses(openaiBody.tools, toolNameMap);
   if (openaiBody.safety_identifier !== undefined) body.safety_identifier = openaiBody.safety_identifier;
   if (openaiBody.max_tool_calls !== undefined) body.max_tool_calls = openaiBody.max_tool_calls;
   if (openaiBody.prompt_cache_key !== undefined) body.prompt_cache_key = openaiBody.prompt_cache_key;
@@ -546,8 +655,11 @@ export function convertOpenAiBodyToResponsesBody(
     body.text = textConfig;
   }
 
-  const responsesToolChoice = convertOpenAiToolChoiceToResponses(openaiBody.tool_choice);
+  const responsesToolChoice = convertOpenAiToolChoiceToResponses(openaiBody.tool_choice, toolNameMap);
   if (responsesToolChoice !== undefined) body.tool_choice = responsesToolChoice;
+  if (Array.isArray(body.tools) && body.tools.length === 0) {
+    delete body.tool_choice;
+  }
 
   return normalizeResponsesBodyForCompatibility(
     normalizeResponsesRequestFieldParity(body, { verbositySource: openaiBody.verbosity }),
@@ -657,28 +769,30 @@ function toOpenAiMessageContent(content: unknown): string | Array<string | Recor
 function convertResponsesToolsToOpenAi(rawTools: unknown): unknown {
   if (!Array.isArray(rawTools)) return rawTools;
 
-  return rawTools.map((item) => {
-    if (!isRecord(item)) return item;
-    const type = asTrimmedString(item.type).toLowerCase();
+  return rawTools
+    .map((item) => {
+      if (!isRecord(item)) return item;
+      const type = asTrimmedString(item.type).toLowerCase();
 
-    if (type === 'custom' || type === 'image_generation') return item;
-    if (type !== 'function') return item;
-    if (isRecord(item.function) && asTrimmedString(item.function.name)) return item;
+      if (type === 'custom' || type === 'image_generation') return item;
+      if (type !== 'function') return item;
+      if (isRecord(item.function) && asTrimmedString(item.function.name)) return item;
 
-    const name = asTrimmedString(item.name);
-    if (!name) return item;
+      const name = asTrimmedString(item.name);
+      if (!name) return null;
 
-    const fn: Record<string, unknown> = { name };
-    const description = asTrimmedString(item.description);
-    if (description) fn.description = description;
-    if (item.parameters !== undefined) fn.parameters = item.parameters;
-    if (item.strict !== undefined) fn.strict = item.strict;
+      const fn: Record<string, unknown> = { name };
+      const description = asTrimmedString(item.description);
+      if (description) fn.description = description;
+      if (item.parameters !== undefined) fn.parameters = item.parameters;
+      if (item.strict !== undefined) fn.strict = item.strict;
 
-    return {
-      type: 'function',
-      function: fn,
-    };
-  });
+      return {
+        type: 'function',
+        function: fn,
+      };
+    })
+    .filter((item): item is Record<string, unknown> => !!item);
 }
 
 function convertResponsesToolChoiceToOpenAi(rawToolChoice: unknown): unknown {
@@ -687,6 +801,14 @@ function convertResponsesToolChoiceToOpenAi(rawToolChoice: unknown): unknown {
   if (!isRecord(rawToolChoice)) return rawToolChoice;
 
   const type = asTrimmedString(rawToolChoice.type).toLowerCase();
+  if (type === 'tool') {
+    const name = asTrimmedString(rawToolChoice.name);
+    if (!name) return 'required';
+    return {
+      type: 'function',
+      function: { name },
+    };
+  }
   if (type === 'function') {
     if (isRecord(rawToolChoice.function) && asTrimmedString(rawToolChoice.function.name)) {
       return rawToolChoice;
@@ -713,16 +835,23 @@ export function convertResponsesBodyToOpenAiBody(
   stream: boolean,
   options?: { defaultEncryptedReasoningInclude?: boolean },
 ): Record<string, unknown> {
-  const normalizedBody = normalizeResponsesRequestFieldParity(body, {
-    defaultEncryptedReasoningInclude: options?.defaultEncryptedReasoningInclude,
-  });
+  const normalizedBody = normalizeResponsesBodyForCompatibility(
+    normalizeResponsesRequestFieldParity(body, {
+      defaultEncryptedReasoningInclude: options?.defaultEncryptedReasoningInclude,
+    }),
+  );
   const messages: Array<Record<string, unknown>> = [];
-  const input = normalizedBody.input;
+  const input = stripOrphanedResponsesToolOutputs(normalizedBody.input);
   let functionCallIndex = 0;
   let pendingToolCalls: OpenAiToolCall[] = [];
+  const emittedToolCallIds = new Set<string>();
 
   const flushPendingToolCalls = () => {
     if (pendingToolCalls.length <= 0) return;
+    for (const toolCall of pendingToolCalls) {
+      const callId = asTrimmedString(toolCall.id);
+      if (callId) emittedToolCallIds.add(callId);
+    }
     messages.push({
       role: 'assistant',
       content: '',
@@ -752,6 +881,15 @@ export function convertResponsesBodyToOpenAiBody(
     if (!isRecord(item)) return;
 
     const itemType = asTrimmedString(item.type).toLowerCase();
+    if (itemType.startsWith('mcp_') && isResponsesMcpItem(item)) {
+      const toolCall = toResponsesMcpCompatToolCall(item, `call_${Date.now()}_${functionCallIndex}`);
+      if (toolCall) {
+        pendingToolCalls.push(toolCall as OpenAiToolCall);
+        functionCallIndex += 1;
+        return;
+      }
+    }
+
     if (itemType === 'function_call' || itemType === 'custom_tool_call') {
       const toolCall = toOpenAiToolCall(item, functionCallIndex);
       functionCallIndex += 1;
@@ -761,7 +899,9 @@ export function convertResponsesBodyToOpenAiBody(
 
     if (itemType === 'function_call_output' || itemType === 'custom_tool_call_output') {
       flushPendingToolCalls();
-      pushToolOutputMessage(item.call_id ?? item.id, item.output ?? item.content);
+      const toolCallId = asTrimmedString(item.call_id ?? item.id);
+      if (!toolCallId || !emittedToolCallIds.has(toolCallId)) return;
+      pushToolOutputMessage(toolCallId, item.output ?? item.content);
       return;
     }
 
@@ -791,7 +931,9 @@ export function convertResponsesBodyToOpenAiBody(
     const content = toOpenAiMessageContent(item.content ?? item.input ?? item);
 
     if (normalizedRole === 'tool') {
-      pushToolOutputMessage(item.tool_call_id ?? item.call_id ?? item.id, item.content);
+      const toolCallId = asTrimmedString(item.tool_call_id ?? item.call_id ?? item.id);
+      if (!toolCallId || !emittedToolCallIds.has(toolCallId)) return;
+      pushToolOutputMessage(toolCallId, item.content);
       return;
     }
 
@@ -800,10 +942,13 @@ export function convertResponsesBodyToOpenAiBody(
       : Array.isArray(content) && content.length > 0;
     if (!hasContent) return;
 
-    messages.push({
+    const message: Record<string, unknown> = {
       role: normalizedRole,
       content,
-    });
+    };
+    const phase = asTrimmedString(item.phase);
+    if (phase) message.phase = phase;
+    messages.push(message);
   };
 
   if (typeof input === 'string') {
@@ -836,9 +981,15 @@ export function convertResponsesBodyToOpenAiBody(
   if (typeof normalizedBody.max_output_tokens === 'number' && Number.isFinite(normalizedBody.max_output_tokens)) {
     payload.max_tokens = normalizedBody.max_output_tokens;
   }
+  if (normalizedBody.metadata !== undefined) payload.metadata = cloneJsonValue(normalizedBody.metadata);
+  if (normalizedBody.modalities !== undefined) payload.modalities = cloneJsonValue(normalizedBody.modalities);
+  if (normalizedBody.audio !== undefined) payload.audio = cloneJsonValue(normalizedBody.audio);
   if (normalizedBody.parallel_tool_calls !== undefined) payload.parallel_tool_calls = normalizedBody.parallel_tool_calls;
   if (normalizedBody.tools !== undefined) payload.tools = convertResponsesToolsToOpenAi(normalizedBody.tools);
   if (normalizedBody.tool_choice !== undefined) payload.tool_choice = convertResponsesToolChoiceToOpenAi(normalizedBody.tool_choice);
+  if (Array.isArray(payload.tools) && payload.tools.length === 0) {
+    delete payload.tool_choice;
+  }
   if (normalizedBody.safety_identifier !== undefined) payload.safety_identifier = normalizedBody.safety_identifier;
   if (normalizedBody.max_tool_calls !== undefined) payload.max_tool_calls = normalizedBody.max_tool_calls;
   if (normalizedBody.prompt_cache_key !== undefined) payload.prompt_cache_key = normalizedBody.prompt_cache_key;
@@ -861,3 +1012,5 @@ export function convertResponsesBodyToOpenAiBody(
 
   return payload;
 }
+
+export { normalizeResponsesInputForCompatibility };

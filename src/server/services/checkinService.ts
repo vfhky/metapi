@@ -8,6 +8,7 @@ import { refreshBalance } from './balanceService.js';
 import { parseCheckinRewardAmount } from './checkinRewardParser.js';
 import {
   getAutoReloginConfig,
+  getProxyUrlFromExtraConfig,
   getPlatformUserIdFromExtraConfig,
   guessPlatformUserIdFromUsername,
   mergeAccountExtraConfig,
@@ -16,6 +17,7 @@ import {
 import { decryptAccountPassword } from './accountCredentialService.js';
 import { setAccountRuntimeHealth } from './accountHealthService.js';
 import { formatUtcSqlDateTime } from './localTimeService.js';
+import { withAccountProxyOverride } from './siteProxy.js';
 
 type CheckinExecutionStatus = 'success' | 'failed' | 'skipped';
 
@@ -100,7 +102,10 @@ async function tryAutoRelogin(account: any, site: any): Promise<string | null> {
   const password = decryptAccountPassword(relogin.passwordCipher);
   if (!password) return null;
 
-  const result = await adapter.login(site.url, relogin.username, password);
+  const result = await withAccountProxyOverride(
+    getProxyUrlFromExtraConfig(account.extraConfig),
+    () => adapter.login(site.url, relogin.username, password),
+  );
   if (!result.success || !result.accessToken) return null;
 
   await db.update(schema.accounts)
@@ -115,7 +120,7 @@ async function tryAutoRelogin(account: any, site: any): Promise<string | null> {
   return result.accessToken;
 }
 
-export async function checkinAccount(accountId: number, options?: { skipEvent?: boolean }) {
+export async function checkinAccount(accountId: number, options?: { skipEvent?: boolean; scheduleMode?: 'cron' | 'interval' }) {
   const rows = await db
     .select()
     .from(schema.accounts)
@@ -172,14 +177,17 @@ export async function checkinAccount(accountId: number, options?: { skipEvent?: 
     : guessPlatformUserIdFromUsername(account.username);
   const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
 
+  const accountProxyUrl = getProxyUrlFromExtraConfig(account.extraConfig);
   let activeAccessToken = account.accessToken;
-  let result = await adapter.checkin(site.url, activeAccessToken, platformUserId);
+  let result = await withAccountProxyOverride(accountProxyUrl,
+    () => adapter.checkin(site.url, activeAccessToken, platformUserId));
 
   if (!result.success && shouldAttemptAutoRelogin(result.message)) {
     const refreshedAccessToken = await tryAutoRelogin(account, site);
     if (refreshedAccessToken) {
       activeAccessToken = refreshedAccessToken;
-      result = await adapter.checkin(site.url, activeAccessToken, platformUserId);
+      result = await withAccountProxyOverride(accountProxyUrl,
+        () => adapter.checkin(site.url, activeAccessToken, platformUserId));
     }
   }
 
@@ -192,6 +200,7 @@ export async function checkinAccount(accountId: number, options?: { skipEvent?: 
   const effectiveSuccess = result.success || alreadyCheckedIn || unsupportedCheckin || manualVerificationRequired;
   const shouldRefreshBalance = result.success || alreadyCheckedIn;
   const directCheckinSuccess = result.success && !alreadyCheckedIn && !unsupportedCheckin;
+  const shouldAdvanceLastCheckinAt = directCheckinSuccess || (alreadyCheckedIn && options?.scheduleMode !== 'interval');
   const normalizedStatus: CheckinExecutionStatus = effectiveSuccess
     ? ((unsupportedCheckin || manualVerificationRequired) ? 'skipped' : 'success')
     : 'failed';
@@ -211,9 +220,10 @@ export async function checkinAccount(accountId: number, options?: { skipEvent?: 
       source: 'checkin',
     });
 
-    const updates: Record<string, unknown> = {
-      lastCheckinAt: new Date().toISOString(),
-    };
+    const updates: Record<string, unknown> = {};
+    if (shouldAdvanceLastCheckinAt) {
+      updates.lastCheckinAt = new Date().toISOString();
+    }
     if (!storedPlatformUserId && guessedPlatformUserId) {
       updates.extraConfig = mergeAccountExtraConfig(account.extraConfig, {
         platformUserId: guessedPlatformUserId,
@@ -224,10 +234,12 @@ export async function checkinAccount(accountId: number, options?: { skipEvent?: 
       updates.updatedAt = new Date().toISOString();
     }
 
-    await db.update(schema.accounts)
-      .set(updates)
-      .where(eq(schema.accounts.id, accountId))
-      .run();
+    if (Object.keys(updates).length > 0) {
+      await db.update(schema.accounts)
+        .set(updates)
+        .where(eq(schema.accounts.id, accountId))
+        .run();
+    }
 
     if (shouldRefreshBalance) {
       try {
@@ -308,7 +320,7 @@ export async function checkinAccount(accountId: number, options?: { skipEvent?: 
   };
 }
 
-export async function checkinAll() {
+export async function checkinAll(options?: { accountIds?: number[]; scheduleMode?: 'cron' | 'interval' }) {
   const rows = await db
     .select()
     .from(schema.accounts)
@@ -321,10 +333,12 @@ export async function checkinAll() {
     )
     .all();
 
+  const scopedAccountIds = options?.accountIds ? new Set(options.accountIds) : null;
   const results: Array<{ accountId: number; username: string | null; site: string; result: any }> = [];
 
   const grouped = new Map<number, typeof rows>();
   for (const row of rows) {
+    if (scopedAccountIds && !scopedAccountIds.has(row.accounts.id)) continue;
     const siteId = row.sites.id;
     if (!grouped.has(siteId)) grouped.set(siteId, []);
     grouped.get(siteId)!.push(row);
@@ -332,7 +346,10 @@ export async function checkinAll() {
 
   const promises = Array.from(grouped.entries()).map(async ([_, siteRows]) => {
     for (const row of siteRows) {
-      const r = await checkinAccount(row.accounts.id, { skipEvent: true });
+      const r = await checkinAccount(row.accounts.id, {
+        skipEvent: true,
+        scheduleMode: options?.scheduleMode,
+      });
       results.push({
         accountId: row.accounts.id,
         username: row.accounts.username,

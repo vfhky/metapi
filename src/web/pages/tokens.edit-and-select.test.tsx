@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, create, type ReactTestInstance } from 'react-test-renderer';
 import { MemoryRouter } from 'react-router-dom';
+import ModernSelect from '../components/ModernSelect.js';
 import { ToastProvider } from '../components/Toast.js';
 import Accounts from './Accounts.js';
 import { TokensPanel } from './Tokens.js';
@@ -143,7 +144,7 @@ describe('Tokens edit modal and row selection', () => {
   });
 
   it('opens the centered edit modal when editing a token', async () => {
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = buildRoot();
@@ -191,7 +192,7 @@ describe('Tokens edit modal and row selection', () => {
   });
 
   it('selects a token when clicking the row body, but not when clicking an action button', async () => {
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = buildRoot();
@@ -211,8 +212,7 @@ describe('Tokens edit modal and row selection', () => {
       });
       await flushMicrotasks();
 
-      expect(JSON.stringify(root.toJSON())).toContain('已选 ');
-      expect(JSON.stringify(root.toJSON())).toContain('"1"');
+      expect(collectText(root.root)).toContain('已选 1 项');
 
       const copyButton = root.root
         .findAll((node) => node.type === 'button')
@@ -224,8 +224,7 @@ describe('Tokens edit modal and row selection', () => {
       });
       await flushMicrotasks();
 
-      expect(JSON.stringify(root.toJSON())).toContain('已选 ');
-      expect(JSON.stringify(root.toJSON())).toContain('"1"');
+      expect(collectText(root.root)).toContain('已选 1 项');
     } finally {
       root?.unmount();
     }
@@ -234,7 +233,7 @@ describe('Tokens edit modal and row selection', () => {
   it('does not repeatedly refetch groups when edit-group loading fails once', async () => {
     apiMock.getAccountTokenGroups.mockRejectedValueOnce(new Error('账号会话可能已过期，请重新登录后再拉取分组'));
 
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = buildRoot();
@@ -259,6 +258,78 @@ describe('Tokens edit modal and row selection', () => {
     }
   });
 
+  it('uses searchable account selectors for sync and add-token flows', async () => {
+    apiMock.getAccounts.mockResolvedValue([
+      {
+        id: 1,
+        username: 'session-user',
+        accessToken: 'session-token',
+        status: 'active',
+        credentialMode: 'session',
+        capabilities: { canCheckin: true, canRefreshBalance: true, proxyOnly: false },
+        site: { id: 10, name: 'Session Site', platform: 'new-api', status: 'active', url: 'https://session.example.com' },
+      },
+      {
+        id: 2,
+        username: 'codex-user',
+        accessToken: 'codex-token',
+        status: 'active',
+        credentialMode: 'session',
+        capabilities: { canCheckin: true, canRefreshBalance: true, proxyOnly: false },
+        site: { id: 11, name: 'Codex Workspace', platform: 'codex', status: 'active', url: 'https://workspace.example.com' },
+      },
+    ]);
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = buildTokensRoot();
+      });
+      await flushMicrotasks();
+
+      const syncAccountSelect = root.root.findAllByType(ModernSelect)
+        .find((node) => node.props.placeholder === '选择账号后同步站点令牌');
+      expect(syncAccountSelect).toBeTruthy();
+      expect(syncAccountSelect!.props.searchable).toBe(true);
+      expect(syncAccountSelect!.props.searchPlaceholder).toBe('筛选账号（名称 / 站点）');
+      expect(syncAccountSelect!.props.options).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            value: '2',
+            label: 'codex-user @ Codex Workspace',
+            description: 'Codex Workspace',
+          }),
+        ]),
+      );
+
+      const addButton = root.root.findAll((node) => node.type === 'button')
+        .find((node) => collectText(node).includes('+ 新增令牌'));
+      expect(addButton).toBeTruthy();
+
+      await act(async () => {
+        addButton!.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const addAccountSelect = root.root.findAllByType(ModernSelect)
+        .find((node) => node.props.placeholder === '选择账号');
+      expect(addAccountSelect).toBeTruthy();
+      expect(addAccountSelect!.props.searchable).toBe(true);
+      expect(addAccountSelect!.props.searchPlaceholder).toBe('筛选账号（名称 / 站点）');
+      expect(addAccountSelect!.props.options).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            value: '2',
+            label: 'codex-user @ Codex Workspace',
+            description: 'Codex Workspace',
+          }),
+        ]),
+      );
+    } finally {
+      root?.unmount();
+    }
+  });
+
   it('shows placeholder guidance and saves masked_pending tokens as ready values', async () => {
     apiMock.getAccountTokens.mockResolvedValue([
       {
@@ -276,7 +347,7 @@ describe('Tokens edit modal and row selection', () => {
     ]);
     apiMock.getAccountTokenValue.mockRejectedValueOnce(new Error('当前仅保存了脱敏令牌，无法展开/复制。请在站点重新生成并同步，或手动更新为完整令牌。'));
 
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = buildTokensRoot();
@@ -358,7 +429,7 @@ describe('Tokens edit modal and row selection', () => {
     });
     apiMock.getAccountTokenValue.mockRejectedValueOnce(new Error('当前仅保存了脱敏令牌，无法展开/复制。请在站点重新生成并同步，或手动更新为完整令牌。'));
 
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = buildTokensRoot();

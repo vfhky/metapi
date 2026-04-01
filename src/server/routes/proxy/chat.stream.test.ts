@@ -1,5 +1,8 @@
+import { zstdCompressSync } from 'node:zlib';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { config } from '../../config.js';
+import { resetUpstreamEndpointRuntimeState } from '../../services/upstreamEndpointRuntimeMemory.js';
 
 const fetchMock = vi.fn();
 const selectChannelMock = vi.fn();
@@ -67,6 +70,9 @@ vi.mock('../../db/index.js', () => ({
   db: {
     insert: (arg: any) => dbInsertMock(arg),
   },
+  hasProxyLogBillingDetailsColumn: async () => false,
+  hasProxyLogClientColumns: async () => false,
+  hasProxyLogDownstreamApiKeyIdColumn: async () => false,
   schema: {
     proxyLogs: {},
   },
@@ -98,6 +104,7 @@ describe('chat proxy stream behavior', () => {
     fetchModelPricingCatalogMock.mockReset();
     resolveProxyUsageWithSelfLogFallbackMock.mockClear();
     dbInsertMock.mockClear();
+    resetUpstreamEndpointRuntimeState();
 
     selectChannelMock.mockReturnValue({
       channel: { id: 11, routeId: 22 },
@@ -109,6 +116,20 @@ describe('chat proxy stream behavior', () => {
     });
     selectNextChannelMock.mockReturnValue(null);
     fetchModelPricingCatalogMock.mockResolvedValue(null);
+    (config as any).codexHeaderDefaults = {
+      userAgent: '',
+      betaFeatures: '',
+    };
+    (config as any).payloadRules = {
+      default: [],
+      defaultRaw: [],
+      override: [],
+      overrideRaw: [],
+      filter: [],
+    };
+    (config as any).disableCrossProtocolFallback = false;
+    config.proxyEmptyContentFailEnabled = false;
+    config.proxyErrorKeywords = [];
   });
 
   afterAll(async () => {
@@ -148,6 +169,326 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('"chat.completion.chunk"');
     expect(response.body).toContain('hello from upstream');
     expect(response.body).toContain('data: [DONE]');
+    expect(recordSuccessMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).not.toHaveBeenCalled();
+  });
+
+  it('decodes zstd-compressed non-stream chat responses before serializing downstream JSON', async () => {
+    const payload = JSON.stringify({
+      id: 'chatcmpl-zstd',
+      object: 'chat.completion',
+      created: 1_706_000_000,
+      model: 'upstream-gpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: '你好，来自 zstd 非流式响应' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
+    });
+    fetchMock.mockResolvedValue(new Response(zstdCompressSync(Buffer.from(payload)), {
+      status: 200,
+      headers: {
+        'content-encoding': 'zstd',
+        'content-type': 'application/json; charset=utf-8',
+      },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()?.choices?.[0]?.message?.content).toBe('你好，来自 zstd 非流式响应');
+  });
+
+  it('decodes zstd-compressed non-SSE streaming chat responses before SSE conversion', async () => {
+    const payload = JSON.stringify({
+      id: 'chatcmpl-zstd-stream',
+      object: 'chat.completion',
+      created: 1_706_000_000,
+      model: 'upstream-gpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: '你好，来自 zstd 流式回退' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
+    });
+    fetchMock.mockResolvedValue(new Response(zstdCompressSync(Buffer.from(payload)), {
+      status: 200,
+      headers: {
+        'content-encoding': 'zstd',
+        'content-type': 'application/json; charset=utf-8',
+      },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('"chat.completion.chunk"');
+    expect(response.body).toContain('你好，来自 zstd 流式回退');
+    expect(response.body).not.toContain('(�/�');
+    expect(response.body).toContain('data: [DONE]');
+  });
+
+  it('decodes zstd-compressed native SSE chat streams before converting downstream chunks', async () => {
+    fetchMock.mockResolvedValue(new Response(zstdCompressSync(Buffer.from([
+      'data: {"id":"chatcmpl-zstd-native","model":"upstream-gpt","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+      'data: {"id":"chatcmpl-zstd-native","model":"upstream-gpt","choices":[{"delta":{"content":"你好，来自 zstd 原生 SSE"},"finish_reason":null}]}\n\n',
+      'data: {"id":"chatcmpl-zstd-native","model":"upstream-gpt","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ].join(''))), {
+      status: 200,
+      headers: {
+        'content-encoding': 'zstd',
+        'content-type': 'text/event-stream; charset=utf-8',
+      },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('"chat.completion.chunk"');
+    expect(response.body).toContain('你好，来自 zstd 原生 SSE');
+    expect(response.body).not.toContain('(�/�');
+    expect(response.body).toContain('data: [DONE]');
+  });
+
+  it('returns upstream_error for empty non-stream chat responses when empty-content failure is enabled', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'chatcmpl-empty',
+      object: 'chat.completion',
+      created: 1_706_000_000,
+      model: 'upstream-gpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: '' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 6, completion_tokens: 0, total_tokens: 6 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(response.json()?.error?.message).toContain('empty content');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns HTTP upstream_error instead of hijacking when streamed chat requests receive empty non-SSE payloads', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'chatcmpl-empty-stream',
+      object: 'chat.completion',
+      created: 1_706_000_000,
+      model: 'upstream-gpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: '' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 4, completion_tokens: 0, total_tokens: 4 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns HTTP upstream_error when streamed chat SSE yields only empty deltas before DONE', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-empty-sse","choices":[{"delta":{}}]}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(response.json()?.error?.message).toContain('empty content');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns HTTP upstream_error when streamed chat SSE carries prompt usage but no assistant output', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-empty-usage","choices":[{"delta":{}}],"usage":{"prompt_tokens":42203,"completion_tokens":0,"total_tokens":42203}}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        stream: true,
+        messages: [{ role: 'user', content: 'long prompt' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(response.json()?.error?.message).toContain('empty content');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns HTTP upstream_error when streamed chat SSE carries completion usage but no assistant output', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-empty-completion-usage","choices":[{"delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        stream: true,
+        messages: [{ role: 'user', content: 'long prompt' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(response.json()?.error?.message).toContain('empty content');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps streamed non-SSE chat fallback successful when the final payload has visible output but zero completion usage', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'chatcmpl-visible-zero-usage',
+      object: 'chat.completion',
+      created: 1_706_000_000,
+      model: 'upstream-gpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: 'visible answer despite zero output usage' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 11, completion_tokens: 0, total_tokens: 11 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('visible answer despite zero output usage');
+    expect(response.body).toContain('data: [DONE]');
+    expect(recordSuccessMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).not.toHaveBeenCalled();
   });
 
   it('returns clear 400 when /v1/chat/completions receives responses-style input without messages', async () => {
@@ -554,7 +895,8 @@ describe('chat proxy stream behavior', () => {
     expect(response.statusCode).toBe(200);
 
     const [_targetUrl, options] = fetchMock.mock.calls[0] as [string, any];
-    expect(options.headers['anthropic-beta']).toBe('code-2025-09-30');
+    expect(options.headers['anthropic-beta']).toContain('claude-code-20250219');
+    expect(options.headers['anthropic-beta']).toContain('code-2025-09-30');
     expect(options.headers['x-claude-client']).toBe('claude-code');
 
     const forwardedBody = JSON.parse(options.body);
@@ -1063,6 +1405,112 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('[DONE]');
   });
 
+  it('replays downgraded chat-completions SSE for websocket transport without requiring native responses terminals', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/chat/completions'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1-ws","model":"upstream-gpt","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1-ws","model":"upstream-gpt","choices":[{"delta":{"content":"hello from fallback"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1-ws","model":"upstream-gpt","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      headers: {
+        'x-metapi-responses-websocket-transport': '1',
+      },
+      payload: {
+        model: 'gpt-5.2',
+        input: 'hello',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('response.output_item.added');
+    expect(response.body).toContain('response.output_text.delta');
+    expect(response.body).toContain('response.completed');
+    expect(response.body).not.toContain('response.failed');
+    expect(response.body).toContain('[DONE]');
+  });
+
+  it('initializes reasoning items before emitting reasoning summary deltas on /v1/responses streams', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/chat/completions'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1-reasoning","model":"upstream-gpt","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1-reasoning","model":"upstream-gpt","choices":[{"delta":{"reasoning_content":"plan first"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1-reasoning","model":"upstream-gpt","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.2',
+        input: 'hello',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('event: response.output_item.added');
+    expect(response.body).toContain('event: response.reasoning_summary_part.added');
+    expect(response.body).toContain('event: response.reasoning_summary_text.delta');
+    const eventBlocks = response.body.split('\n\n').filter((block) => block.trim().length > 0);
+    const reasoningItemAddedIndex = eventBlocks.findIndex(
+      (block) => block.includes('event: response.output_item.added') && block.includes('"type":"reasoning"'),
+    );
+    const reasoningSummaryPartAddedIndex = eventBlocks.findIndex(
+      (block) => block.includes('event: response.reasoning_summary_part.added'),
+    );
+    const reasoningSummaryTextDeltaIndex = eventBlocks.findIndex(
+      (block) => block.includes('event: response.reasoning_summary_text.delta'),
+    );
+
+    expect(reasoningItemAddedIndex).toBeGreaterThanOrEqual(0);
+    expect(reasoningItemAddedIndex).toBeLessThan(reasoningSummaryPartAddedIndex);
+    expect(reasoningSummaryPartAddedIndex).toBeLessThan(reasoningSummaryTextDeltaIndex);
+  });
+
   it('converts chat tool_calls SSE to Responses function_call events on /v1/responses', async () => {
     fetchModelPricingCatalogMock.mockResolvedValue({
       models: [
@@ -1385,6 +1833,15 @@ describe('chat proxy stream behavior', () => {
         headers: { 'content-type': 'application/json' },
       }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'request validation failed',
+          type: 'invalid_request_error',
+        },
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
         id: 'resp_retry_minimal_headers',
         object: 'response',
         status: 'completed',
@@ -1413,21 +1870,27 @@ describe('chat proxy stream behavior', () => {
     const body = response.json();
     expect(body.output_text).toContain('ok after minimal headers retry');
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     const [, firstOptions] = fetchMock.mock.calls[0] as [string, any];
     const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
     const [, thirdOptions] = fetchMock.mock.calls[2] as [string, any];
+    const [, fourthOptions] = fetchMock.mock.calls[3] as [string, any];
 
     expect(firstOptions.headers['openai-beta']).toBe('responses-2025-03-11');
     expect(secondOptions.headers['openai-beta']).toBe('responses-2025-03-11');
-    expect(thirdOptions.headers['openai-beta']).toBeUndefined();
+    expect(thirdOptions.headers['openai-beta']).toBe('responses-2025-03-11');
+    expect(fourthOptions.headers['openai-beta']).toBeUndefined();
 
     const firstBody = JSON.parse(firstOptions.body);
     const secondBody = JSON.parse(secondOptions.body);
     const thirdBody = JSON.parse(thirdOptions.body);
+    const fourthBody = JSON.parse(fourthOptions.body);
     expect(firstBody.user).toBe('user-123');
     expect(secondBody.user).toBeUndefined();
     expect(thirdBody.user).toBeUndefined();
+    expect(secondBody.include).toEqual(['reasoning.encrypted_content']);
+    expect(thirdBody.include).toBeUndefined();
+    expect(fourthBody.user).toBeUndefined();
   });
 
   it('returns concise Cloudflare host error on /v1/responses 502 html failures', async () => {
@@ -1720,6 +2183,51 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('"text":"The user asked \\"whoru\\" which is a common internet slang and shorthand for who are you."');
   });
 
+  it('preserves legitimate repeated short deltas when /v1/responses is converted from /v1/messages stream', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/messages'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_repeat_short_1","model":"upstream-gpt"}}\n\n'));
+        controller.enqueue(encoder.encode('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ha"}}\n\n'));
+        controller.enqueue(encoder.encode('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ha"}}\n\n'));
+        controller.enqueue(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        input: 'laugh',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const deltaMatches = response.body.match(/event: response\.output_text\.delta/g) || [];
+    expect(deltaMatches.length).toBe(2);
+    expect(response.body).toContain('"delta":"ha"');
+    expect(response.body).toContain('"text":"haha"');
+  });
+
   it('preserves function_call/function_call_output when /v1/responses falls back to /v1/chat/completions', async () => {
     fetchModelPricingCatalogMock.mockResolvedValue({
       models: [
@@ -1814,6 +2322,7 @@ describe('chat proxy stream behavior', () => {
     expect(forwarded.tools?.[0]?.function?.name).toBe('Glob');
     expect(forwarded.tool_choice?.function?.name).toBe('Glob');
   });
+
 
   it('preserves function_call/function_call_output when /v1/responses falls back to /v1/messages', async () => {
     fetchModelPricingCatalogMock.mockResolvedValue({
@@ -1927,6 +2436,87 @@ describe('chat proxy stream behavior', () => {
     expect(targetUrl).toContain('/v1/messages');
   });
 
+  it('does not stick generic /v1/responses traffic to /v1/messages after a fallback success', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: { name: 'generic-site', url: 'https://upstream.example.com', platform: 'new-api' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt',
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: 'Gateway time-out', type: 'upstream_error' },
+      }), {
+        status: 504,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: 'Bad gateway', type: 'upstream_error' },
+      }), {
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'msg_fallback_1',
+        type: 'message',
+        model: 'upstream-gpt',
+        content: [{ type: 'text', text: 'ok via messages fallback' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_recovered_1',
+        object: 'response',
+        model: 'upstream-gpt',
+        status: 'completed',
+        output_text: 'ok via recovered responses',
+        usage: { input_tokens: 6, output_tokens: 2, total_tokens: 8 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const firstResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hello',
+      },
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(firstResponse.json().output_text).toContain('ok via messages fallback');
+
+    const secondResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hello again',
+      },
+    });
+
+    expect(secondResponse.statusCode).toBe(200);
+    expect(secondResponse.json().output_text).toContain('ok via recovered responses');
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    const [firstUrl] = fetchMock.mock.calls[0] as [string, any];
+    const [secondUrl] = fetchMock.mock.calls[1] as [string, any];
+    const [thirdUrl] = fetchMock.mock.calls[2] as [string, any];
+    const [fourthUrl] = fetchMock.mock.calls[3] as [string, any];
+    expect(firstUrl).toContain('/v1/responses');
+    expect(secondUrl).toContain('/v1/chat/completions');
+    expect(thirdUrl).toContain('/v1/messages');
+    expect(fourthUrl).toContain('/v1/responses');
+  });
+
   it('prefers native /v1/responses for claude-family /v1/responses requests that explicitly ask for encrypted reasoning', async () => {
     selectChannelMock.mockReturnValue({
       channel: { id: 11, routeId: 22 },
@@ -1972,6 +2562,71 @@ describe('chat proxy stream behavior', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [targetUrl] = fetchMock.mock.calls[0] as [string, any];
     expect(targetUrl).toContain('/v1/responses');
+  });
+
+  it('returns upstream_error for empty non-stream /v1/responses payloads when empty-content failure is enabled', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'resp-empty',
+      object: 'response',
+      model: 'gpt-5.4',
+      status: 'completed',
+      output: [],
+      output_text: '',
+      usage: { input_tokens: 3, output_tokens: 0, total_tokens: 3 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hello',
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(response.json()?.error?.message).toContain('empty content');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns HTTP upstream_error instead of hijacking when streamed /v1/responses receives empty non-SSE payloads', async () => {
+    config.proxyEmptyContentFailEnabled = true;
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'resp-empty-stream',
+      object: 'response',
+      model: 'gpt-5.4',
+      status: 'completed',
+      output: [],
+      output_text: '',
+      usage: { input_tokens: 2, output_tokens: 0, total_tokens: 2 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hello',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()?.error?.type).toBe('upstream_error');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
   });
 
   it('prefers native /v1/responses for claude-family /v1/responses requests that include input_file file_url', async () => {
@@ -2039,7 +2694,7 @@ describe('chat proxy stream behavior', () => {
     });
   });
 
-  it('returns clear 400 when input_file file_url is sent to a claude-only upstream without native responses support', async () => {
+  it('converts input_file file_url into Claude document url blocks for claude-only upstreams', async () => {
     selectChannelMock.mockReturnValue({
       channel: { id: 11, routeId: 22 },
       site: { name: 'claude-site', url: 'https://upstream.example.com', platform: 'claude' },
@@ -2048,6 +2703,18 @@ describe('chat proxy stream behavior', () => {
       tokenValue: 'sk-demo',
       actualModel: 'upstream-claude',
     });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'msg_file_url_1',
+      type: 'message',
+      role: 'assistant',
+      model: 'upstream-claude',
+      content: [{ type: 'text', text: 'hello from claude messages' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 7, output_tokens: 3 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
 
     const response = await app.inject({
       method: 'POST',
@@ -2071,12 +2738,119 @@ describe('chat proxy stream behavior', () => {
       },
     });
 
-    expect(response.statusCode).toBe(400);
-    const body = response.json();
-    expect(body?.error?.type).toBe('invalid_request_error');
-    expect(body?.error?.message).toContain('input_file.file_url');
-    expect(body?.error?.message).toContain('/v1/responses');
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(response.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl, options] = fetchMock.mock.calls[0] as [string, any];
+    expect(targetUrl).toContain('/v1/messages');
+    const forwardedBody = JSON.parse(options.body);
+    expect(forwardedBody.messages[0].content[1]).toMatchObject({
+      type: 'document',
+      title: 'remote.pdf',
+      source: {
+        type: 'url',
+        url: 'https://example.com/remote.pdf',
+      },
+    });
+  });
+
+  it('does not let remote document url success poison later inline document endpoint preference', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: { name: 'generic-site', url: 'https://upstream.example.com', platform: 'new-api' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt',
+    });
+    fetchMock.mockImplementation(async (target: unknown) => {
+      const url = String(target);
+      if (url.includes('/v1/responses')) {
+        return new Response(JSON.stringify({
+          id: 'resp_file_url_runtime_1',
+          object: 'response',
+          model: 'upstream-gpt',
+          output_text: 'hello from responses upstream',
+          output: [
+            {
+              id: 'msg_file_url_runtime_1',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'hello from responses upstream' }],
+            },
+          ],
+          status: 'completed',
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/v1/messages')) {
+        return new Response(JSON.stringify({
+          id: 'msg_inline_runtime_1',
+          type: 'message',
+          role: 'assistant',
+          model: 'upstream-gpt',
+          content: [{ type: 'text', text: 'hello from messages upstream' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 7, output_tokens: 3 },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected target url: ${url}`);
+    });
+
+    const remoteResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'read this remote file' },
+              {
+                type: 'input_file',
+                filename: 'remote.pdf',
+                file_url: 'https://example.com/remote.pdf',
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(remoteResponse.statusCode).toBe(200);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/v1/responses');
+
+    const inlineResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'read this inline file' },
+              {
+                type: 'input_file',
+                filename: 'brief.pdf',
+                file_data: 'data:application/pdf;base64,JVBERi0xLjQK',
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(inlineResponse.statusCode).toBe(200);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain('/v1/messages');
   });
 
   it('prefers native /v1/responses for claude-family /v1/responses requests that opt into reasoning without injecting a generic default include', async () => {
@@ -2525,6 +3299,43 @@ describe('chat proxy stream behavior', () => {
     expect(body?.choices?.[0]?.message?.content).toContain('ok via responses fallback after 502');
   });
 
+  it('stops after the first failed protocol when cross protocol fallback is disabled', async () => {
+    (config as any).disableCrossProtocolFallback = true;
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: { name: 'generic-site', url: 'https://generic.example.com', platform: 'new-api' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-generic',
+      actualModel: 'claude-haiku-4-5-20251001',
+    });
+
+    fetchMock.mockResolvedValueOnce(new Response(
+      '<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>Cloudflare</body></html>',
+      {
+        status: 502,
+        headers: { 'content-type': 'text/html; charset=UTF-8' },
+      },
+    ));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [firstUrl] = fetchMock.mock.calls[0] as [string, any];
+    expect(firstUrl).toContain('/v1/messages');
+    const body = response.json();
+    expect(body?.error?.message).toContain('/v1/messages');
+  });
+
   it('continues to /v1/responses when /v1/messages dispatch is denied for /v1/chat/completions', async () => {
     selectChannelMock.mockReturnValue({
       channel: { id: 11, routeId: 22 },
@@ -2817,6 +3628,87 @@ describe('chat proxy stream behavior', () => {
     expect(toolMessage).toBeTruthy();
     expect(toolMessage.tool_call_id).toBe('toolu_abc');
     expect(toolMessage.content).toContain('matches');
+  });
+
+  it('maps claude tool config and thinking budget before routing claude downstream requests to openai chat endpoint', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: { name: 'openai-site', url: 'https://api.openai.com', platform: 'openai' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-openai',
+      actualModel: 'gpt-4o-mini',
+    });
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'chatcmpl-openai-config-mapped',
+      object: 'chat.completion',
+      created: 1_706_000_007,
+      model: 'gpt-4o-mini',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: 'tool config mapped' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'gpt-4o-mini',
+        max_tokens: 256,
+        metadata: { user_id: 'user-1' },
+        thinking: { type: 'enabled', budget_tokens: 1024 },
+        tools: [{
+          name: 'Glob',
+          description: 'Search files',
+          input_schema: {
+            type: 'object',
+            properties: {
+              pattern: { type: 'string' },
+            },
+            required: ['pattern'],
+          },
+        }],
+        tool_choice: {
+          type: 'tool',
+          name: 'Glob',
+        },
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [_targetUrl, options] = fetchMock.mock.calls[0] as [string, any];
+    const forwardedBody = JSON.parse(options.body);
+    expect(forwardedBody.metadata).toEqual({ user_id: 'user-1' });
+    expect(forwardedBody.reasoning_budget).toBe(1024);
+    expect(forwardedBody.tools).toEqual([{
+      type: 'function',
+      function: {
+        name: 'Glob',
+        description: 'Search files',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string' },
+          },
+          required: ['pattern'],
+        },
+      },
+    }]);
+    expect(forwardedBody.tool_choice).toEqual({
+      type: 'function',
+      function: {
+        name: 'Glob',
+      },
+    });
   });
 
   it('forces claude platform to use /v1/messages with x-api-key auth for openai downstream requests', async () => {
@@ -3193,6 +4085,8 @@ describe('chat proxy stream behavior', () => {
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain('"finish_reason":"error"');
     expect(response.body).toContain('[DONE]');
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
   });
 
   it('preserves non-stream function_call output when /v1/chat/completions falls back to /v1/responses', async () => {

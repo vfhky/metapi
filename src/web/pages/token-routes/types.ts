@@ -1,12 +1,13 @@
 import type { ReactNode } from 'react';
 import type { BrandInfo } from '../../components/BrandIcon.js';
+import type { RouteDecision, RouteDecisionCandidate, RouteMode } from '../../../shared/tokenRouteContract.js';
+export type { RouteDecision, RouteDecisionCandidate, RouteMode } from '../../../shared/tokenRouteContract.js';
 
 export type RouteSortBy = 'modelPattern' | 'channelCount';
 export type RouteSortDir = 'asc' | 'desc';
 export type GroupFilter = null | '__all__' | number;
-export type RouteRoutingStrategy = 'weighted' | 'round_robin';
+export type RouteRoutingStrategy = 'weighted' | 'round_robin' | 'stable_first';
 export type RouteRowKind = 'persisted' | 'zero_channel';
-
 export type RouteChannelDraft = {
   accountId: number;
   tokenId: number;
@@ -15,6 +16,7 @@ export type RouteChannelDraft = {
 
 export type RouteChannel = {
   id: number;
+  routeId?: number;
   accountId: number;
   tokenId: number | null;
   sourceModel?: string | null;
@@ -27,6 +29,9 @@ export type RouteChannel = {
   cooldownUntil?: string | null;
   account?: {
     username: string | null;
+    accessToken?: string | null;
+    extraConfig?: string | null;
+    credentialMode?: string | null;
   };
   site?: {
     id: number;
@@ -47,6 +52,8 @@ export type RouteRow = {
   modelPattern: string;
   displayName?: string | null;
   displayIcon?: string | null;
+  routeMode?: RouteMode | null;
+  sourceRouteIds?: number[];
   modelMapping?: string | null;
   routingStrategy?: RouteRoutingStrategy | null;
   decisionSnapshot?: RouteDecision | null;
@@ -60,6 +67,8 @@ export type RouteSummaryRow = {
   modelPattern: string;
   displayName: string | null;
   displayIcon: string | null;
+  routeMode?: RouteMode | null;
+  sourceRouteIds?: number[];
   modelMapping: string | null;
   routingStrategy?: RouteRoutingStrategy | null;
   enabled: boolean;
@@ -71,31 +80,6 @@ export type RouteSummaryRow = {
   kind?: RouteRowKind;
   readOnly?: boolean;
   isVirtual?: boolean;
-};
-
-export type RouteDecisionCandidate = {
-  channelId: number;
-  accountId: number;
-  username: string;
-  siteName: string;
-  tokenName: string;
-  priority: number;
-  weight: number;
-  eligible: boolean;
-  recentlyFailed: boolean;
-  avoidedByRecentFailure: boolean;
-  probability: number;
-  reason: string;
-};
-
-export type RouteDecision = {
-  requestedModel: string;
-  actualModel: string;
-  matched: boolean;
-  selectedChannelId?: number;
-  selectedLabel?: string;
-  summary: string[];
-  candidates: RouteDecisionCandidate[];
 };
 
 export type ChannelDecisionState = {
@@ -141,23 +125,30 @@ export type MissingTokenGroupRouteSiteActionItem = {
 
 export type SortableChannelRowProps = {
   channel: RouteChannel;
+  displayPriority?: number;
   decisionCandidate?: RouteDecisionCandidate;
   isExactRoute: boolean;
   loadingDecision: boolean;
   isSavingPriority: boolean;
+  readOnly?: boolean;
+  channelManagementDisabled?: boolean;
+  mobile?: boolean;
   tokenOptions: RouteTokenOption[];
   activeTokenId: number;
   isUpdatingToken: boolean;
   onTokenDraftChange: (channelId: number, tokenId: number) => void;
   onSaveToken: () => void;
   onDeleteChannel: () => void;
+  onToggleEnabled: (enabled: boolean) => void;
+  onSiteBlockModel?: () => void;
 };
 
 export type GroupRouteItem = {
   id: number;
   title: string;
-  icon: { kind: 'none' } | { kind: 'text'; value: string } | { kind: 'brand'; value: string };
+  icon: { kind: 'auto' } | { kind: 'none' } | { kind: 'text'; value: string } | { kind: 'brand'; value: string };
   brand: BrandInfo | null;
   modelPattern: string;
   channelCount: number;
+  sourceRouteCount: number;
 };

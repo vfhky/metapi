@@ -1,12 +1,23 @@
-﻿import { FastifyInstance } from 'fastify';
+import { FastifyInstance } from 'fastify';
 import cron from 'node-cron';
+import { fetch } from 'undici';
 import { config } from '../../config.js';
 import { db, runtimeDbDialect, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
-import { refreshModelsAndRebuildRoutes } from '../../services/modelService.js';
-import { updateBalanceRefreshCron, updateCheckinCron, updateLogCleanupSettings } from '../../services/checkinScheduler.js';
+import * as routeRefreshWorkflow from '../../services/routeRefreshWorkflow.js';
+import { getAllBrandNames } from '../../services/brandMatcher.js';
+import { updateBalanceRefreshCron, updateCheckinSchedule, updateLogCleanupSettings } from '../../services/checkinScheduler.js';
 import { sendNotification } from '../../services/notifyService.js';
-import { exportBackup, importBackup, type BackupExportType } from '../../services/backupService.js';
+import {
+  exportBackup,
+  exportBackupToWebdav,
+  getBackupWebdavConfig,
+  importBackup,
+  importBackupFromWebdav,
+  reloadBackupWebdavScheduler,
+  saveBackupWebdavConfig,
+  type BackupExportType,
+} from '../../services/backupService.js';
 import { startBackgroundTask } from '../../services/backgroundTaskService.js';
 import {
   maskConnectionString,
@@ -15,9 +26,17 @@ import {
   testDatabaseConnection,
   type MigrationDialect,
 } from '../../services/databaseMigrationService.js';
-import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import {
+  parseSystemProxyTestPayload,
+  parseDatabaseMigrationPayload,
+  parseBackupImportPayload,
+  parseRuntimeSettingsPayload,
+  parseBackupWebdavConfigPayload,
+  parseBackupWebdavExportPayload,
+} from '../../contracts/settingsRoutePayloads.js';
+import { formatUtcSqlDateTime, getResolvedTimeZone } from '../../services/localTimeService.js';
 import { extractClientIp, isIpAllowed } from '../../middleware/auth.js';
-import { invalidateSiteProxyCache, normalizeSiteProxyUrl } from '../../services/siteProxy.js';
+import { invalidateSiteProxyCache, normalizeSiteProxyUrl, withExplicitProxyRequestInit } from '../../services/siteProxy.js';
 import { performFactoryReset } from '../../services/factoryResetService.js';
 import { normalizeLogCleanupRetentionDays } from '../../services/logCleanupService.js';
 import { stopProxyLogRetentionService } from '../../services/proxyLogRetentionService.js';
@@ -27,7 +46,22 @@ type RoutingWeights = typeof config.routingWeights;
 interface RuntimeSettingsBody {
   proxyToken?: string;
   systemProxyUrl?: string;
+  codexUpstreamWebsocketEnabled?: boolean;
+  disableCrossProtocolFallback?: boolean;
+  proxySessionChannelConcurrencyLimit?: number;
+  proxySessionChannelQueueWaitMs?: number;
+  proxyDebugTraceEnabled?: boolean;
+  proxyDebugCaptureHeaders?: boolean;
+  proxyDebugCaptureBodies?: boolean;
+  proxyDebugCaptureStreamChunks?: boolean;
+  proxyDebugTargetSessionId?: string;
+  proxyDebugTargetClientKind?: string;
+  proxyDebugTargetModel?: string;
+  proxyDebugRetentionHours?: number;
+  proxyDebugMaxBodyBytes?: number;
   checkinCron?: string;
+  checkinScheduleMode?: 'cron' | 'interval';
+  checkinIntervalHours?: number;
   balanceRefreshCron?: string;
   logCleanupCron?: string;
   logCleanupUsageLogsEnabled?: boolean;
@@ -43,6 +77,8 @@ interface RuntimeSettingsBody {
   telegramApiBaseUrl?: string;
   telegramBotToken?: string;
   telegramChatId?: string;
+  telegramUseSystemProxy?: boolean;
+  telegramMessageThreadId?: string;
   smtpEnabled?: boolean;
   smtpHost?: string;
   smtpPort?: number;
@@ -55,6 +91,10 @@ interface RuntimeSettingsBody {
   adminIpAllowlist?: string[] | string;
   routingFallbackUnitCost?: number;
   routingWeights?: Partial<RoutingWeights>;
+  proxyErrorKeywords?: string[] | string;
+  proxyEmptyContentFailEnabled?: boolean;
+  globalBlockedBrands?: string[];
+  globalAllowedModels?: string[];
 }
 
 interface DatabaseMigrationBody {
@@ -62,6 +102,21 @@ interface DatabaseMigrationBody {
   connectionString?: unknown;
   overwrite?: unknown;
   ssl?: unknown;
+}
+
+interface SystemProxyTestBody {
+  proxyUrl?: unknown;
+}
+
+interface BackupWebdavConfigBody {
+  enabled?: unknown;
+  fileUrl?: unknown;
+  username?: unknown;
+  password?: unknown;
+  clearPassword?: unknown;
+  exportType?: unknown;
+  autoSyncEnabled?: unknown;
+  autoSyncCron?: unknown;
 }
 
 type RuntimeDatabaseConfig = {
@@ -74,6 +129,8 @@ const PROXY_TOKEN_PREFIX = 'sk-';
 const DB_TYPE_SETTING_KEY = 'db_type';
 const DB_URL_SETTING_KEY = 'db_url';
 const DB_SSL_SETTING_KEY = 'db_ssl';
+const SYSTEM_PROXY_TEST_PROBE_URL = 'https://www.gstatic.com/generate_204';
+const SYSTEM_PROXY_TEST_TIMEOUT_MS = 15_000;
 
 function isValidProxyToken(value: string): boolean {
   return value.startsWith(PROXY_TOKEN_PREFIX) && value.length >= 6;
@@ -112,6 +169,94 @@ function toPositiveNumberOrFallback(value: unknown, fallback: number) {
   return n;
 }
 
+function extractNestedErrorMessages(error: unknown): string[] {
+  const messages: string[] = [];
+  const visited = new Set<unknown>();
+  let current: any = error;
+
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const message = typeof current?.message === 'string' ? current.message.trim() : '';
+    if (message) {
+      messages.push(message);
+    }
+    current = current?.cause;
+  }
+
+  return messages;
+}
+
+function describeSystemProxyTestFailure(error: unknown): string {
+  const messages = extractNestedErrorMessages(error);
+  const detail = messages.find((message) => message && message !== 'fetch failed')
+    || messages[0]
+    || '未知错误';
+
+  if (/ECONNREFUSED/i.test(detail)) {
+    return '系统代理测试失败：连接被拒绝，请检查代理地址、端口和本地代理程序是否已启动';
+  }
+
+  if (/ETIMEDOUT|timed out|timeout/i.test(detail)) {
+    return '系统代理测试失败：连接超时，请检查代理服务或当前网络是否可用';
+  }
+
+  if (/ENOTFOUND|EAI_AGAIN/i.test(detail)) {
+    return '系统代理测试失败：域名解析失败，请检查网络或代理的 DNS 配置';
+  }
+
+  if (/ECONNRESET/i.test(detail)) {
+    return '系统代理测试失败：连接被对端重置，请检查代理链路是否稳定';
+  }
+
+  if (/407/.test(detail) || /proxy authentication/i.test(detail)) {
+    return '系统代理测试失败：代理要求认证，请检查用户名、密码或代理配置';
+  }
+
+  return `系统代理测试失败：${detail}`;
+}
+
+async function testSystemProxyConnectivity(proxyUrl: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SYSTEM_PROXY_TEST_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  try {
+    const response = await fetch(
+      SYSTEM_PROXY_TEST_PROBE_URL,
+      withExplicitProxyRequestInit(proxyUrl, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'cache-control': 'no-cache',
+          'user-agent': 'metapi-system-proxy-tester/1.0',
+        },
+      }),
+    );
+
+    try {
+      await response.arrayBuffer();
+    } catch {
+      // Ignore body drain failures; reachability is determined by receiving a response.
+    }
+
+    return {
+      reachable: true,
+      ok: response.ok,
+      statusCode: response.status,
+      latencyMs: Math.max(1, Date.now() - startedAt),
+      probeUrl: SYSTEM_PROXY_TEST_PROBE_URL,
+      finalUrl: response.url || SYSTEM_PROXY_TEST_PROBE_URL,
+    };
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`系统代理测试超时（${Math.round(SYSTEM_PROXY_TEST_TIMEOUT_MS / 1000)}s）`);
+    }
+    throw new Error(describeSystemProxyTestFailure(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function toStringList(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value
@@ -125,6 +270,33 @@ function toStringList(value: unknown): string[] {
       .filter((item) => item.length > 0);
   }
   return [];
+}
+
+function parseProxyErrorKeywords(value: unknown): string[] {
+  const splitKeywords = (input: string): string[] => input
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  if (Array.isArray(value)) {
+    const keywords = value.flatMap((item) => {
+      if (typeof item !== 'string') return [];
+      return splitKeywords(item);
+    });
+    return keywords;
+  }
+
+  if (typeof value === 'string') {
+    const keywords = splitKeywords(value);
+    return keywords;
+  }
+
+  throw new Error('上游错误关键词格式无效：需要 string 或 string[]');
+}
+
+function parseBooleanFlag(value: unknown, label: string): boolean {
+  if (typeof value === 'boolean') return value;
+  throw new Error(`${label}格式无效：需要 boolean`);
 }
 
 function isValidHttpUrl(raw: string): boolean {
@@ -142,12 +314,46 @@ function normalizeTelegramApiBaseUrl(raw: string): string {
   return String(raw || '').trim().replace(/\/+$/, '');
 }
 
+function normalizeTelegramMessageThreadId(raw: unknown): string {
+  return String(raw || '').trim();
+}
+
+function isValidTelegramMessageThreadId(raw: string): boolean {
+  return /^[1-9]\d*$/.test(raw);
+}
+
 function applyImportedSettingToRuntime(key: string, value: unknown) {
   switch (key) {
     case 'checkin_cron': {
       if (typeof value !== 'string' || !value || !cron.validate(value)) return;
       config.checkinCron = value;
-      updateCheckinCron(value);
+      updateCheckinSchedule({
+        mode: config.checkinScheduleMode,
+        cronExpr: config.checkinCron,
+        intervalHours: config.checkinIntervalHours,
+      });
+      return;
+    }
+    case 'checkin_schedule_mode': {
+      if (value !== 'cron' && value !== 'interval') return;
+      const nextMode: 'cron' | 'interval' = value;
+      config.checkinScheduleMode = nextMode;
+      updateCheckinSchedule({
+        mode: config.checkinScheduleMode,
+        cronExpr: config.checkinCron,
+        intervalHours: config.checkinIntervalHours,
+      });
+      return;
+    }
+    case 'checkin_interval_hours': {
+      const intervalHours = Number(value);
+      if (!Number.isFinite(intervalHours) || intervalHours < 1 || intervalHours > 24) return;
+      config.checkinIntervalHours = Math.trunc(intervalHours);
+      updateCheckinSchedule({
+        mode: config.checkinScheduleMode,
+        cronExpr: config.checkinCron,
+        intervalHours: config.checkinIntervalHours,
+      });
       return;
     }
     case 'balance_refresh_cron': {
@@ -197,6 +403,146 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       config.systemProxyUrl = normalizeSiteProxyUrl(value) || '';
       return;
     }
+    case 'codex_upstream_websocket_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.codexUpstreamWebsocketEnabled = value;
+      return;
+    }
+    case 'disable_cross_protocol_fallback': {
+      if (typeof value !== 'boolean') return;
+      config.disableCrossProtocolFallback = value;
+      return;
+    }
+    case 'proxy_error_keywords': {
+      try {
+        config.proxyErrorKeywords = parseProxyErrorKeywords(value);
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'proxy_session_channel_concurrency_limit': {
+      const limit = Number(value);
+      if (!Number.isFinite(limit) || limit < 0) return;
+      config.proxySessionChannelConcurrencyLimit = Math.trunc(limit);
+      return;
+    }
+    case 'proxy_session_channel_queue_wait_ms': {
+      const queueWaitMs = Number(value);
+      if (!Number.isFinite(queueWaitMs) || queueWaitMs < 0) return;
+      config.proxySessionChannelQueueWaitMs = Math.trunc(queueWaitMs);
+      return;
+    }
+    case 'proxy_debug_trace_enabled': {
+      try {
+        config.proxyDebugTraceEnabled = parseBooleanFlag(value, '代理调试追踪开关');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'proxy_debug_capture_headers': {
+      try {
+        config.proxyDebugCaptureHeaders = parseBooleanFlag(value, '代理调试请求头采集');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'proxy_debug_capture_bodies': {
+      try {
+        config.proxyDebugCaptureBodies = parseBooleanFlag(value, '代理调试请求体采集');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'proxy_debug_capture_stream_chunks': {
+      try {
+        config.proxyDebugCaptureStreamChunks = parseBooleanFlag(value, '代理调试流式分片采集');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'proxy_debug_target_session_id': {
+      config.proxyDebugTargetSessionId = typeof value === 'string' ? value.trim() : '';
+      return;
+    }
+    case 'proxy_debug_target_client_kind': {
+      config.proxyDebugTargetClientKind = typeof value === 'string' ? value.trim() : '';
+      return;
+    }
+    case 'proxy_debug_target_model': {
+      config.proxyDebugTargetModel = typeof value === 'string' ? value.trim() : '';
+      return;
+    }
+    case 'proxy_debug_retention_hours': {
+      const retentionHours = Number(value);
+      if (!Number.isFinite(retentionHours) || retentionHours < 1) return;
+      config.proxyDebugRetentionHours = Math.trunc(retentionHours);
+      return;
+    }
+    case 'proxy_debug_max_body_bytes': {
+      const maxBodyBytes = Number(value);
+      if (!Number.isFinite(maxBodyBytes) || maxBodyBytes < 1024) return;
+      config.proxyDebugMaxBodyBytes = Math.trunc(maxBodyBytes);
+      return;
+    }
+    case 'proxy_empty_content_fail_enabled': {
+      try {
+        config.proxyEmptyContentFailEnabled = parseBooleanFlag(value, '空内容判定失败开关');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'global_blocked_brands': {
+      try {
+        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+        if (Array.isArray(parsed)) {
+          const nextBrands = parsed.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
+          const prev = JSON.stringify(config.globalBlockedBrands);
+          config.globalBlockedBrands = nextBrands;
+          if (prev !== JSON.stringify(nextBrands)) {
+            startBackgroundTask(
+              {
+                type: 'maintenance',
+                title: '品牌屏蔽变更后重建路由',
+                dedupeKey: 'refresh-models-and-rebuild-routes',
+              },
+              async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
+            );
+          }
+        }
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'global_allowed_models': {
+      try {
+        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+        if (Array.isArray(parsed)) {
+          const nextModels = parsed.filter((m): m is string => typeof m === 'string').map((m) => m.trim()).filter(Boolean);
+          const prev = JSON.stringify(config.globalAllowedModels);
+          config.globalAllowedModels = nextModels;
+          if (prev !== JSON.stringify(nextModels)) {
+            startBackgroundTask(
+              {
+                type: 'maintenance',
+                title: '模型白名单变更后重建路由',
+                dedupeKey: 'refresh-models-and-rebuild-routes',
+              },
+              async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
+            );
+          }
+        }
+      } catch {
+        return;
+      }
+      return;
+    }
     case 'webhook_url': {
       if (typeof value !== 'string') return;
       config.webhookUrl = value.trim();
@@ -241,6 +587,15 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
     case 'telegram_chat_id': {
       if (typeof value !== 'string') return;
       config.telegramChatId = value.trim();
+      return;
+    }
+    case 'telegram_use_system_proxy': {
+      config.telegramUseSystemProxy = !!value;
+      return;
+    }
+    case 'telegram_message_thread_id': {
+      if (typeof value !== 'string') return;
+      config.telegramMessageThreadId = value.trim();
       return;
     }
     case 'smtp_enabled': {
@@ -318,11 +673,26 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
 function getRuntimeSettingsResponse(currentAdminIp = '') {
   return {
     checkinCron: config.checkinCron,
+    checkinScheduleMode: config.checkinScheduleMode,
+    checkinIntervalHours: config.checkinIntervalHours,
     balanceRefreshCron: config.balanceRefreshCron,
     logCleanupCron: config.logCleanupCron,
     logCleanupUsageLogsEnabled: config.logCleanupUsageLogsEnabled,
     logCleanupProgramLogsEnabled: config.logCleanupProgramLogsEnabled,
     logCleanupRetentionDays: config.logCleanupRetentionDays,
+    codexUpstreamWebsocketEnabled: config.codexUpstreamWebsocketEnabled,
+    disableCrossProtocolFallback: config.disableCrossProtocolFallback,
+    proxySessionChannelConcurrencyLimit: config.proxySessionChannelConcurrencyLimit,
+    proxySessionChannelQueueWaitMs: config.proxySessionChannelQueueWaitMs,
+    proxyDebugTraceEnabled: config.proxyDebugTraceEnabled,
+    proxyDebugCaptureHeaders: config.proxyDebugCaptureHeaders,
+    proxyDebugCaptureBodies: config.proxyDebugCaptureBodies,
+    proxyDebugCaptureStreamChunks: config.proxyDebugCaptureStreamChunks,
+    proxyDebugTargetSessionId: config.proxyDebugTargetSessionId,
+    proxyDebugTargetClientKind: config.proxyDebugTargetClientKind,
+    proxyDebugTargetModel: config.proxyDebugTargetModel,
+    proxyDebugRetentionHours: config.proxyDebugRetentionHours,
+    proxyDebugMaxBodyBytes: config.proxyDebugMaxBodyBytes,
     routingFallbackUnitCost: config.routingFallbackUnitCost,
     routingWeights: config.routingWeights,
     webhookUrl: config.webhookUrl,
@@ -335,6 +705,8 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     telegramApiBaseUrl: config.telegramApiBaseUrl,
     telegramBotTokenMasked: maskSecret(config.telegramBotToken),
     telegramChatId: config.telegramChatId,
+    telegramUseSystemProxy: config.telegramUseSystemProxy,
+    telegramMessageThreadId: config.telegramMessageThreadId,
     smtpEnabled: config.smtpEnabled,
     smtpHost: config.smtpHost,
     smtpPort: config.smtpPort,
@@ -346,8 +718,13 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     notifyCooldownSec: config.notifyCooldownSec,
     adminIpAllowlist: config.adminIpAllowlist,
     currentAdminIp,
+    serverTimeZone: getResolvedTimeZone(),
     systemProxyUrl: config.systemProxyUrl,
+    proxyErrorKeywords: config.proxyErrorKeywords,
+    proxyEmptyContentFailEnabled: config.proxyEmptyContentFailEnabled,
     proxyTokenMasked: maskSecret(config.proxyToken),
+    globalBlockedBrands: config.globalBlockedBrands,
+    globalAllowedModels: config.globalAllowedModels,
   };
 }
 
@@ -425,8 +802,65 @@ export async function settingsRoutes(app: FastifyInstance) {
     return getRuntimeSettingsResponse(currentAdminIp);
   });
 
-  app.put<{ Body: RuntimeSettingsBody }>('/api/settings/runtime', async (request, reply) => {
-    const body = request.body || {};
+  app.get('/api/settings/brand-list', async () => {
+    return { brands: getAllBrandNames() };
+  });
+
+  app.post<{ Body: unknown }>('/api/settings/system-proxy/test', async (request, reply) => {
+    const parsedBody = parseSystemProxyTestPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        success: false,
+        message: parsedBody.error,
+      });
+    }
+
+    const rawProxyUrl = parsedBody.data.proxyUrl === undefined
+      ? config.systemProxyUrl
+      : String(parsedBody.data.proxyUrl || '').trim();
+    const normalizedProxyUrl = rawProxyUrl
+      ? normalizeSiteProxyUrl(rawProxyUrl)
+      : '';
+
+    if (!rawProxyUrl) {
+      return reply.code(400).send({
+        success: false,
+        message: '请先填写系统代理地址',
+      });
+    }
+
+    if (!normalizedProxyUrl) {
+      return reply.code(400).send({
+        success: false,
+        message: '系统代理地址无效，请填写合法的 http(s)/socks 代理 URL',
+      });
+    }
+
+    try {
+      const result = await testSystemProxyConnectivity(normalizedProxyUrl);
+      return {
+        success: true,
+        proxyUrl: normalizedProxyUrl,
+        ...result,
+      };
+    } catch (error: any) {
+      return reply.code(502).send({
+        success: false,
+        message: error?.message || '系统代理测试失败',
+      });
+    }
+  });
+
+  app.put<{ Body: unknown }>('/api/settings/runtime', async (request, reply) => {
+    const parsedBody = parseRuntimeSettingsPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        success: false,
+        message: parsedBody.error,
+      });
+    }
+
+    const body = parsedBody.data as RuntimeSettingsBody;
     const changedLabels: string[] = [];
     const currentRequestIp = extractClientIp(request.ip, request.headers['x-forwarded-for']);
 
@@ -465,7 +899,9 @@ export async function settingsRoutes(app: FastifyInstance) {
     const telegramTouched = body.telegramEnabled !== undefined
       || body.telegramApiBaseUrl !== undefined
       || body.telegramBotToken !== undefined
-      || body.telegramChatId !== undefined;
+      || body.telegramChatId !== undefined
+      || body.telegramUseSystemProxy !== undefined
+      || body.telegramMessageThreadId !== undefined;
     const nextTelegramEnabled = body.telegramEnabled !== undefined
       ? !!body.telegramEnabled
       : config.telegramEnabled;
@@ -478,6 +914,9 @@ export async function settingsRoutes(app: FastifyInstance) {
     const nextTelegramChatId = body.telegramChatId !== undefined
       ? String(body.telegramChatId || '').trim()
       : config.telegramChatId;
+    const nextTelegramMessageThreadId = body.telegramMessageThreadId !== undefined
+      ? normalizeTelegramMessageThreadId(body.telegramMessageThreadId)
+      : config.telegramMessageThreadId;
     if (telegramTouched && nextTelegramEnabled) {
       if (!nextTelegramBotToken) {
         return reply.code(400).send({ success: false, message: 'Telegram Bot Token 不能为空（启用 Telegram 时）' });
@@ -488,12 +927,21 @@ export async function settingsRoutes(app: FastifyInstance) {
       if (!nextTelegramChatId) {
         return reply.code(400).send({ success: false, message: 'Telegram Chat ID 不能为空（启用 Telegram 时）' });
       }
+      if (nextTelegramMessageThreadId && !isValidTelegramMessageThreadId(nextTelegramMessageThreadId)) {
+        return reply.code(400).send({ success: false, message: 'Telegram Topic ID 格式无效，需要正整数' });
+      }
       if (nextTelegramApiBaseUrl && !isValidHttpUrl(nextTelegramApiBaseUrl)) {
         return reply.code(400).send({ success: false, message: 'Telegram API Base URL 无效，请填写 http/https 地址' });
       }
     } else if (body.telegramApiBaseUrl !== undefined && nextTelegramApiBaseUrl && !isValidHttpUrl(nextTelegramApiBaseUrl)) {
       return reply.code(400).send({ success: false, message: 'Telegram API Base URL 无效，请填写 http/https 地址' });
+    } else if (body.telegramMessageThreadId !== undefined && nextTelegramMessageThreadId && !isValidTelegramMessageThreadId(nextTelegramMessageThreadId)) {
+      return reply.code(400).send({ success: false, message: 'Telegram Topic ID 格式无效，需要正整数' });
     }
+
+    const checkinScheduleTouched = body.checkinCron !== undefined
+      || body.checkinScheduleMode !== undefined
+      || body.checkinIntervalHours !== undefined;
 
     if (body.checkinCron !== undefined) {
       if (!cron.validate(body.checkinCron)) {
@@ -502,8 +950,50 @@ export async function settingsRoutes(app: FastifyInstance) {
       if (body.checkinCron !== config.checkinCron) {
         changedLabels.push(`签到 Cron（${config.checkinCron} -> ${body.checkinCron}）`);
       }
-      updateCheckinCron(body.checkinCron);
-      upsertSetting('checkin_cron', body.checkinCron);
+    }
+
+    if (body.checkinScheduleMode !== undefined) {
+      if (body.checkinScheduleMode !== 'cron' && body.checkinScheduleMode !== 'interval') {
+        return reply.code(400).send({ success: false, message: '签到方式无效：仅支持 cron 或 interval' });
+      }
+      if (body.checkinScheduleMode !== config.checkinScheduleMode) {
+        changedLabels.push('签到方式');
+      }
+      config.checkinScheduleMode = body.checkinScheduleMode;
+    }
+
+    if (body.checkinIntervalHours !== undefined) {
+      const intervalHours = Number(body.checkinIntervalHours);
+      if (!Number.isFinite(intervalHours) || intervalHours < 1 || intervalHours > 24) {
+        return reply.code(400).send({ success: false, message: '签到间隔必须是 1 到 24 的整数小时' });
+      }
+      const nextIntervalHours = Math.trunc(intervalHours);
+      if (nextIntervalHours !== config.checkinIntervalHours) {
+        changedLabels.push(`签到间隔（${config.checkinIntervalHours}h -> ${nextIntervalHours}h）`);
+      }
+      config.checkinIntervalHours = nextIntervalHours;
+    }
+
+    if (checkinScheduleTouched) {
+      const nextCheckinCron = body.checkinCron !== undefined ? body.checkinCron : config.checkinCron;
+      const nextCheckinScheduleMode: 'cron' | 'interval' = body.checkinScheduleMode !== undefined
+        ? body.checkinScheduleMode
+        : config.checkinScheduleMode;
+      const nextCheckinIntervalHours = body.checkinIntervalHours !== undefined
+        ? Math.trunc(Number(body.checkinIntervalHours))
+        : config.checkinIntervalHours;
+
+      updateCheckinSchedule({
+        mode: nextCheckinScheduleMode,
+        cronExpr: nextCheckinCron,
+        intervalHours: nextCheckinIntervalHours,
+      });
+      config.checkinCron = nextCheckinCron;
+      config.checkinScheduleMode = nextCheckinScheduleMode;
+      config.checkinIntervalHours = nextCheckinIntervalHours;
+      upsertSetting('checkin_cron', config.checkinCron);
+      upsertSetting('checkin_schedule_mode', config.checkinScheduleMode);
+      upsertSetting('checkin_interval_hours', config.checkinIntervalHours);
     }
 
     if (body.balanceRefreshCron !== undefined) {
@@ -603,6 +1093,275 @@ export async function settingsRoutes(app: FastifyInstance) {
       invalidateSiteProxyCache();
     }
 
+    if (body.codexUpstreamWebsocketEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.codexUpstreamWebsocketEnabled, 'Codex 上游 WebSocket 开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || 'Codex 上游 WebSocket 开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.codexUpstreamWebsocketEnabled) {
+        changedLabels.push('Codex 上游 WebSocket 默认策略');
+      }
+      config.codexUpstreamWebsocketEnabled = nextValue;
+      upsertSetting('codex_upstream_websocket_enabled', config.codexUpstreamWebsocketEnabled);
+    }
+
+    if (body.disableCrossProtocolFallback !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.disableCrossProtocolFallback, '跨协议回退开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '跨协议回退开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.disableCrossProtocolFallback) {
+        changedLabels.push('失败时不尝试其他协议');
+      }
+      config.disableCrossProtocolFallback = nextValue;
+      upsertSetting('disable_cross_protocol_fallback', config.disableCrossProtocolFallback);
+    }
+
+    if (body.proxySessionChannelConcurrencyLimit !== undefined) {
+      const limit = Number(body.proxySessionChannelConcurrencyLimit);
+      if (!Number.isFinite(limit) || limit < 0) {
+        return reply.code(400).send({ success: false, message: '会话通道并发上限必须是大于等于 0 的整数' });
+      }
+      const nextLimit = Math.trunc(limit);
+      if (nextLimit !== config.proxySessionChannelConcurrencyLimit) {
+        changedLabels.push(`会话通道并发上限（${config.proxySessionChannelConcurrencyLimit} -> ${nextLimit}）`);
+      }
+      config.proxySessionChannelConcurrencyLimit = nextLimit;
+      upsertSetting('proxy_session_channel_concurrency_limit', config.proxySessionChannelConcurrencyLimit);
+    }
+
+    if (body.proxySessionChannelQueueWaitMs !== undefined) {
+      const rawQueueWaitMs = Number(body.proxySessionChannelQueueWaitMs);
+      if (!Number.isFinite(rawQueueWaitMs) || rawQueueWaitMs < 0) {
+        return reply.code(400).send({ success: false, message: '会话通道排队等待时间必须是大于等于 0 的整数毫秒' });
+      }
+      const nextQueueWaitMs = Math.trunc(rawQueueWaitMs);
+      if (nextQueueWaitMs !== config.proxySessionChannelQueueWaitMs) {
+        changedLabels.push(`会话通道排队等待（${config.proxySessionChannelQueueWaitMs}ms -> ${nextQueueWaitMs}ms）`);
+      }
+      config.proxySessionChannelQueueWaitMs = nextQueueWaitMs;
+      upsertSetting('proxy_session_channel_queue_wait_ms', config.proxySessionChannelQueueWaitMs);
+    }
+
+    if (body.proxyDebugTraceEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.proxyDebugTraceEnabled, '代理调试追踪开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '代理调试追踪开关格式无效',
+        });
+      }
+      if (nextValue !== config.proxyDebugTraceEnabled) {
+        changedLabels.push('代理调试追踪');
+      }
+      config.proxyDebugTraceEnabled = nextValue;
+      upsertSetting('proxy_debug_trace_enabled', config.proxyDebugTraceEnabled);
+    }
+
+    if (body.proxyDebugCaptureHeaders !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.proxyDebugCaptureHeaders, '代理调试请求头采集');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '代理调试请求头采集格式无效',
+        });
+      }
+      if (nextValue !== config.proxyDebugCaptureHeaders) {
+        changedLabels.push('代理调试请求头采集');
+      }
+      config.proxyDebugCaptureHeaders = nextValue;
+      upsertSetting('proxy_debug_capture_headers', config.proxyDebugCaptureHeaders);
+    }
+
+    if (body.proxyDebugCaptureBodies !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.proxyDebugCaptureBodies, '代理调试请求体采集');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '代理调试请求体采集格式无效',
+        });
+      }
+      if (nextValue !== config.proxyDebugCaptureBodies) {
+        changedLabels.push('代理调试请求体采集');
+      }
+      config.proxyDebugCaptureBodies = nextValue;
+      upsertSetting('proxy_debug_capture_bodies', config.proxyDebugCaptureBodies);
+    }
+
+    if (body.proxyDebugCaptureStreamChunks !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.proxyDebugCaptureStreamChunks, '代理调试流式分片采集');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '代理调试流式分片采集格式无效',
+        });
+      }
+      if (nextValue !== config.proxyDebugCaptureStreamChunks) {
+        changedLabels.push('代理调试流式分片采集');
+      }
+      config.proxyDebugCaptureStreamChunks = nextValue;
+      upsertSetting('proxy_debug_capture_stream_chunks', config.proxyDebugCaptureStreamChunks);
+    }
+
+    if (body.proxyDebugTargetSessionId !== undefined) {
+      const nextValue = String(body.proxyDebugTargetSessionId || '').trim();
+      if (nextValue !== config.proxyDebugTargetSessionId) {
+        changedLabels.push('代理调试目标会话');
+      }
+      config.proxyDebugTargetSessionId = nextValue;
+      upsertSetting('proxy_debug_target_session_id', config.proxyDebugTargetSessionId);
+    }
+
+    if (body.proxyDebugTargetClientKind !== undefined) {
+      const nextValue = String(body.proxyDebugTargetClientKind || '').trim();
+      if (nextValue !== config.proxyDebugTargetClientKind) {
+        changedLabels.push('代理调试目标客户端');
+      }
+      config.proxyDebugTargetClientKind = nextValue;
+      upsertSetting('proxy_debug_target_client_kind', config.proxyDebugTargetClientKind);
+    }
+
+    if (body.proxyDebugTargetModel !== undefined) {
+      const nextValue = String(body.proxyDebugTargetModel || '').trim();
+      if (nextValue !== config.proxyDebugTargetModel) {
+        changedLabels.push('代理调试目标模型');
+      }
+      config.proxyDebugTargetModel = nextValue;
+      upsertSetting('proxy_debug_target_model', config.proxyDebugTargetModel);
+    }
+
+    if (body.proxyDebugRetentionHours !== undefined) {
+      const retentionHours = Number(body.proxyDebugRetentionHours);
+      if (!Number.isFinite(retentionHours) || retentionHours < 1) {
+        return reply.code(400).send({ success: false, message: '代理调试保留时长必须是大于等于 1 的整数小时' });
+      }
+      const nextValue = Math.trunc(retentionHours);
+      if (nextValue !== config.proxyDebugRetentionHours) {
+        changedLabels.push(`代理调试保留时长（${config.proxyDebugRetentionHours}h -> ${nextValue}h）`);
+      }
+      config.proxyDebugRetentionHours = nextValue;
+      upsertSetting('proxy_debug_retention_hours', config.proxyDebugRetentionHours);
+    }
+
+    if (body.proxyDebugMaxBodyBytes !== undefined) {
+      const maxBodyBytes = Number(body.proxyDebugMaxBodyBytes);
+      if (!Number.isFinite(maxBodyBytes) || maxBodyBytes < 1024) {
+        return reply.code(400).send({ success: false, message: '代理调试抓取体积上限必须是大于等于 1024 的整数字节' });
+      }
+      const nextValue = Math.trunc(maxBodyBytes);
+      if (nextValue !== config.proxyDebugMaxBodyBytes) {
+        changedLabels.push(`代理调试抓取体积上限（${config.proxyDebugMaxBodyBytes}B -> ${nextValue}B）`);
+      }
+      config.proxyDebugMaxBodyBytes = nextValue;
+      upsertSetting('proxy_debug_max_body_bytes', config.proxyDebugMaxBodyBytes);
+    }
+
+    if (body.proxyErrorKeywords !== undefined) {
+      let nextKeywords: string[] = [];
+      try {
+        nextKeywords = parseProxyErrorKeywords(body.proxyErrorKeywords);
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '上游错误关键词格式无效',
+        });
+      }
+
+      if (JSON.stringify(nextKeywords) !== JSON.stringify(config.proxyErrorKeywords || [])) {
+        changedLabels.push('上游错误关键词');
+      }
+      config.proxyErrorKeywords = nextKeywords;
+      upsertSetting('proxy_error_keywords', config.proxyErrorKeywords);
+    }
+
+    if (body.proxyEmptyContentFailEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.proxyEmptyContentFailEnabled, '空内容判定失败开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '空内容判定失败开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.proxyEmptyContentFailEnabled) {
+        changedLabels.push('空内容判定失败');
+      }
+      config.proxyEmptyContentFailEnabled = nextValue;
+      upsertSetting('proxy_empty_content_fail_enabled', config.proxyEmptyContentFailEnabled);
+    }
+
+    if (body.globalBlockedBrands !== undefined) {
+      if (!Array.isArray(body.globalBlockedBrands)) {
+        return reply.code(400).send({ error: 'globalBlockedBrands must be an array of strings' });
+      }
+      const nextBrands = body.globalBlockedBrands.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
+      const uniqueBrands = Array.from(new Set(nextBrands));
+      const prev = JSON.stringify(config.globalBlockedBrands);
+      const next = JSON.stringify(uniqueBrands);
+      if (prev !== next) {
+        changedLabels.push('全局品牌屏蔽');
+      }
+      config.globalBlockedBrands = uniqueBrands;
+      upsertSetting('global_blocked_brands', JSON.stringify(uniqueBrands));
+      if (prev !== next) {
+        startBackgroundTask(
+          {
+            type: 'maintenance',
+            title: '品牌屏蔽变更后重建路由',
+            dedupeKey: 'refresh-models-and-rebuild-routes',
+          },
+          async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
+        );
+      }
+    }
+
+    if (body.globalAllowedModels !== undefined) {
+      if (!Array.isArray(body.globalAllowedModels)) {
+        return reply.code(400).send({ error: 'globalAllowedModels must be an array of strings' });
+      }
+      const nextModels = body.globalAllowedModels.filter((m): m is string => typeof m === 'string').map((m) => m.trim()).filter(Boolean);
+      const uniqueModels = Array.from(new Set(nextModels));
+      const prev = JSON.stringify(config.globalAllowedModels);
+      const next = JSON.stringify(uniqueModels);
+      if (prev !== next) {
+        changedLabels.push('全局模型白名单');
+      }
+      config.globalAllowedModels = uniqueModels;
+      upsertSetting('global_allowed_models', JSON.stringify(uniqueModels));
+      if (prev !== next) {
+        startBackgroundTask(
+          {
+            type: 'maintenance',
+            title: '模型白名单变更后重建路由',
+            dedupeKey: 'refresh-models-and-rebuild-routes',
+          },
+          async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
+        );
+      }
+    }
+
     if (body.webhookUrl !== undefined) {
       if (String(body.webhookUrl || '').trim() !== config.webhookUrl) {
         changedLabels.push('Webhook 地址');
@@ -683,6 +1442,23 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.telegramChatId = String(body.telegramChatId || '').trim();
       upsertSetting('telegram_chat_id', config.telegramChatId);
+    }
+
+    if (body.telegramUseSystemProxy !== undefined) {
+      if (!!body.telegramUseSystemProxy !== config.telegramUseSystemProxy) {
+        changedLabels.push('Telegram 使用系统代理');
+      }
+      config.telegramUseSystemProxy = !!body.telegramUseSystemProxy;
+      upsertSetting('telegram_use_system_proxy', config.telegramUseSystemProxy);
+    }
+
+    if (body.telegramMessageThreadId !== undefined) {
+      const nextTelegramMessageThreadId = normalizeTelegramMessageThreadId(body.telegramMessageThreadId);
+      if (nextTelegramMessageThreadId !== config.telegramMessageThreadId) {
+        changedLabels.push('Telegram Topic ID');
+      }
+      config.telegramMessageThreadId = nextTelegramMessageThreadId;
+      upsertSetting('telegram_message_thread_id', config.telegramMessageThreadId);
     }
 
     if (body.smtpEnabled !== undefined) {
@@ -838,9 +1614,17 @@ export async function settingsRoutes(app: FastifyInstance) {
     };
   });
 
-  app.put<{ Body: DatabaseMigrationBody }>('/api/settings/database/runtime', async (request, reply) => {
+  app.put<{ Body: unknown }>('/api/settings/database/runtime', async (request, reply) => {
     try {
-      const normalized = normalizeMigrationInput(request.body || {});
+      const parsedBody = parseDatabaseMigrationPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({
+          success: false,
+          message: parsedBody.error,
+        });
+      }
+
+      const normalized = normalizeMigrationInput(parsedBody.data);
       await upsertSetting(DB_TYPE_SETTING_KEY, normalized.dialect);
       await upsertSetting(DB_URL_SETTING_KEY, normalized.connectionString);
       await upsertSetting(DB_SSL_SETTING_KEY, normalized.ssl);
@@ -870,9 +1654,17 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
   });
 
-  app.post<{ Body: DatabaseMigrationBody }>('/api/settings/database/test-connection', async (request, reply) => {
+  app.post<{ Body: unknown }>('/api/settings/database/test-connection', async (request, reply) => {
     try {
-      const result = await testDatabaseConnection(request.body || {});
+      const parsedBody = parseDatabaseMigrationPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({
+          success: false,
+          message: parsedBody.error,
+        });
+      }
+
+      const result = await testDatabaseConnection(parsedBody.data);
       return {
         success: true,
         message: '目标数据库连接成功',
@@ -886,9 +1678,17 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
   });
 
-  app.post<{ Body: DatabaseMigrationBody }>('/api/settings/database/migrate', async (request, reply) => {
+  app.post<{ Body: unknown }>('/api/settings/database/migrate', async (request, reply) => {
     try {
-      const result = await migrateCurrentDatabase(request.body || {});
+      const parsedBody = parseDatabaseMigrationPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({
+          success: false,
+          message: parsedBody.error,
+        });
+      }
+
+      const result = await migrateCurrentDatabase(parsedBody.data);
       appendSettingsEvent({
         type: 'status',
         title: '数据库迁移已完成',
@@ -916,16 +1716,19 @@ export async function settingsRoutes(app: FastifyInstance) {
     return await exportBackup(type);
   });
 
-  app.post<{ Body: { data?: Record<string, unknown> } }>('/api/settings/backup/import', async (request, reply) => {
-    const payload = request.body?.data;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+  app.post<{ Body: unknown }>('/api/settings/backup/import', async (request, reply) => {
+    const parsedBody = parseBackupImportPayload(request.body);
+    if (!parsedBody.success) {
       return reply.code(400).send({ success: false, message: '导入数据格式错误：需要 JSON 对象' });
     }
 
     try {
-      const result = await importBackup(payload);
+      const result = await importBackup(parsedBody.data.data);
       for (const item of result.appliedSettings) {
         applyImportedSettingToRuntime(item.key, item.value);
+      }
+      if (result.appliedSettings.some((item) => item.key === 'backup_webdav_config_v1')) {
+        await reloadBackupWebdavScheduler();
       }
       return {
         success: true,
@@ -936,6 +1739,81 @@ export async function settingsRoutes(app: FastifyInstance) {
       return reply.code(400).send({
         success: false,
         message: err?.message || '导入失败',
+      });
+    }
+  });
+
+  app.get('/api/settings/backup/webdav', async () => {
+    return getBackupWebdavConfig();
+  });
+
+  app.put<{ Body: BackupWebdavConfigBody }>('/api/settings/backup/webdav', async (request, reply) => {
+    try {
+      const parsedBody = parseBackupWebdavConfigPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({
+          success: false,
+          message: parsedBody.error,
+        });
+      }
+
+      const body = parsedBody.data;
+      const result = await saveBackupWebdavConfig({
+        enabled: body.enabled === undefined ? undefined : body.enabled === true,
+        fileUrl: body.fileUrl === undefined ? undefined : String(body.fileUrl || ''),
+        username: body.username === undefined ? undefined : String(body.username || ''),
+        password: body.password === undefined ? undefined : String(body.password),
+        clearPassword: body.clearPassword === true,
+        exportType: body.exportType === undefined ? undefined : String(body.exportType || '') as BackupExportType,
+        autoSyncEnabled: body.autoSyncEnabled === undefined ? undefined : body.autoSyncEnabled === true,
+        autoSyncCron: body.autoSyncCron === undefined ? undefined : String(body.autoSyncCron || ''),
+      });
+      return result;
+    } catch (err: any) {
+      return reply.code(400).send({
+        success: false,
+        message: err?.message || 'WebDAV 配置保存失败',
+      });
+    }
+  });
+
+  app.post<{ Body: { type?: string } }>('/api/settings/backup/webdav/export', async (request, reply) => {
+    try {
+      const parsedBody = parseBackupWebdavExportPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({
+          success: false,
+          message: parsedBody.error,
+        });
+      }
+
+      const rawType = typeof parsedBody.data.type === 'string' ? parsedBody.data.type.trim().toLowerCase() : '';
+      const type: BackupExportType | undefined = rawType === 'all' || rawType === 'accounts' || rawType === 'preferences'
+        ? rawType
+        : undefined;
+      return await exportBackupToWebdav(type);
+    } catch (err: any) {
+      return reply.code(400).send({
+        success: false,
+        message: err?.message || 'WebDAV 导出失败',
+      });
+    }
+  });
+
+  app.post('/api/settings/backup/webdav/import', async (_, reply) => {
+    try {
+      const result = await importBackupFromWebdav();
+      for (const item of result.appliedSettings) {
+        applyImportedSettingToRuntime(item.key, item.value);
+      }
+      if (result.appliedSettings.some((item) => item.key === 'backup_webdav_config_v1')) {
+        await reloadBackupWebdavScheduler();
+      }
+      return result;
+    } catch (err: any) {
+      return reply.code(400).send({
+        success: false,
+        message: err?.message || 'WebDAV 导入失败',
       });
     }
   });
@@ -982,7 +1860,7 @@ export async function settingsRoutes(app: FastifyInstance) {
         },
         failureMessage: (currentTask) => `缓存清理后重建失败：${currentTask.error || 'unknown error'}`,
       },
-      async () => refreshModelsAndRebuildRoutes(),
+      async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
     );
 
     return reply.code(202).send({

@@ -44,17 +44,34 @@ describe('settings and auth events', () => {
     config.proxyToken = 'sk-old-proxy-token-123';
     config.systemProxyUrl = '';
     config.checkinCron = '0 8 * * *';
+    (config as any).checkinScheduleMode = 'cron';
+    (config as any).checkinIntervalHours = 6;
     config.balanceRefreshCron = '0 * * * *';
     config.logCleanupConfigured = false;
     config.logCleanupCron = '0 6 * * *';
     config.logCleanupUsageLogsEnabled = false;
     config.logCleanupProgramLogsEnabled = false;
     config.logCleanupRetentionDays = 30;
+    config.codexUpstreamWebsocketEnabled = false;
+    config.proxySessionChannelConcurrencyLimit = 2;
+    config.proxySessionChannelQueueWaitMs = 1500;
+    (config as any).proxyDebugTraceEnabled = false;
+    (config as any).proxyDebugCaptureHeaders = true;
+    (config as any).proxyDebugCaptureBodies = false;
+    (config as any).proxyDebugCaptureStreamChunks = false;
+    (config as any).proxyDebugTargetSessionId = '';
+    (config as any).proxyDebugTargetClientKind = '';
+    (config as any).proxyDebugTargetModel = '';
+    (config as any).proxyDebugRetentionHours = 24;
+    (config as any).proxyDebugMaxBodyBytes = 262144;
     config.routingFallbackUnitCost = 1;
+    (config as any).disableCrossProtocolFallback = false;
     (config as any).telegramEnabled = false;
     (config as any).telegramApiBaseUrl = 'https://api.telegram.org';
     (config as any).telegramBotToken = '';
     (config as any).telegramChatId = '';
+    (config as any).telegramUseSystemProxy = false;
+    (config as any).telegramMessageThreadId = '';
   });
 
   afterAll(async () => {
@@ -85,6 +102,121 @@ describe('settings and auth events', () => {
     expect(events[0].message || '').toContain('签到 Cron');
   });
 
+  it('persists and returns checkin interval mode from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        checkinScheduleMode: 'interval',
+        checkinIntervalHours: 8,
+        checkinCron: '0 8 * * *',
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as { checkinScheduleMode?: string; checkinIntervalHours?: number };
+    expect(updated.checkinScheduleMode).toBe('interval');
+    expect(updated.checkinIntervalHours).toBe(8);
+
+    const savedMode = await db.select().from(schema.settings).where(eq(schema.settings.key, 'checkin_schedule_mode')).get();
+    const savedInterval = await db.select().from(schema.settings).where(eq(schema.settings.key, 'checkin_interval_hours')).get();
+    expect(savedMode?.value).toBe(JSON.stringify('interval'));
+    expect(savedInterval?.value).toBe(JSON.stringify(8));
+  });
+
+  it('persists codex upstream websocket and session lease settings from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        codexUpstreamWebsocketEnabled: true,
+        proxySessionChannelConcurrencyLimit: 6,
+        proxySessionChannelQueueWaitMs: 4200,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as {
+      codexUpstreamWebsocketEnabled?: boolean;
+      proxySessionChannelConcurrencyLimit?: number;
+      proxySessionChannelQueueWaitMs?: number;
+    };
+    expect(updated.codexUpstreamWebsocketEnabled).toBe(true);
+    expect(updated.proxySessionChannelConcurrencyLimit).toBe(6);
+    expect(updated.proxySessionChannelQueueWaitMs).toBe(4200);
+    expect(config.codexUpstreamWebsocketEnabled).toBe(true);
+    expect(config.proxySessionChannelConcurrencyLimit).toBe(6);
+    expect(config.proxySessionChannelQueueWaitMs).toBe(4200);
+
+    const savedWebsocket = await db.select().from(schema.settings).where(eq(schema.settings.key, 'codex_upstream_websocket_enabled')).get();
+    const savedConcurrency = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_session_channel_concurrency_limit')).get();
+    const savedQueueWait = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_session_channel_queue_wait_ms')).get();
+    expect(savedWebsocket?.value).toBe(JSON.stringify(true));
+    expect(savedConcurrency?.value).toBe(JSON.stringify(6));
+    expect(savedQueueWait?.value).toBe(JSON.stringify(4200));
+  });
+
+  it('persists proxy debug runtime settings from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        proxyDebugTraceEnabled: true,
+        proxyDebugCaptureHeaders: true,
+        proxyDebugCaptureBodies: true,
+        proxyDebugCaptureStreamChunks: true,
+        proxyDebugTargetSessionId: 'sess-debug-1',
+        proxyDebugTargetClientKind: 'codex',
+        proxyDebugTargetModel: 'gpt-4o',
+        proxyDebugRetentionHours: 12,
+        proxyDebugMaxBodyBytes: 131072,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as {
+      proxyDebugTraceEnabled?: boolean;
+      proxyDebugCaptureHeaders?: boolean;
+      proxyDebugCaptureBodies?: boolean;
+      proxyDebugCaptureStreamChunks?: boolean;
+      proxyDebugTargetSessionId?: string;
+      proxyDebugTargetClientKind?: string;
+      proxyDebugTargetModel?: string;
+      proxyDebugRetentionHours?: number;
+      proxyDebugMaxBodyBytes?: number;
+    };
+    expect(updated).toMatchObject({
+      proxyDebugTraceEnabled: true,
+      proxyDebugCaptureHeaders: true,
+      proxyDebugCaptureBodies: true,
+      proxyDebugCaptureStreamChunks: true,
+      proxyDebugTargetSessionId: 'sess-debug-1',
+      proxyDebugTargetClientKind: 'codex',
+      proxyDebugTargetModel: 'gpt-4o',
+      proxyDebugRetentionHours: 12,
+      proxyDebugMaxBodyBytes: 131072,
+    });
+
+    const savedEnabled = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_trace_enabled')).get();
+    const savedHeaders = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_capture_headers')).get();
+    const savedBodies = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_capture_bodies')).get();
+    const savedStreamChunks = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_capture_stream_chunks')).get();
+    const savedTargetSessionId = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_target_session_id')).get();
+    const savedTargetClientKind = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_target_client_kind')).get();
+    const savedTargetModel = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_target_model')).get();
+    const savedRetentionHours = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_retention_hours')).get();
+    const savedMaxBodyBytes = await db.select().from(schema.settings).where(eq(schema.settings.key, 'proxy_debug_max_body_bytes')).get();
+    expect(savedEnabled?.value).toBe(JSON.stringify(true));
+    expect(savedHeaders?.value).toBe(JSON.stringify(true));
+    expect(savedBodies?.value).toBe(JSON.stringify(true));
+    expect(savedStreamChunks?.value).toBe(JSON.stringify(true));
+    expect(savedTargetSessionId?.value).toBe(JSON.stringify('sess-debug-1'));
+    expect(savedTargetClientKind?.value).toBe(JSON.stringify('codex'));
+    expect(savedTargetModel?.value).toBe(JSON.stringify('gpt-4o'));
+    expect(savedRetentionHours?.value).toBe(JSON.stringify(12));
+    expect(savedMaxBodyBytes?.value).toBe(JSON.stringify(131072));
+  });
+
   it('returns current recognized admin IP in runtime settings response', async () => {
     const response = await app.inject({
       method: 'GET',
@@ -96,8 +228,10 @@ describe('settings and auth events', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    const body = response.json() as { currentAdminIp?: string };
+    const body = response.json() as { currentAdminIp?: string; serverTimeZone?: string };
     expect(body.currentAdminIp).toBe('203.0.113.5');
+    expect(typeof body.serverTimeZone).toBe('string');
+    expect((body.serverTimeZone || '').length).toBeGreaterThan(0);
   });
 
   it('rejects proxy token that does not start with sk-', async () => {
@@ -142,6 +276,21 @@ describe('settings and auth events', () => {
     expect(response.statusCode).toBe(400);
     const body = response.json() as { message?: string };
     expect(body.message).toContain('Webhook URL');
+  });
+
+  it('rejects non-boolean webhookEnabled payloads instead of coercing them', async () => {
+    (config as any).webhookEnabled = false;
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        webhookEnabled: 'false',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { message?: string }).message).toContain('Webhook 开关');
+    expect(config.webhookEnabled).toBe(false);
   });
 
   it('rejects telegram config when bot token is missing but telegram is enabled', async () => {
@@ -202,6 +351,32 @@ describe('settings and auth events', () => {
     expect(runtime.telegramApiBaseUrl).toBe('https://tg-proxy.example.com/custom');
   });
 
+  it('persists and returns telegram message thread id from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        telegramMessageThreadId: '77',
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as { telegramMessageThreadId?: string };
+    expect(updated.telegramMessageThreadId).toBe('77');
+    expect((config as any).telegramMessageThreadId).toBe('77');
+
+    const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'telegram_message_thread_id')).get();
+    expect(saved?.value).toBe(JSON.stringify('77'));
+
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: '/api/settings/runtime',
+    });
+    expect(getResponse.statusCode).toBe(200);
+    const runtime = getResponse.json() as { telegramMessageThreadId?: string };
+    expect(runtime.telegramMessageThreadId).toBe('77');
+  });
+
   it('rejects invalid telegram api base url when telegram is enabled', async () => {
     const response = await app.inject({
       method: 'PUT',
@@ -217,6 +392,46 @@ describe('settings and auth events', () => {
     expect(response.statusCode).toBe(400);
     const body = response.json() as { message?: string };
     expect(body.message).toContain('Telegram API Base URL');
+  });
+
+  it('persists and returns telegram use system proxy from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        telegramUseSystemProxy: true,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as { telegramUseSystemProxy?: boolean };
+    expect(updated.telegramUseSystemProxy).toBe(true);
+    expect((config as any).telegramUseSystemProxy).toBe(true);
+
+    const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'telegram_use_system_proxy')).get();
+    expect(saved?.value).toBe(JSON.stringify(true));
+
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: '/api/settings/runtime',
+    });
+    expect(getResponse.statusCode).toBe(200);
+    const runtime = getResponse.json() as { telegramUseSystemProxy?: boolean };
+    expect(runtime.telegramUseSystemProxy).toBe(true);
+  });
+
+  it('rejects non-boolean telegram use system proxy payloads instead of coercing them', async () => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        telegramUseSystemProxy: 'false',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { message?: string }).message).toContain('Telegram 使用系统代理');
+    expect((config as any).telegramUseSystemProxy).toBe(false);
   });
 
   it('persists and returns routing fallback unit cost from runtime settings', async () => {
@@ -246,6 +461,33 @@ describe('settings and auth events', () => {
     expect(runtime.routingFallbackUnitCost).toBe(0.25);
   });
 
+  it('persists and returns disable cross protocol fallback from runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        disableCrossProtocolFallback: true,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as { disableCrossProtocolFallback?: boolean };
+    expect(updated.disableCrossProtocolFallback).toBe(true);
+    expect((config as any).disableCrossProtocolFallback).toBe(true);
+
+    const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'disable_cross_protocol_fallback')).get();
+    expect(saved?.value).toBe(JSON.stringify(true));
+
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: '/api/settings/runtime',
+    });
+
+    expect(getResponse.statusCode).toBe(200);
+    const runtime = getResponse.json() as { disableCrossProtocolFallback?: boolean };
+    expect(runtime.disableCrossProtocolFallback).toBe(true);
+  });
+
   it('persists and returns system proxy url from runtime settings', async () => {
     const updateResponse = await app.inject({
       method: 'PUT',
@@ -271,6 +513,60 @@ describe('settings and auth events', () => {
     expect(getResponse.statusCode).toBe(200);
     const runtime = getResponse.json() as { systemProxyUrl?: string };
     expect(runtime.systemProxyUrl).toBe('http://127.0.0.1:7890');
+  });
+
+  it('splits proxy error keywords on newlines and commas when saving runtime settings', async () => {
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        proxyErrorKeywords: 'quota exceeded\nbad gateway,too many requests',
+        proxyEmptyContentFailEnabled: true,
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    const updated = updateResponse.json() as {
+      proxyErrorKeywords?: string[];
+      proxyEmptyContentFailEnabled?: boolean;
+    };
+    expect(updated.proxyErrorKeywords).toEqual([
+      'quota exceeded',
+      'bad gateway',
+      'too many requests',
+    ]);
+    expect(updated.proxyEmptyContentFailEnabled).toBe(true);
+    expect(config.proxyErrorKeywords).toEqual([
+      'quota exceeded',
+      'bad gateway',
+      'too many requests',
+    ]);
+    expect(config.proxyEmptyContentFailEnabled).toBe(true);
+
+    const rows = await db.select().from(schema.settings).all();
+    const settingsMap = new Map(rows.map((row) => [row.key, row.value]));
+    expect(settingsMap.get('proxy_error_keywords')).toBe(JSON.stringify([
+      'quota exceeded',
+      'bad gateway',
+      'too many requests',
+    ]));
+    expect(settingsMap.get('proxy_empty_content_fail_enabled')).toBe(JSON.stringify(true));
+
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: '/api/settings/runtime',
+    });
+    expect(getResponse.statusCode).toBe(200);
+    const runtime = getResponse.json() as {
+      proxyErrorKeywords?: string[];
+      proxyEmptyContentFailEnabled?: boolean;
+    };
+    expect(runtime.proxyErrorKeywords).toEqual([
+      'quota exceeded',
+      'bad gateway',
+      'too many requests',
+    ]);
+    expect(runtime.proxyEmptyContentFailEnabled).toBe(true);
   });
 
   it('persists and returns log cleanup settings from runtime settings', async () => {

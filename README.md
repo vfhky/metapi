@@ -11,11 +11,20 @@
 </p>
 
 <p align="center">
+  <a href="https://linux.do/t/topic/1671489" alt="LINUX DO">
+    <img src="https://shorturl.at/ggSqS" alt="LINUX DO">
+  </a>
+</p>
+
+<p align="center">
 <a href="https://github.com/cita-777/metapi/releases">
   <img alt="GitHub Release" src="https://img.shields.io/github/v/release/cita-777/metapi?label=Release&logo=github&style=flat">
 </a><!--
 --><a href="https://github.com/cita-777/metapi/stargazers">
   <img alt="GitHub Stars" src="https://img.shields.io/github/stars/cita-777/metapi?style=flat&logo=github&label=Stars">
+</a><!--
+--><a href="https://deepwiki.com/cita-777/metapi">
+  <img alt="Ask DeepWiki" src="https://deepwiki.com/badge.svg">
 </a><!--
 --><a href="https://hub.docker.com/r/1467078763/metapi">
   <img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/1467078763/metapi?style=flat&logo=docker&label=Docker%20Pulls">
@@ -26,7 +35,7 @@
 --><a href="LICENSE">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-brightgreen?style=flat">
 </a><!--
---><img alt="Node.js" src="https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&style=flat"><!--
+--><img alt="Node.js" src="https://img.shields.io/badge/Node.js-22.15%2B-339933?logo=node.js&style=flat"><!--
 --><img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&style=flat"><!--
 --><a href="https://zeabur.com/templates/DOX5PR">
   <img alt="Deploy on Zeabur" src="https://zeabur.com/button.svg" height="28">
@@ -279,7 +288,7 @@
 ### 📦 轻量部署
 
 - **单 Docker 容器**，默认本地数据目录部署，支持外接 MySQL / PostgreSQL 运行时数据库
-- Alpine 基础镜像，体积精简
+- Docker 镜像支持 `amd64`、`arm64` 和 `armv7l`（`linux/arm/v7`）服务端部署
 - 数据完整导入导出，迁移无忧
 
 ---
@@ -343,6 +352,11 @@ docker run -d --name metapi \
 
 启动后访问 `http://localhost:4000`，用 `AUTH_TOKEN` 登录即可。
 
+> [!NOTE]
+> Docker 镜像支持 `amd64`、`arm64` 和 `armv7l`（`linux/arm/v7`）服务端部署。
+> 当前 `armv7l` 支持范围仅限服务端 / Docker 运行，不包含桌面安装包。
+
+<!-- markdownlint-disable-next-line MD028 -->
 > [!IMPORTANT]
 > 请务必修改 `AUTH_TOKEN` 和 `PROXY_TOKEN`，不要使用默认值。数据存储在 `./data` 目录，升级不会丢失。
 
@@ -369,7 +383,7 @@ Docker Compose、桌面安装包、反向代理、升级与数据库选项等详
 | **数据库**     | SQLite / MySQL / PostgreSQL +[Drizzle ORM](https://orm.drizzle.team) |
 | **数据可视化** | [VChart](https://visactor.io/vchart) (@visactor/react-vchart)        |
 | **定时任务**   | [node-cron](https://github.com/node-cron/node-cron)                  |
-| **容器化**     | Docker (Alpine) + Docker Compose                                  |
+| **容器化**     | Docker (Debian slim) + Docker Compose                             |
 | **测试**       | [Vitest](https://vitest.dev)                                         |
 
 ---

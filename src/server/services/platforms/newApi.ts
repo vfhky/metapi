@@ -1,7 +1,8 @@
-import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, UserInfo, TokenVerifyResult, CreateApiTokenOptions } from './base.js';
+import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, UserInfo, TokenVerifyResult, CreateApiTokenOptions, type SiteAnnouncement } from './base.js';
 import type { RequestInit as UndiciRequestInit } from 'undici';
 import { createContext, runInContext } from 'node:vm';
 import { withSiteProxyRequestInit } from '../siteProxy.js';
+import { fetchJsonWithShieldCookieRetry } from './newApiShield.js';
 
 export class NewApiAdapter extends BasePlatformAdapter {
   readonly platformName: string = 'new-api';
@@ -12,6 +13,26 @@ export class NewApiAdapter extends BasePlatformAdapter {
       return res?.success === true && typeof res?.data?.system_name === 'string';
     } catch {
       return false;
+    }
+  }
+
+  override async getSiteAnnouncements(baseUrl: string, _accessToken: string): Promise<SiteAnnouncement[]> {
+    try {
+      const payload = await this.fetchJson<any>(`${baseUrl}/api/notice`);
+      const content = typeof payload?.data === 'string'
+        ? payload.data.trim()
+        : (typeof payload === 'string' ? payload.trim() : '');
+      if (!content) return [];
+      return [{
+        sourceKey: this.buildNoticeSourceKey(content),
+        title: 'Site notice',
+        content,
+        level: 'info',
+        sourceUrl: '/api/notice',
+        rawPayload: payload,
+      }];
+    } catch {
+      return [];
     }
   }
 
@@ -608,6 +629,72 @@ export class NewApiAdapter extends BasePlatformAdapter {
     );
   }
 
+  private isMissingCheckinEndpointMessage(message?: string | null): boolean {
+    if (!message) return false;
+    const text = message.toLowerCase();
+    return (
+      text.includes('invalid url (post /api/user/checkin)') ||
+      (text.includes('http 404') && text.includes('/api/user/checkin')) ||
+      text.includes('checkin endpoint not found') ||
+      text.includes('check-in is not supported') ||
+      text.includes('checkin is not supported') ||
+      text.includes('does not support checkin') ||
+      text.includes('not support checkin')
+    );
+  }
+
+  private isCookieSessionFailureMessage(message?: string | null): boolean {
+    if (!message) return false;
+    const text = message.toLowerCase();
+    return (
+      text.includes('access token') ||
+      text.includes('unauthorized') ||
+      text.includes('forbidden') ||
+      text.includes('new-api-user') ||
+      text.includes('user id') ||
+      text.includes('invalid token') ||
+      text.includes('expired') ||
+      text.includes('无权') ||
+      text.includes('未登录') ||
+      text.includes('未提供') ||
+      text.includes('未授权') ||
+      text.includes('not login') ||
+      text.includes('not logged')
+    );
+  }
+
+  private async detectCookieSessionFailureMessage(
+    baseUrl: string,
+    accessToken: string,
+    candidateUserIds: Array<number | null | undefined>,
+  ): Promise<string | null> {
+    let failureMessage: string | null = null;
+    const rememberFailure = (message: string) => {
+      if (failureMessage) return;
+      const text = message.trim();
+      if (!this.isCookieSessionFailureMessage(text)) return;
+      failureMessage = text;
+    };
+
+    const uniqueCandidateUserIds = Array.from(new Set(
+      candidateUserIds.filter((value): value is number => typeof value === 'number' && value > 0),
+    ));
+
+    if (uniqueCandidateUserIds.length === 0) {
+      await this.fetchUserSelfByCookie(baseUrl, accessToken, undefined, rememberFailure);
+      return failureMessage;
+    }
+
+    for (const userId of uniqueCandidateUserIds) {
+      await this.fetchUserSelfByCookie(baseUrl, accessToken, userId, rememberFailure);
+      if (failureMessage) {
+        return failureMessage;
+      }
+    }
+
+    return failureMessage;
+  }
+
   private async fetchJsonRawWithCookie<T>(
     url: string,
     options?: UndiciRequestInit,
@@ -741,12 +828,39 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return [];
   }
 
+  private extractOpenAiModels(payload: any): string[] {
+    if (!Array.isArray(payload?.data)) return [];
+    return payload.data.map((m: any) => m?.id).filter(Boolean);
+  }
+
+  private async getOpenAiModelsViaShieldCookie(baseUrl: string, token: string): Promise<string[]> {
+    for (const cookie of this.buildCookieCandidates(token)) {
+      try {
+        const { data } = await fetchJsonWithShieldCookieRetry<any>(`${baseUrl}/v1/models`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Cookie: cookie,
+          },
+        });
+        const models = this.extractOpenAiModels(data);
+        if (models.length > 0) return models;
+      } catch {}
+    }
+    return [];
+  }
+
   private async getOpenAiModels(baseUrl: string, token: string): Promise<string[]> {
+    const shouldTryShieldCookie = this.platformName === 'anyrouter' || token.includes('=');
+    if (shouldTryShieldCookie) {
+      const shieldModels = await this.getOpenAiModelsViaShieldCookie(baseUrl, token);
+      if (shieldModels.length > 0) return shieldModels;
+    }
+
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/v1/models`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return (res?.data || []).map((m: any) => m.id).filter(Boolean);
+      return this.extractOpenAiModels(res);
     } catch {
       return [];
     }
@@ -1028,6 +1142,17 @@ export class NewApiAdapter extends BasePlatformAdapter {
     if (alternateCookieUserId) {
       const retriedCookieResult = await tryCookieCheckin(alternateCookieUserId);
       if (retriedCookieResult) return retriedCookieResult;
+    }
+
+    if (this.isMissingCheckinEndpointMessage(firstFailureMessage)) {
+      const cookieSessionFailureMessage = await this.detectCookieSessionFailureMessage(
+        baseUrl,
+        accessToken,
+        [resolvedUserId, alternateCookieUserId],
+      );
+      if (cookieSessionFailureMessage) {
+        return { success: false, message: cookieSessionFailureMessage };
+      }
     }
 
     return { success: false, message: firstFailureMessage || 'checkin failed' };

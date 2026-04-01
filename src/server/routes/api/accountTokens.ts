@@ -4,7 +4,6 @@ import { db, schema } from '../../db/index.js';
 import {
   ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING,
   ACCOUNT_TOKEN_VALUE_STATUS_READY,
-  ensureDefaultTokenForAccount,
   isMaskedPendingAccountToken,
   isMaskedTokenValue,
   isUsableAccountToken,
@@ -14,16 +13,23 @@ import {
   repairDefaultToken,
   resolveAccountTokenValueStatus,
   setDefaultToken,
-  syncTokensFromUpstream,
 } from '../../services/accountTokenService.js';
 import { getAdapter } from '../../services/platforms/index.js';
-import { getCredentialModeFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
+import { getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
 import { startBackgroundTask } from '../../services/backgroundTaskService.js';
+import { withAccountProxyOverride } from '../../services/siteProxy.js';
+import { type ModelRefreshResult } from '../../services/modelService.js';
 import {
-  rebuildTokenRoutesFromAvailability,
-  refreshModelsForAccount,
-  type ModelRefreshResult,
-} from '../../services/modelService.js';
+  type CoverageBatchRebuildResult,
+  convergeAccountMutation,
+  refreshAccountCoverageBatch,
+} from '../../services/accountMutationWorkflow.js';
+import {
+  parseAccountTokenBatchPayload,
+  parseAccountTokenCreatePayload,
+  parseAccountTokenSyncAllPayload,
+  parseAccountTokenUpdatePayload,
+} from '../../contracts/accountTokensRoutePayloads.js';
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -64,9 +70,7 @@ type CoverageRefreshFailureItem = {
 };
 
 type CoverageRefreshItem = ModelRefreshResult | CoverageRefreshFailureItem;
-type CoverageRefreshRebuildResult =
-  | { success: true; result: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>> }
-  | { success: false; error: string };
+type CoverageRefreshRebuildResult = CoverageBatchRebuildResult;
 
 const TOKEN_SYNC_TIMEOUT_MS = 15_000;
 const SYNC_ALL_BATCH_SIZE = 3;
@@ -230,7 +234,38 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
 
   if (!row.accounts.accessToken) {
     if (row.accounts.apiToken) {
-      ensureDefaultTokenForAccount(accountId, row.accounts.apiToken, { name: 'default', source: 'legacy' });
+      try {
+        const convergence = await convergeAccountMutation({
+          accountId,
+          preferredApiToken: row.accounts.apiToken,
+          defaultTokenSource: 'legacy',
+        });
+        if (convergence.defaultTokenId != null) {
+          return {
+            ...base,
+            status: 'synced',
+            reason: 'legacy_default_token_restored',
+            message: 'restored local default token from legacy api token',
+            synced: true,
+            created: 0,
+            updated: 0,
+            total: 0,
+            defaultTokenId: convergence.defaultTokenId,
+          };
+        }
+      } catch (error: any) {
+        return {
+          ...base,
+          status: 'failed',
+          reason: 'sync_error',
+          message: error?.message || 'sync failed',
+          synced: false,
+          created: 0,
+          updated: 0,
+          total: 0,
+          defaultTokenId: null,
+        };
+      }
     }
     return {
       ...base,
@@ -261,15 +296,18 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
 
   try {
     const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
+    const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
     let tokens = await withTimeout(
-      () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId),
+      () => withAccountProxyOverride(accountProxyUrl,
+        () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
       TOKEN_SYNC_TIMEOUT_MS,
       `token sync timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
     );
 
     if (tokens.length === 0) {
       const fallback = await withTimeout(
-        () => adapter.getApiToken(row.sites.url, row.accounts.accessToken, platformUserId),
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => adapter.getApiToken(row.sites.url, row.accounts.accessToken, platformUserId)),
         TOKEN_SYNC_TIMEOUT_MS,
         `token sync timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
       );
@@ -292,7 +330,11 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
       };
     }
 
-    const synced = await syncTokensFromUpstream(accountId, tokens);
+    const convergence = await convergeAccountMutation({
+      accountId,
+      upstreamTokens: tokens,
+    });
+    const synced = convergence.tokenSync!;
     if ((synced.maskedPending || 0) > 0) {
       return {
         ...base,
@@ -386,49 +428,26 @@ async function executeSyncAllAccountTokens() {
 }
 
 async function refreshCoverageForAccounts(accountIds: number[]) {
-  const uniqueAccountIds = Array.from(new Set(
-    accountIds.filter((id) => Number.isFinite(id) && id > 0),
-  ));
+  const result = await refreshAccountCoverageBatch({
+    accountIds,
+    batchSize: SYNC_ALL_BATCH_SIZE,
+    mapFailure: buildCoverageRefreshFailureItem,
+  });
 
-  if (uniqueAccountIds.length === 0) {
-    return { refresh: [], rebuild: null };
+  result.refresh.forEach((item) => {
+    if ((item as CoverageRefreshFailureItem).reason === 'coverage_refresh_failed') {
+      const failed = item as CoverageRefreshFailureItem;
+      console.warn(`[account-tokens] coverage refresh failed for account ${failed.accountId}: ${failed.errorMessage}`);
+    }
+  });
+  if (result.rebuild && !result.rebuild.success) {
+    console.warn(`[account-tokens] token route rebuild failed after coverage refresh: ${result.rebuild.error}`);
   }
 
-  const refresh: CoverageRefreshItem[] = [];
-  for (let offset = 0; offset < uniqueAccountIds.length; offset += SYNC_ALL_BATCH_SIZE) {
-    const batch = uniqueAccountIds.slice(offset, offset + SYNC_ALL_BATCH_SIZE);
-    const settled = await Promise.allSettled(
-      batch.map(async (accountId) => refreshModelsForAccount(accountId)),
-    );
-    settled.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        refresh.push(result.value);
-        return;
-      }
-
-      const accountId = batch[index] || 0;
-      const errorMessage = result.reason instanceof Error ? result.reason.message : String(result.reason || 'coverage refresh failed');
-      refresh.push(buildCoverageRefreshFailureItem(accountId, errorMessage));
-      console.warn(`[account-tokens] coverage refresh failed for account ${accountId}: ${errorMessage}`);
-    });
-  }
-
-  let rebuild: CoverageRefreshRebuildResult | null = null;
-  try {
-    rebuild = {
-      success: true,
-      result: await rebuildTokenRoutesFromAvailability(),
-    };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error || 'route rebuild failed');
-    rebuild = {
-      success: false,
-      error: errorMessage,
-    };
-    console.warn(`[account-tokens] token route rebuild failed after coverage refresh: ${errorMessage}`);
-  }
-
-  return { refresh, rebuild };
+  return {
+    refresh: result.refresh as CoverageRefreshItem[],
+    rebuild: result.rebuild as CoverageRefreshRebuildResult | null,
+  };
 }
 
 function buildCoverageRefreshFailureItem(
@@ -456,22 +475,13 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     return listTokensWithRelations(Number.isFinite(accountId as number) ? accountId : undefined);
   });
 
-  app.post<{ Body: {
-    accountId: number;
-    name?: string;
-    token?: string;
-    enabled?: boolean;
-    isDefault?: boolean;
-    source?: string;
-    group?: string;
-    unlimitedQuota?: boolean | string;
-    remainQuota?: number | string;
-    expiredTime?: number | string;
-    allowIps?: string;
-    modelLimitsEnabled?: boolean | string;
-    modelLimits?: string;
-  } }>('/api/account-tokens', async (request, reply) => {
-    const body = request.body;
+  app.post<{ Body: unknown }>('/api/account-tokens', async (request, reply) => {
+    const parsedBody = parseAccountTokenCreatePayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    const body = parsedBody.data;
     const row = await db.select()
       .from(schema.accounts)
       .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
@@ -517,7 +527,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       if (createdId <= 0) {
         return reply.code(500).send({ success: false, message: '创建令牌失败' });
       }
-      const created = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, createdId)).get();
+      let created = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, createdId)).get();
       if (!created) {
         return reply.code(500).send({ success: false, message: '创建令牌失败' });
       }
@@ -528,6 +538,10 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         await setDefaultToken(created.id);
       }
       const coverageRefresh = await refreshCoverageForAccounts([body.accountId]);
+      created = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, created.id)).get();
+      if (!created) {
+        return reply.code(500).send({ success: false, message: '创建令牌失败' });
+      }
       return { success: true, token: created, coverageRefresh };
     }
 
@@ -579,20 +593,23 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
 
     const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
-    const createdViaUpstream = await adapter.createApiToken(
-      site.url,
-      account.accessToken,
-      platformUserId,
-      {
-        name: asTrimmedString(body.name),
-        group: asTrimmedString(body.group),
-        unlimitedQuota,
-        remainQuota,
-        expiredTime,
-        allowIps: asTrimmedString(body.allowIps),
-        modelLimitsEnabled,
-        modelLimits: asTrimmedString(body.modelLimits),
-      },
+    const createdViaUpstream = await withAccountProxyOverride(
+      getProxyUrlFromExtraConfig(account.extraConfig),
+      () => adapter.createApiToken(
+        site.url,
+        account.accessToken,
+        platformUserId,
+        {
+          name: asTrimmedString(body.name),
+          group: asTrimmedString(body.group),
+          unlimitedQuota,
+          remainQuota,
+          expiredTime,
+          allowIps: asTrimmedString(body.allowIps),
+          modelLimitsEnabled,
+          modelLimits: asTrimmedString(body.modelLimits),
+        },
+      ),
     );
     if (!createdViaUpstream) {
       return reply.code(502).send({ success: false, message: '站点创建令牌失败' });
@@ -652,11 +669,14 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     if (shouldDeleteUpstream) {
       const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
-      const upstreamDeleted = await adapter!.deleteApiToken(
-        site.url,
-        account.accessToken,
-        existing.token,
-        platformUserId,
+      const upstreamDeleted = await withAccountProxyOverride(
+        getProxyUrlFromExtraConfig(account.extraConfig),
+        () => adapter!.deleteApiToken(
+          site.url,
+          account.accessToken,
+          existing.token,
+          platformUserId,
+        ),
       );
       if (!upstreamDeleted) {
         return { success: false, message: '站点删除令牌失败，本地未删除' };
@@ -671,9 +691,14 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     return { success: true };
   };
 
-  app.post<{ Body?: { ids?: number[]; action?: string } }>('/api/account-tokens/batch', async (request, reply) => {
-    const ids = normalizeBatchIds(request.body?.ids);
-    const action = String(request.body?.action || '').trim();
+  app.post<{ Body: unknown }>('/api/account-tokens/batch', async (request, reply) => {
+    const parsedBody = parseAccountTokenBatchPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ message: parsedBody.error });
+    }
+
+    const ids = normalizeBatchIds(parsedBody.data.ids);
+    const action = String(parsedBody.data.action || '').trim();
     if (ids.length === 0) {
       return reply.code(400).send({ message: 'ids is required' });
     }
@@ -738,7 +763,12 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     };
   });
 
-  app.put<{ Params: { id: string }; Body: { name?: string; token?: string; group?: string; enabled?: boolean; isDefault?: boolean; source?: string } }>('/api/account-tokens/:id', async (request, reply) => {
+  app.put<{ Params: { id: string }; Body: unknown }>('/api/account-tokens/:id', async (request, reply) => {
+    const parsedBody = parseAccountTokenUpdatePayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
     const tokenId = Number.parseInt(request.params.id, 10);
     if (Number.isNaN(tokenId)) {
       return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
@@ -757,7 +787,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: 'API Key 连接不支持管理账号令牌' });
     }
 
-    const body = request.body;
+    const body = parsedBody.data;
     const updates: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     let nextValueStatus = resolveAccountTokenValueStatus(existing);
 
@@ -792,19 +822,24 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     await db.update(schema.accountTokens).set(updates).where(eq(schema.accountTokens.id, tokenId)).run();
 
-    const latest = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).get();
+    let latest = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).get();
     if (!latest) {
       return reply.code(500).send({ success: false, message: '更新失败' });
     }
 
     if (body.isDefault === true && isUsableAccountToken(latest)) {
-      setDefaultToken(tokenId);
+      await setDefaultToken(tokenId);
     } else if (latest.isDefault && isUsableAccountToken(latest)) {
-      setDefaultToken(tokenId);
+      await setDefaultToken(tokenId);
     } else if (existing.isDefault && !isUsableAccountToken(latest)) {
-      repairDefaultToken(existing.accountId);
+      await repairDefaultToken(existing.accountId);
     } else if (body.isDefault === false && existing.isDefault) {
-      repairDefaultToken(existing.accountId);
+      await repairDefaultToken(existing.accountId);
+    }
+
+    latest = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).get();
+    if (!latest) {
+      return reply.code(500).send({ success: false, message: '更新失败' });
     }
 
     return { success: true, token: latest };
@@ -904,7 +939,10 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     try {
       const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
-      const groups = await adapter.getUserGroups(site.url, account.accessToken, platformUserId);
+      const groups = await withAccountProxyOverride(
+        getProxyUrlFromExtraConfig(account.extraConfig),
+        () => adapter.getUserGroups(site.url, account.accessToken, platformUserId),
+      );
       const normalized = Array.from(new Set((groups || []).map((item) => String(item || '').trim()).filter(Boolean)));
       return { success: true, groups: normalized.length > 0 ? normalized : ['default'] };
     } catch (error: any) {
@@ -960,8 +998,13 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     return { success: true, ...result, coverageRefresh };
   });
 
-  app.post<{ Body?: { wait?: boolean } }>('/api/account-tokens/sync-all', async (request, reply) => {
-    if (request.body?.wait) {
+  app.post<{ Body: unknown }>('/api/account-tokens/sync-all', async (request, reply) => {
+    const parsedBody = parseAccountTokenSyncAllPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    if (parsedBody.data.wait) {
       const syncResult = await executeSyncAllAccountTokens();
       return { success: true, ...syncResult };
     }

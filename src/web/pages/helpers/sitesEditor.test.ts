@@ -16,6 +16,7 @@ describe('buildSiteSaveAction', () => {
         url: 'https://a.example.com/',
         externalCheckinUrl: 'https://checkin.a.example.com',
         platform: 'new-api',
+        proxyUrl: 'socks5://127.0.0.1:1080',
         customHeaders: '{"x-site-token":"alpha"}',
         useSystemProxy: false,
         globalWeight: 1.2,
@@ -29,6 +30,7 @@ describe('buildSiteSaveAction', () => {
         url: 'https://a.example.com/',
         externalCheckinUrl: 'https://checkin.a.example.com',
         platform: 'new-api',
+        proxyUrl: 'socks5://127.0.0.1:1080',
         customHeaders: '{"x-site-token":"alpha"}',
         useSystemProxy: false,
         globalWeight: 1.2,
@@ -44,6 +46,7 @@ describe('buildSiteSaveAction', () => {
         url: 'https://b.example.com',
         externalCheckinUrl: '',
         platform: 'one-api',
+        proxyUrl: '',
         useSystemProxy: true,
         customHeaders: '',
         globalWeight: 0.8,
@@ -58,6 +61,7 @@ describe('buildSiteSaveAction', () => {
         url: 'https://b.example.com',
         externalCheckinUrl: '',
         platform: 'one-api',
+        proxyUrl: '',
         useSystemProxy: true,
         customHeaders: '',
         globalWeight: 0.8,
@@ -68,12 +72,13 @@ describe('buildSiteSaveAction', () => {
   it('throws when edit mode has no site id', () => {
     expect(() =>
       buildSiteSaveAction(
-        { mode: 'edit' },
+        { mode: 'edit' } as unknown as Parameters<typeof buildSiteSaveAction>[0],
         {
           name: 'site-c',
           url: 'https://c.example.com',
           externalCheckinUrl: '',
           platform: '',
+          proxyUrl: '',
           useSystemProxy: false,
           customHeaders: '',
           globalWeight: 1,
@@ -83,18 +88,24 @@ describe('buildSiteSaveAction', () => {
   });
 
   it('does not expose deprecated apiKey in site editor state', () => {
-    expect(emptySiteForm()).not.toHaveProperty('apiKey');
-    expect(emptySiteForm().customHeaders).toEqual([emptySiteCustomHeader()]);
-    expect(siteFormFromSite({
+    const legacySite = {
       name: 'site-d',
       url: 'https://d.example.com',
       externalCheckinUrl: null,
       platform: 'new-api',
-      proxyUrl: null,
+      proxyUrl: 'http://127.0.0.1:8080',
       customHeaders: '{"x-site-token":"alpha"}',
       globalWeight: 1,
       apiKey: 'sk-legacy-site-key',
-    })).not.toHaveProperty('apiKey');
+    } as unknown as Parameters<typeof siteFormFromSite>[0];
+
+    expect(emptySiteForm()).not.toHaveProperty('apiKey');
+    expect(emptySiteForm().customHeaders).toEqual([emptySiteCustomHeader()]);
+    expect(emptySiteForm().proxyUrl).toBe('');
+    expect(siteFormFromSite(legacySite)).not.toHaveProperty('apiKey');
+    expect(siteFormFromSite({
+      proxyUrl: 'http://127.0.0.1:8080',
+    }).proxyUrl).toBe('http://127.0.0.1:8080');
   });
 
   it('parses custom headers json into key value rows', () => {

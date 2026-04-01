@@ -32,6 +32,49 @@
 | `SYSTEM_PROXY_URL` | 系统代理 URL（留空表示不使用） | 空 |
 | `ACCOUNT_CREDENTIAL_SECRET` | 账号凭证加密密钥（用于加密存储的上游账号密码） | 默认使用 `AUTH_TOKEN` |
 
+## 更新中心与 Deploy Helper
+
+如果你现在只是一个普通 Docker / Docker Compose 部署，没有 K3s / Kubernetes、没有 Helm release、也没有 Deploy Helper，那么这一节可以先跳过。
+
+这一节只写给已经准备使用“K3s 更新中心”的用户。除了设置页里的运行时字段，还需要补齐主服务和 helper 的环境变量。
+
+如果你是老用户，正在从 Docker Compose 迁到 K3s / Helm，这一节可以提前看，先把迁移后的环境变量和组件关系理解清楚。
+
+### 主 Metapi 服务
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `DEPLOY_HELPER_TOKEN` | 主服务访问 Deploy Helper 的 Bearer Token | 空 |
+| `UPDATE_CENTER_HELPER_TOKEN` | `DEPLOY_HELPER_TOKEN` 的兼容别名，二选一即可 | 空 |
+
+> [!IMPORTANT]
+> 主 Metapi 和 Deploy Helper 必须使用同一个 token，否则更新中心可以显示页面但无法完成 helper 状态查询或部署。
+
+### Deploy Helper 服务
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `DEPLOY_HELPER_HOST` | helper 监听地址 | `0.0.0.0` |
+| `DEPLOY_HELPER_PORT` | helper 监听端口 | `9850` |
+| `DEPLOY_HELPER_TOKEN` | helper Bearer Token，必须和主服务一致 | 空 |
+
+### 设置页里的持久化字段
+
+更新中心页面本身还会把下面这些字段持久化到运行数据库：
+
+- `helperBaseUrl`
+- `namespace`
+- `releaseName`
+- `chartRef`
+- `imageRepository`
+- `githubReleasesEnabled`
+- `dockerHubTagsEnabled`
+- `defaultDeploySource`
+
+完整接入步骤见：
+
+- [K3s 更新中心](./k3s-update-center.md)
+
 ## 数据库配置
 
 | 变量名 | 说明 | 默认值 |
@@ -212,6 +255,24 @@ Metapi 的路由引擎按多因子加权选择最优通道。
 | 数据库运行配置 | `DB_TYPE`、`DB_URL`、`DB_SSL` | 保存后在下次 Metapi 后端启动时生效 |
 
 > `TOKEN_ROUTER_CACHE_TTL_MS`、`PROXY_LOG_RETENTION_DAYS`、`PROXY_LOG_RETENTION_PRUNE_INTERVAL_MINUTES` 当前仍属于部署级环境变量，不在后台运行时设置里单独维护。
+
+## 站点公告
+
+管理后台新增了「站点公告」页面，用于保存和浏览 Metapi 已同步到本地的上游公告记录。
+
+- 首次发现的上游公告会写入站内通知，并按现有通知渠道外发一次
+- 后续重复同步只更新本地公告记录，不会重复外发同一条公告
+- 当前支持的上游公告来源包括 `new-api`、`done-hub` 与 `sub2api`
+- 「清空公告」只删除 Metapi 本地保存的公告记录，不会修改上游站点数据
+
+## 更新提醒
+
+更新中心现在会在后台定时检查 GitHub Releases / Docker Hub 的可部署候选，并把结果保存为本地运行时状态。
+
+- 首次发现新的版本候选或新的 Docker digest 时，会写入站内通知，并按现有通知渠道外发一次
+- 相同候选后续重复检查只更新本地运行时状态，不会重复外发同一条提醒
+- 这类提醒不会自动触发部署，只是把用户带到「设置 → 更新中心」继续手动确认和执行
+- K3s 用户可以在收到提醒后直接去更新中心部署；Compose 用户也可以收到提醒，但仍按自己的升级方式处理
 
 ## 下一步
 

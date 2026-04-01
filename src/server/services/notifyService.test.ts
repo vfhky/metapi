@@ -17,12 +17,24 @@ vi.mock('undici', () => ({
   fetch: (...args: unknown[]) => fetchMock(...args),
 }));
 
+const withExplicitProxyRequestInitMock = vi.fn(
+  (_proxyUrl: unknown, options?: Record<string, unknown>) => {
+    if (_proxyUrl) return { ...(options || {}), dispatcher: 'mock-proxy-dispatcher' };
+    return options ?? {};
+  },
+);
+
+vi.mock('./siteProxy.js', () => ({
+  withExplicitProxyRequestInit: (...args: unknown[]) => withExplicitProxyRequestInitMock(...args),
+}));
+
 describe('notifyService', () => {
   beforeEach(async () => {
     vi.resetModules();
     sendMailMock.mockReset();
     createTransportMock.mockClear();
     fetchMock.mockReset();
+    withExplicitProxyRequestInitMock.mockClear();
 
     const { config } = await import('../config.js');
     config.notifyCooldownSec = 300;
@@ -35,6 +47,9 @@ describe('notifyService', () => {
     (config as any).telegramEnabled = false;
     (config as any).telegramBotToken = '';
     (config as any).telegramChatId = '';
+    (config as any).telegramUseSystemProxy = false;
+    config.systemProxyUrl = '';
+    (config as any).telegramMessageThreadId = '';
     config.smtpEnabled = true;
     config.smtpHost = 'smtp.example.com';
     config.smtpPort = 465;
@@ -167,11 +182,12 @@ describe('notifyService', () => {
     expect(payload?.text || '').toContain('UTC Time:');
   });
 
-  it('sends telegram message when telegram channel is enabled', async () => {
+  it('sends telegram message without topic when telegram thread id is empty', async () => {
     const { config } = await import('../config.js');
     (config as any).telegramEnabled = true;
     (config as any).telegramBotToken = '123456:telegram-token';
     (config as any).telegramChatId = '-1001234567890';
+    (config as any).telegramMessageThreadId = '';
     config.smtpEnabled = false;
 
     fetchMock.mockResolvedValue({
@@ -192,11 +208,33 @@ describe('notifyService', () => {
     );
 
     const rawBody = fetchMock.mock.calls[0]?.[1] as { body?: string };
-    const payload = JSON.parse(rawBody?.body || '{}') as { chat_id?: string; text?: string };
+    const payload = JSON.parse(rawBody?.body || '{}') as { chat_id?: string; text?: string; message_thread_id?: number };
     expect(payload.chat_id).toBe('-1001234567890');
+    expect(payload.message_thread_id).toBeUndefined();
     expect(payload.text || '').toContain('Level: warning');
     expect(payload.text || '').toContain('Local Time:');
     expect(payload.text || '').toContain('UTC Time:');
+  });
+
+  it('sends telegram topic id when telegram thread id is configured', async () => {
+    const { config } = await import('../config.js');
+    (config as any).telegramEnabled = true;
+    (config as any).telegramBotToken = '123456:telegram-token';
+    (config as any).telegramChatId = '-1001234567890';
+    (config as any).telegramMessageThreadId = '77';
+    config.smtpEnabled = false;
+
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+    });
+
+    const { sendNotification } = await import('./notifyService.js');
+    await sendNotification('测试通知', 'message', 'warning', { bypassThrottle: true, throwOnFailure: true });
+
+    const rawBody = fetchMock.mock.calls[0]?.[1] as { body?: string };
+    const payload = JSON.parse(rawBody?.body || '{}') as { message_thread_id?: number };
+    expect(payload.message_thread_id).toBe(77);
   });
 
   it('uses TELEGRAM_API_BASE_URL when configured', async () => {
@@ -221,5 +259,122 @@ describe('notifyService', () => {
         method: 'POST',
       }),
     );
+  });
+
+  it('applies system proxy dispatcher when telegramUseSystemProxy is enabled', async () => {
+    const { config } = await import('../config.js');
+    (config as any).telegramEnabled = true;
+    (config as any).telegramBotToken = '123456:telegram-token';
+    (config as any).telegramChatId = '-1001234567890';
+    (config as any).telegramUseSystemProxy = true;
+    config.systemProxyUrl = 'http://127.0.0.1:7890';
+    config.smtpEnabled = false;
+
+    fetchMock.mockResolvedValue({ ok: true, status: 200 });
+
+    const { sendNotification } = await import('./notifyService.js');
+    await sendNotification('测试通知', 'proxy-test', 'info', { bypassThrottle: true, throwOnFailure: true });
+
+    expect(withExplicitProxyRequestInitMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:7890',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/sendMessage'),
+      expect.objectContaining({ dispatcher: 'mock-proxy-dispatcher' }),
+    );
+  });
+
+  it('does not apply proxy dispatcher when telegramUseSystemProxy is disabled', async () => {
+    const { config } = await import('../config.js');
+    (config as any).telegramEnabled = true;
+    (config as any).telegramBotToken = '123456:telegram-token';
+    (config as any).telegramChatId = '-1001234567890';
+    (config as any).telegramUseSystemProxy = false;
+    config.systemProxyUrl = 'http://127.0.0.1:7890';
+    config.smtpEnabled = false;
+
+    fetchMock.mockResolvedValue({ ok: true, status: 200 });
+
+    const { sendNotification } = await import('./notifyService.js');
+    await sendNotification('测试通知', 'no-proxy-test', 'info', { bypassThrottle: true, throwOnFailure: true });
+
+    expect(withExplicitProxyRequestInitMock).toHaveBeenCalledWith(
+      null,
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const fetchOptions = fetchMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(fetchOptions.dispatcher).toBeUndefined();
+  });
+
+  it('sends feishu webhook payload with msg_type text format', async () => {
+    const { config } = await import('../config.js');
+    config.webhookEnabled = true;
+    config.webhookUrl = 'https://open.feishu.cn/open-apis/bot/v2/hook/demo-token';
+    config.smtpEnabled = false;
+
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ code: 0, msg: 'success' }),
+    });
+
+    const { sendNotification } = await import('./notifyService.js');
+    await sendNotification('测试通知', 'feishu message', 'info', { bypassThrottle: true, throwOnFailure: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = fetchMock.mock.calls[0] as [string, { body?: string }];
+    expect(call[0]).toContain('open.feishu.cn/open-apis/bot/v2/hook/');
+
+    const payload = JSON.parse(call[1]?.body || '{}') as { msg_type?: string; content?: { text?: string } };
+    expect(payload.msg_type).toBe('text');
+    expect(payload.content?.text || '').toContain('[metapi][INFO] 测试通知');
+    expect(payload.content?.text || '').toContain('feishu message');
+  });
+
+  it('fails when feishu webhook returns non-zero code', async () => {
+    const { config } = await import('../config.js');
+    config.webhookEnabled = true;
+    config.webhookUrl = 'https://open.feishu.cn/open-apis/bot/v2/hook/demo-token';
+    config.smtpEnabled = false;
+
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ code: 19001, msg: 'param invalid' }),
+    });
+
+    const { sendNotification } = await import('./notifyService.js');
+    await expect(
+      sendNotification('测试通知', 'message', 'info', {
+        bypassThrottle: true,
+        throwOnFailure: true,
+      }),
+    ).rejects.toThrow(/飞书|19001|param invalid/);
+  });
+
+  it('sends feishu webhook payload for larksuite.com domain', async () => {
+    const { config } = await import('../config.js');
+    config.webhookEnabled = true;
+    config.webhookUrl = 'https://open.larksuite.com/open-apis/bot/v2/hook/demo-token';
+    config.smtpEnabled = false;
+
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ code: 0, msg: 'success' }),
+    });
+
+    const { sendNotification } = await import('./notifyService.js');
+    await sendNotification('测试通知', 'lark message', 'warning', { bypassThrottle: true, throwOnFailure: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = fetchMock.mock.calls[0] as [string, { body?: string }];
+    expect(call[0]).toContain('open.larksuite.com/open-apis/bot/v2/hook/');
+
+    const payload = JSON.parse(call[1]?.body || '{}') as { msg_type?: string; content?: { text?: string } };
+    expect(payload.msg_type).toBe('text');
+    expect(payload.content?.text || '').toContain('[metapi][WARNING] 测试通知');
+    expect(payload.content?.text || '').toContain('lark message');
   });
 });

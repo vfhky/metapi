@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterRecentlyFailedCandidates, isChannelRecentlyFailed } from './tokenRouter.js';
+import { filterRecentlyFailedCandidates, isChannelRecentlyFailed, matchesModelPattern, parseRegexModelPattern } from './tokenRouter.js';
 
 type Candidate = {
   channel: {
@@ -10,6 +10,11 @@ type Candidate = {
 };
 
 describe('filterRecentlyFailedCandidates', () => {
+  it('rejects unsafe nested-quantifier regex route patterns', () => {
+    expect(parseRegexModelPattern('re:(?=claude)')).toBeNull();
+    expect(matchesModelPattern('claude-sonnet-4-6', 're:(?=claude)')).toBe(false);
+  });
+
   it('uses a short default recent-failure window', () => {
     const nowMs = Date.now();
     expect(isChannelRecentlyFailed({

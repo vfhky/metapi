@@ -79,7 +79,7 @@ describe('TokenRoutes routing strategy updates', () => {
   });
 
   it('keeps the optimistic routing strategy when refresh fails after a successful save', async () => {
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = create(
@@ -123,6 +123,55 @@ describe('TokenRoutes routing strategy updates', () => {
         && collectText(node).includes('轮询')
       ));
       expect(collectText(strategyTrigger)).toContain('轮询');
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('supports switching to stable_first and keeps the optimistic label when refresh fails', async () => {
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/routes']}>
+            <ToastProvider>
+              <TokenRoutes />
+            </ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const expandButton = root.root.find((node) => (
+        node.type === 'div'
+        && String(node.props.className || '').includes('route-card-collapsed')
+      ));
+      await act(async () => {
+        expandButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const stableFirstOption = root.root.find((node) => (
+        node.type === 'button'
+        && typeof node.props.className === 'string'
+        && node.props.className.includes('modern-select-option')
+        && collectText(node).includes('稳定优先')
+      ));
+
+      await act(async () => {
+        stableFirstOption.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.updateRoute).toHaveBeenCalledWith(1, { routingStrategy: 'stable_first' });
+
+      const strategyTrigger = root.root.find((node) => (
+        node.type === 'button'
+        && typeof node.props.className === 'string'
+        && node.props.className.includes('modern-select-trigger')
+        && collectText(node).includes('稳定优先')
+      ));
+      expect(collectText(strategyTrigger)).toContain('稳定优先');
     } finally {
       root?.unmount();
     }

@@ -29,6 +29,14 @@ function safeJsonStringify(value: unknown): string {
   }
 }
 
+function cloneJsonValue<T>(value: T): T | undefined {
+  try {
+    return JSON.parse(JSON.stringify(value)) as T;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseJsonString(raw: string): unknown {
   const trimmed = raw.trim();
   if (!trimmed) return {};
@@ -187,12 +195,56 @@ function normalizeTextCandidate(value: unknown): string {
   return asTrimmedString(value.text ?? value.content ?? value.output_text);
 }
 
-function normalizeToolMessageContent(raw: unknown): string {
+function ensureAnthropicToolChoiceRecord(value: unknown): Record<string, unknown> | undefined {
+  if (isRecord(value)) return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return undefined;
+    return { type: normalized };
+  }
+  return undefined;
+}
+
+function sanitizeToolReferenceBlock(item: Record<string, unknown>): Record<string, unknown> | null {
+  const toolName = asTrimmedString(item.tool_name ?? item.toolName ?? item.name);
+  if (!toolName) return null;
+  const next: Record<string, unknown> = {
+    ...item,
+    type: 'tool_reference',
+    tool_name: toolName,
+  };
+  delete next.toolName;
+  if ('name' in next) delete next.name;
+  return next;
+}
+
+function normalizeToolMessageContent(raw: unknown): string | Array<Record<string, unknown>> {
   if (raw === undefined || raw === null) return '';
   if (typeof raw === 'string') return raw;
   if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw);
 
   if (Array.isArray(raw)) {
+    const structuredBlocks = raw
+      .map((item) => {
+        if (typeof item === 'string') return toAnthropicTextBlock(item);
+        if (!isRecord(item)) return null;
+        const type = asTrimmedString(item.type).toLowerCase();
+        if (type === 'tool_reference') return sanitizeToolReferenceBlock(item);
+        if (type === 'text' || type === 'input_text' || type === 'output_text') {
+          return toAnthropicTextBlock(normalizeTextCandidate(item));
+        }
+        if (type === 'image_url' || type === 'input_image') {
+          return toAnthropicImageBlock(item);
+        }
+        if (type === 'file' || type === 'input_file') {
+          const fileBlock = normalizeInputFileBlock(item);
+          return fileBlock ? toAnthropicDocumentBlock(fileBlock) : null;
+        }
+        return null;
+      })
+      .filter((item): item is Record<string, unknown> => item !== null);
+    if (structuredBlocks.length > 0) return structuredBlocks;
+
     const textParts = raw
       .map((item) => {
         if (typeof item === 'string') return item;
@@ -205,6 +257,17 @@ function normalizeToolMessageContent(raw: unknown): string {
   }
 
   if (isRecord(raw)) {
+    const type = asTrimmedString(raw.type).toLowerCase();
+    if (type === 'image_url' || type === 'input_image') {
+      const imageBlock = toAnthropicImageBlock(raw);
+      return imageBlock ? [imageBlock] : '';
+    }
+    if (type === 'file' || type === 'input_file') {
+      const fileBlock = normalizeInputFileBlock(raw);
+      if (!fileBlock) return '';
+      const documentBlock = toAnthropicDocumentBlock(fileBlock);
+      return documentBlock ? [documentBlock] : '';
+    }
     const text = normalizeTextCandidate(raw);
     return text || safeJsonStringify(raw);
   }
@@ -329,7 +392,7 @@ function sanitizeAnthropicContentBlock(item: Record<string, unknown>): Record<st
   if (type === 'tool_result') {
     const toolUseId = asTrimmedString(item.tool_use_id ?? item.toolUseId);
     const content = normalizeToolMessageContent(item.content ?? item.result);
-    if (!toolUseId || !content) return null;
+    if (!toolUseId || (typeof content === 'string' ? !content : content.length <= 0)) return null;
     const next: Record<string, unknown> = {
       type: 'tool_result',
       tool_use_id: toolUseId,
@@ -353,6 +416,10 @@ function sanitizeAnthropicContentBlock(item: Record<string, unknown>): Record<st
     const cacheControl = sanitizeCacheControl(item.cache_control);
     if (cacheControl) next.cache_control = cacheControl;
     return next;
+  }
+
+  if (type === 'tool_reference') {
+    return sanitizeToolReferenceBlock(item);
   }
 
   return { ...item };
@@ -846,8 +913,11 @@ export function convertOpenAiBodyToAnthropicMessagesBody(
           asTrimmedString(toolCandidate.tool_call_id)
           || asTrimmedString(toolCandidate.id)
         );
-        const toolResultContent = normalizeToolMessageContent(toolCandidate.content).trim();
-        if (toolUseId && toolResultContent) {
+        const toolResultContent = normalizeToolMessageContent(toolCandidate.content);
+        const hasToolResultContent = typeof toolResultContent === 'string'
+          ? toolResultContent.trim().length > 0
+          : toolResultContent.length > 0;
+        if (toolUseId && hasToolResultContent) {
           toolResultBlocks.push({
             type: 'tool_result',
             tool_use_id: toolUseId,
@@ -906,6 +976,14 @@ export function convertOpenAiBodyToAnthropicMessagesBody(
     max_tokens: toFiniteNumber(openaiBody.max_tokens) ?? 4096,
   };
 
+  const openAiMetadata = openaiBody.metadata;
+  if (isRecord(openAiMetadata)) {
+    const clonedMetadata = cloneJsonValue(openAiMetadata);
+    if (isRecord(clonedMetadata) && 'user_id' in clonedMetadata) {
+      body.metadata = clonedMetadata;
+    }
+  }
+
   if (systemContents.length > 0) {
     body.system = systemContents.join('\n\n');
   }
@@ -922,8 +1000,17 @@ export function convertOpenAiBodyToAnthropicMessagesBody(
 
   if (openaiBody.tools !== undefined) body.tools = convertOpenAiToolsToAnthropic(openaiBody.tools);
 
-  const anthropicToolChoice = convertOpenAiToolChoiceToAnthropic(openaiBody.tool_choice);
-  if (anthropicToolChoice !== undefined) body.tool_choice = anthropicToolChoice;
+  const parallelToolCalls = openaiBody.parallel_tool_calls;
+  let anthropicToolChoice = convertOpenAiToolChoiceToAnthropic(openaiBody.tool_choice);
+  if (parallelToolCalls === false) {
+    const choiceRecord = ensureAnthropicToolChoiceRecord(anthropicToolChoice) ?? { type: 'auto' };
+    choiceRecord.disable_parallel_tool_use = true;
+    anthropicToolChoice = choiceRecord;
+  }
+
+  if (anthropicToolChoice !== undefined) {
+    body.tool_choice = anthropicToolChoice;
+  }
 
   const reasoningSettings = resolveOpenAiReasoningSettings(openaiBody);
   if (reasoningSettings.thinking) body.thinking = reasoningSettings.thinking;

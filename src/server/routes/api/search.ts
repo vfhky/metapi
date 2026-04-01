@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { db, schema } from '../../db/index.js';
 import { and, like, desc, eq, or } from 'drizzle-orm';
 import { getProxyLogBaseSelectFields } from '../../services/proxyLogStore.js';
-import { getCredentialModeFromExtraConfig } from '../../services/accountExtraConfig.js';
+import { getCredentialModeFromExtraConfig, supportsDirectAccountRoutingConnection } from '../../services/accountExtraConfig.js';
 import { ACCOUNT_TOKEN_VALUE_STATUS_READY } from '../../services/accountTokenService.js';
 
 function hasSessionTokenValue(value: string | null | undefined): boolean {
@@ -46,14 +46,13 @@ export async function searchRoutes(app: FastifyInstance) {
     const perCategory = Math.min(Math.ceil(limit / 6), 10);
 
     // Search sites
-    const sites = (await db.select().from(schema.sites)
-      .where(like(schema.sites.name, q))
-      .limit(perCategory).all())
-      .concat(
-        await db.select().from(schema.sites)
-          .where(like(schema.sites.url, q))
-          .limit(perCategory).all()
-      );
+    const sites = await db.select().from(schema.sites)
+      .where(or(
+        like(schema.sites.name, q),
+        like(schema.sites.url, q),
+        like(schema.sites.platform, q),
+      ))
+      .limit(perCategory).all();
     // Deduplicate by id
     const uniqueSites = [...new Map(sites.map(s => [s.id, s])).values()].slice(0, perCategory);
 
@@ -63,6 +62,7 @@ export async function searchRoutes(app: FastifyInstance) {
       .where(or(
         like(schema.accounts.username, q),
         like(schema.sites.name, q),
+        like(schema.sites.platform, q),
       ))
       .limit(perCategory).all();
     const apiKeyLabelMatches = matchesApiKeyDisplayLabel(query);
@@ -91,6 +91,7 @@ export async function searchRoutes(app: FastifyInstance) {
         like(schema.accountTokens.tokenGroup, q),
         like(schema.accounts.username, q),
         like(schema.sites.name, q),
+        like(schema.sites.platform, q),
       ))
       .orderBy(desc(schema.accountTokens.updatedAt))
       .limit(perCategory)
@@ -141,6 +142,25 @@ export async function searchRoutes(app: FastifyInstance) {
       )
       .limit(perCategory * 20)
       .all();
+    const directAccountModelRows = await db.select({
+      modelName: schema.modelAvailability.modelName,
+      accountId: schema.accounts.id,
+      siteId: schema.sites.id,
+      accounts: schema.accounts,
+    })
+      .from(schema.modelAvailability)
+      .innerJoin(schema.accounts, eq(schema.modelAvailability.accountId, schema.accounts.id))
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(
+        and(
+          like(schema.modelAvailability.modelName, q),
+          eq(schema.modelAvailability.available, true),
+          eq(schema.accounts.status, 'active'),
+          eq(schema.sites.status, 'active'),
+        ),
+      )
+      .limit(perCategory * 20)
+      .all();
 
     const modelAgg = new Map<string, { tokenIds: Set<number>; accountIds: Set<number>; siteIds: Set<number> }>();
     for (const row of modelRows) {
@@ -150,6 +170,16 @@ export async function searchRoutes(app: FastifyInstance) {
       }
       const agg = modelAgg.get(key)!;
       agg.tokenIds.add(row.tokenId);
+      agg.accountIds.add(row.accountId);
+      agg.siteIds.add(row.siteId);
+    }
+    for (const row of directAccountModelRows) {
+      if (!supportsDirectAccountRoutingConnection(row.accounts)) continue;
+      const key = row.modelName;
+      if (!modelAgg.has(key)) {
+        modelAgg.set(key, { tokenIds: new Set(), accountIds: new Set(), siteIds: new Set() });
+      }
+      const agg = modelAgg.get(key)!;
       agg.accountIds.add(row.accountId);
       agg.siteIds.add(row.siteId);
     }

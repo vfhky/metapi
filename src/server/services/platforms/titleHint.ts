@@ -1,3 +1,5 @@
+import { stripTrailingSlashes } from '../urlNormalization.js';
+
 export type TitleHintPlatform =
   | 'anyrouter'
   | 'done-hub'
@@ -34,7 +36,7 @@ function normalizeBaseUrl(url: string): string {
     const parsed = new URL(trimmed);
     return `${parsed.protocol}//${parsed.host}`;
   } catch {
-    return trimmed.replace(/\/+$/, '');
+    return stripTrailingSlashes(trimmed);
   }
 }
 
@@ -44,10 +46,7 @@ function extractHtmlTitle(html: string): string {
   return match[1].replace(/\s+/g, ' ').trim();
 }
 
-export async function detectPlatformByTitle(url: string): Promise<TitleHintPlatform | undefined> {
-  const base = normalizeBaseUrl(url);
-  if (!base) return undefined;
-
+async function detectPlatformByTitleOnce(base: string): Promise<TitleHintPlatform | undefined> {
   try {
     const { fetch } = await import('undici');
     const res = await fetch(`${base}/`, {
@@ -70,4 +69,17 @@ export async function detectPlatformByTitle(url: string): Promise<TitleHintPlatf
   } catch {
     return undefined;
   }
+}
+
+export async function detectPlatformByTitle(url: string): Promise<TitleHintPlatform | undefined> {
+  const base = normalizeBaseUrl(url);
+  if (!base) return undefined;
+
+  const first = await detectPlatformByTitleOnce(base);
+  if (first) return first;
+
+  // Under heavy parallel test load, local title probes can occasionally race
+  // with just-started ephemeral HTTP servers. Retry once before giving up.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return detectPlatformByTitleOnce(base);
 }

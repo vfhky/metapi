@@ -5,7 +5,119 @@ import {
   convertResponsesBodyToOpenAiBody,
   sanitizeResponsesBodyForProxy,
 } from './conversion.js';
-import { buildResponsesCompatibilityBodies } from './compatibility.js';
+import {
+  buildResponsesCompatibilityBodies,
+  convertOpenAiBodyToResponsesBody as convertOpenAiBodyToResponsesBodyViaCompatibility,
+  normalizeResponsesInputForCompatibility as normalizeResponsesInputForCompatibilityViaCompatibility,
+  normalizeResponsesMessageContent as normalizeResponsesMessageContentViaCompatibility,
+  sanitizeResponsesBodyForProxy as sanitizeResponsesBodyForProxyViaCompatibility,
+} from './compatibility.js';
+import {
+  normalizeResponsesInputForCompatibility,
+  normalizeResponsesMessageContent,
+} from './conversion.js';
+
+describe('responses conversion single source of truth', () => {
+  it('exports shared conversion helpers from one implementation', () => {
+    expect(normalizeResponsesInputForCompatibilityViaCompatibility).toBe(normalizeResponsesInputForCompatibility);
+    expect(
+      normalizeResponsesMessageContentViaCompatibility(
+        [{ type: 'text', text: 'hello' }],
+        'user',
+      ),
+    ).toEqual(
+      normalizeResponsesMessageContent(
+        'user',
+        [{ type: 'text', text: 'hello' }],
+      ),
+    );
+    expect(convertOpenAiBodyToResponsesBodyViaCompatibility).toBe(convertOpenAiBodyToResponsesBody);
+    expect(sanitizeResponsesBodyForProxyViaCompatibility).toBe(sanitizeResponsesBodyForProxy);
+  });
+
+  it('preserves extra properties when normalizing role-only message items', () => {
+    expect(normalizeResponsesInputForCompatibility([
+      {
+        role: 'assistant',
+        content: 'done',
+        id: 'msg_1',
+        status: 'completed',
+      },
+    ])).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'done' }],
+        id: 'msg_1',
+        status: 'completed',
+      },
+    ]);
+  });
+
+  it('filters whitespace-only string entries from normalized responses input arrays', () => {
+    expect(normalizeResponsesInputForCompatibility([
+      'hello',
+      '   ',
+      {
+        role: 'user',
+        content: 'world',
+      },
+    ])).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'hello' }],
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'world' }],
+      },
+    ]);
+  });
+
+  it('falls back to non-empty text and image sources when earlier compatibility fields are blank', () => {
+    const normalized = normalizeResponsesInputForCompatibility([
+      {
+        role: 'assistant',
+        content: '',
+        text: 'done',
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '   ', content: 'hello' },
+          { type: 'image_url', image_url: '   ', url: 'https://example.com/image.png' },
+        ],
+      },
+    ]);
+
+    expect(normalized).toEqual([
+      expect.objectContaining({
+        type: 'message',
+        role: 'assistant',
+        text: 'done',
+        content: [{ type: 'output_text', text: 'done' }],
+      }),
+      expect.objectContaining({
+        type: 'message',
+        role: 'user',
+        content: [
+          expect.objectContaining({
+            type: 'input_text',
+            text: 'hello',
+            content: 'hello',
+          }),
+          expect.objectContaining({
+            type: 'input_image',
+            image_url: 'https://example.com/image.png',
+            url: 'https://example.com/image.png',
+          }),
+        ],
+      }),
+    ]);
+  });
+});
 
 describe('sanitizeResponsesBodyForProxy', () => {
   it('preserves newer Responses request fields needed by the proxy', () => {
@@ -186,6 +298,205 @@ describe('sanitizeResponsesBodyForProxy', () => {
         summary: 'auto',
       },
     });
+  });
+
+  it('preserves unknown top-level fields while still normalizing known compatibility fields', () => {
+    const result = sanitizeResponsesBodyForProxy(
+      {
+        model: 'gpt-5',
+        input: 'hello',
+        max_completion_tokens: 256,
+        custom_vendor_flag: 'keep-me',
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result).toMatchObject({
+      model: 'gpt-5',
+      stream: false,
+      custom_vendor_flag: 'keep-me',
+      max_output_tokens: 256,
+    });
+    expect(result.max_completion_tokens).toBeUndefined();
+  });
+
+  it('normalizes failed input item statuses before proxying Responses requests', () => {
+    const result = sanitizeResponsesBodyForProxy(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            role: 'assistant',
+            status: 'failed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'tool step failed',
+              },
+            ],
+          },
+          {
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'lookup_weather',
+            arguments: '{"city":"Shanghai"}',
+            status: 'failed',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_1',
+            output: '{"error":"timeout"}',
+            status: 'completed',
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.input).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        status: 'incomplete',
+        content: [
+          {
+            type: 'output_text',
+            text: 'tool step failed',
+          },
+        ],
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'lookup_weather',
+        arguments: '{"city":"Shanghai"}',
+        status: 'incomplete',
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_1',
+        output: '{"error":"timeout"}',
+        status: 'completed',
+      },
+    ]);
+  });
+
+  it('drops unsupported input item statuses before proxying Responses requests', () => {
+    const result = sanitizeResponsesBodyForProxy(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            status: 'errored',
+            content: 'hello',
+          },
+          {
+            type: 'function_call',
+            call_id: 'call_2',
+            name: 'lookup_weather',
+            arguments: '{}',
+            status: 'invalid',
+          },
+          {
+            type: 'reasoning',
+            id: 'rs_1',
+            status: 'broken',
+            summary: [],
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'hello',
+          },
+        ],
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_2',
+        name: 'lookup_weather',
+        arguments: '{}',
+      },
+      {
+        type: 'reasoning',
+        id: 'rs_1',
+        summary: [],
+      },
+    ]);
+  });
+
+  it('drops blank tool calls before proxying Responses requests while preserving follow-up tool outputs', () => {
+    const result = sanitizeResponsesBodyForProxy(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            type: 'function_call',
+            call_id: 'call_blank',
+            name: '   ',
+            arguments: '{"city":"Shanghai"}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_blank',
+            output: '{"temp":22}',
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'continue normally',
+              },
+            ],
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_missing',
+            output: 'orphaned output',
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.input).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_blank',
+        output: '{"temp":22}',
+      },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'output_text',
+            text: 'continue normally',
+          },
+        ],
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_missing',
+        output: 'orphaned output',
+      },
+    ]);
   });
 });
 
@@ -432,6 +743,305 @@ describe('convertOpenAiBodyToResponsesBody', () => {
       },
     ]);
   });
+
+  it('preserves structured tool outputs and assistant phase when converting Responses bodies to OpenAI-compatible messages', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'lookup_weather',
+            arguments: '{"city":"Shanghai"}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_1',
+            output: [
+              {
+                type: 'output_text',
+                text: 'tool result',
+              },
+              {
+                type: 'input_image',
+                image_url: 'https://example.com/tool.png',
+              },
+            ],
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            phase: 'analysis',
+            content: [
+              {
+                type: 'output_text',
+                text: 'done',
+              },
+            ],
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.messages).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'lookup_weather',
+            arguments: '{"city":"Shanghai"}',
+          },
+        }],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_1',
+        content: [
+          {
+            type: 'text',
+            text: 'tool result',
+          },
+          {
+            type: 'image_url',
+            image_url: 'https://example.com/tool.png',
+          },
+        ],
+      },
+      {
+        role: 'assistant',
+        phase: 'analysis',
+        content: [{
+          type: 'text',
+          text: 'done',
+        }],
+      },
+    ]);
+  });
+
+  it('drops tool outputs that do not have a matching prior tool call when converting to OpenAI-compatible messages', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            type: 'function_call_output',
+            call_id: 'call_missing',
+            output: 'orphaned tool result',
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'continue normally',
+              },
+            ],
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: 'continue normally',
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('drops tool outputs whose prior tool call cannot be converted into an OpenAI-compatible tool call', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            type: 'function_call',
+            call_id: 'call_invalid',
+            name: '   ',
+            arguments: '{"plan":true}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_invalid',
+            output: 'unsupported call',
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'continue normally',
+              },
+            ],
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: 'continue normally',
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('shortens long MCP tool names consistently across tools, tool_choice and assistant tool calls', () => {
+    const sharedSuffix = 'server__execute_super_long_nested_tool_name_that_needs_shortening';
+    const firstName = `mcp__alpha_workspace__${sharedSuffix}`;
+    const secondName = `mcp__beta_workspace__${sharedSuffix}`;
+
+    const result = convertOpenAiBodyToResponsesBody(
+      {
+        model: 'gpt-5',
+        messages: [
+          {
+            role: 'assistant',
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: firstName,
+                  arguments: '{"city":"shanghai"}',
+                },
+              },
+            ],
+          },
+          {
+            role: 'tool',
+            tool_call_id: 'call_1',
+            content: 'done',
+          },
+        ],
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: firstName,
+              parameters: { type: 'object' },
+            },
+          },
+          {
+            type: 'function',
+            function: {
+              name: secondName,
+              parameters: { type: 'object' },
+            },
+          },
+        ],
+        tool_choice: {
+          type: 'function',
+          function: {
+            name: secondName,
+          },
+        },
+      },
+      'gpt-5',
+      false,
+    );
+
+    const toolNames = Array.isArray(result.tools)
+      ? result.tools.map((tool: any) => tool.name)
+      : [];
+    const assistantCall = Array.isArray(result.input)
+      ? result.input.find((item: any) => item.type === 'function_call')
+      : null;
+
+    expect(toolNames).toHaveLength(2);
+    expect(toolNames[0].length).toBeLessThanOrEqual(64);
+    expect(toolNames[1].length).toBeLessThanOrEqual(64);
+    expect(toolNames[0].startsWith('mcp__')).toBe(true);
+    expect(toolNames[1].startsWith('mcp__')).toBe(true);
+    expect(toolNames[0]).not.toBe(toolNames[1]);
+    expect(result.tool_choice).toEqual({
+      type: 'function',
+      name: toolNames[1],
+    });
+    expect(assistantCall).toMatchObject({
+      type: 'function_call',
+      name: toolNames[0],
+    });
+  });
+
+  it('drops function tools with blank names when converting OpenAI-compatible input into Responses bodies', () => {
+    const result = convertOpenAiBodyToResponsesBody(
+      {
+        model: 'gpt-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: '   ',
+              parameters: { type: 'object' },
+            },
+          },
+          {
+            type: 'function',
+            function: {
+              name: 'lookup_weather',
+              parameters: { type: 'object' },
+            },
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.tools).toEqual([
+      {
+        type: 'function',
+        name: 'lookup_weather',
+        parameters: { type: 'object' },
+      },
+    ]);
+  });
+
+  it('drops all-invalid function tools instead of forwarding blank names into Responses bodies', () => {
+    const result = convertOpenAiBodyToResponsesBody(
+      {
+        model: 'gpt-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: '   ',
+              parameters: { type: 'object' },
+            },
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.tools).toEqual([]);
+  });
 });
 
 describe('convertResponsesBodyToOpenAiBody', () => {
@@ -473,6 +1083,7 @@ describe('convertResponsesBodyToOpenAiBody', () => {
             file: {
               filename: 'paper.pdf',
               file_data: Buffer.from('%PDF-demo').toString('base64'),
+              mime_type: 'application/pdf',
             },
           },
         ],
@@ -614,6 +1225,65 @@ describe('convertResponsesBodyToOpenAiBody', () => {
         reasoning_signature: 'enc_sig_1',
       },
     ]);
+  });
+
+  it('round-trips mcp item families through OpenAI-compatible fallback using compatibility tool calls', () => {
+    const source = {
+      model: 'gpt-5',
+      input: [
+        {
+          type: 'mcp_call',
+          id: 'mcp_call_1',
+          call_id: 'mcp_call_1',
+          name: 'read_file',
+          server_label: 'filesystem',
+          arguments: {
+            path: '/tmp/demo.txt',
+          },
+        },
+        {
+          type: 'mcp_approval_request',
+          id: 'mcp_approval_request_1',
+          approval_request_id: 'mcp_approval_request_1',
+          name: 'read_file',
+          server_label: 'filesystem',
+          arguments: {
+            path: '/tmp/demo.txt',
+          },
+        },
+        {
+          type: 'mcp_approval_response',
+          id: 'mcp_approval_response_1',
+          approval_request_id: 'mcp_approval_request_1',
+          approve: true,
+        },
+      ],
+    };
+
+    const openAiBody = convertResponsesBodyToOpenAiBody(
+      source,
+      'gpt-5',
+      false,
+    );
+
+    expect(openAiBody.messages).toHaveLength(1);
+    expect(openAiBody.messages[0]).toMatchObject({
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        { id: 'mcp_call_1', type: 'function' },
+        { id: 'mcp_approval_request_1', type: 'function' },
+        { id: 'mcp_approval_response_1', type: 'function' },
+      ],
+    });
+
+    const roundTripped = convertOpenAiBodyToResponsesBody(
+      openAiBody,
+      'gpt-5',
+      false,
+    );
+
+    expect(roundTripped.input).toEqual(source.input);
   });
 
   it('preserves remaining request fields needed for OpenAI-compatible downstream fallback', () => {
@@ -853,6 +1523,7 @@ describe('convertResponsesBodyToOpenAiBody', () => {
       model: 'gpt-5',
       input: 'hello',
       stream: true,
+      parallel_tool_calls: true,
       include: ['reasoning.encrypted_content'],
       reasoning: {
         effort: 'high',
@@ -864,12 +1535,20 @@ describe('convertResponsesBodyToOpenAiBody', () => {
       prompt_cache_retention: { scope: 'workspace' },
       background: true,
       top_logprobs: 2,
+      previous_response_id: 'resp_prev_9',
+      truncation: 'auto',
+      service_tier: 'priority',
+      text: {
+        verbosity: 'high',
+      },
     });
 
     expect(candidates).toContainEqual({
       model: 'gpt-5',
       input: 'hello',
       stream: true,
+      parallel_tool_calls: true,
+      include: ['reasoning.encrypted_content'],
       reasoning: {
         effort: 'high',
         summary: 'auto',
@@ -880,6 +1559,250 @@ describe('convertResponsesBodyToOpenAiBody', () => {
       prompt_cache_retention: { scope: 'workspace' },
       background: true,
       top_logprobs: 2,
+      previous_response_id: 'resp_prev_9',
+      truncation: 'auto',
+      service_tier: 'priority',
+      text: {
+        verbosity: 'high',
+      },
+    });
+  });
+
+  it('preserves tools and tool_choice across all compatibility retry bodies', () => {
+    const candidates = buildResponsesCompatibilityBodies({
+      model: 'gpt-5',
+      input: 'hello',
+      stream: true,
+      metadata: { user_id: 'user-1' },
+      instructions: 'be helpful',
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'lookup_weather',
+          parameters: {
+            type: 'object',
+            properties: {
+              city: { type: 'string' },
+            },
+          },
+        },
+      }],
+      tool_choice: {
+        type: 'function',
+        function: {
+          name: 'lookup_weather',
+        },
+      },
+    });
+
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const candidate of candidates) {
+      expect(candidate.tools).toEqual([{
+        type: 'function',
+        function: {
+          name: 'lookup_weather',
+          parameters: {
+            type: 'object',
+            properties: {
+              city: { type: 'string' },
+            },
+          },
+        },
+      }]);
+      expect(candidate.tool_choice).toEqual({
+        type: 'function',
+        function: {
+          name: 'lookup_weather',
+        },
+      });
+    }
+  });
+
+  it('maps native tool choices and strict function tools into OpenAI-compatible fallback bodies', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: 'hello',
+        tools: [{
+          type: 'function',
+          name: 'lookup_weather',
+          parameters: {
+            type: 'object',
+            properties: {
+              city: { type: 'string' },
+            },
+          },
+          strict: true,
+        }],
+        tool_choice: {
+          type: 'tool',
+          name: 'lookup_weather',
+        },
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.tools).toEqual([{
+      type: 'function',
+      function: {
+        name: 'lookup_weather',
+        parameters: {
+          type: 'object',
+          properties: {
+            city: { type: 'string' },
+          },
+        },
+        strict: true,
+      },
+    }]);
+    expect(result.tool_choice).toEqual({
+      type: 'function',
+      function: {
+        name: 'lookup_weather',
+      },
+    });
+  });
+
+  it('drops blank native function tools and tool choices when converting to OpenAI-compatible fallback bodies', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: 'hello',
+        tools: [{
+          type: 'function',
+          name: '   ',
+          parameters: {
+            type: 'object',
+          },
+        }],
+        tool_choice: {
+          type: 'tool',
+          name: '   ',
+        },
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.tools).toEqual([]);
+    expect(result.tool_choice).toBeUndefined();
+  });
+
+  it('derives Responses reasoning config from chat-style reasoning request fields', () => {
+    const result = convertOpenAiBodyToResponsesBody(
+      {
+        model: 'gpt-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        reasoning_effort: 'high',
+        reasoning_budget: 2048,
+        reasoning_summary: 'detailed',
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result).toMatchObject({
+      model: 'gpt-5',
+      reasoning: {
+        effort: 'high',
+        budget_tokens: 2048,
+        summary: 'detailed',
+      },
+    });
+  });
+
+  it('preserves assistant reasoning history when converting OpenAI-compatible bodies to Responses input', () => {
+    const result = convertOpenAiBodyToResponsesBody(
+      {
+        model: 'gpt-5',
+        messages: [{
+          role: 'assistant',
+          content: '',
+          reasoning_content: 'plan quietly',
+          reasoning_signature: 'sig_1',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: {
+              name: 'Glob',
+              arguments: '{"pattern":"README*"}',
+            },
+          }],
+        }],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.input).toEqual([
+      {
+        type: 'reasoning',
+        summary: [{
+          type: 'summary_text',
+          text: 'plan quietly',
+        }],
+        encrypted_content: 'sig_1',
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'Glob',
+        arguments: '{"pattern":"README*"}',
+      },
+    ]);
+  });
+
+  it('preserves chat-native modalities and audio settings when converting to Responses bodies', () => {
+    const result = convertOpenAiBodyToResponsesBody(
+      {
+        model: 'gpt-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        metadata: { user_id: 'user-1' },
+        modalities: ['text', 'audio'],
+        audio: {
+          voice: 'alloy',
+          format: 'mp3',
+        },
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result).toMatchObject({
+      metadata: { user_id: 'user-1' },
+      modalities: ['text', 'audio'],
+      audio: {
+        voice: 'alloy',
+        format: 'mp3',
+      },
+    });
+  });
+
+  it('preserves metadata, modalities, and audio when converting Responses bodies back to OpenAI-compatible bodies', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: 'hello',
+        metadata: { user_id: 'user-1' },
+        modalities: ['text', 'audio'],
+        audio: {
+          voice: 'alloy',
+          format: 'mp3',
+        },
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result).toMatchObject({
+      model: 'gpt-5',
+      metadata: { user_id: 'user-1' },
+      modalities: ['text', 'audio'],
+      audio: {
+        voice: 'alloy',
+        format: 'mp3',
+      },
     });
   });
 
@@ -922,6 +1845,27 @@ describe('convertResponsesBodyToOpenAiBody', () => {
         },
       },
       verbosity: 'medium',
+    });
+  });
+
+  it('preserves responses metadata when converting back to OpenAI-compatible bodies', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: 'hello',
+        metadata: {
+          user_id: 'user-1',
+        },
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result).toMatchObject({
+      model: 'gpt-5',
+      metadata: {
+        user_id: 'user-1',
+      },
     });
   });
 

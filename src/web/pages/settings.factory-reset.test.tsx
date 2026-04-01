@@ -11,7 +11,9 @@ const { apiMock } = vi.hoisted(() => ({
     getDownstreamApiKeys: vi.fn(),
     getRoutesLite: vi.fn(),
     getRuntimeDatabaseConfig: vi.fn(),
+    getBrandList: vi.fn(),
     factoryReset: vi.fn(),
+    getModelTokenCandidates: vi.fn(),
   },
 }));
 
@@ -77,12 +79,14 @@ describe('Settings factory reset', () => {
     });
     apiMock.getDownstreamApiKeys.mockResolvedValue({ items: [] });
     apiMock.getRoutesLite.mockResolvedValue([]);
+    apiMock.getBrandList.mockResolvedValue({ brands: [] });
     apiMock.getRuntimeDatabaseConfig.mockResolvedValue({
       active: { dialect: 'sqlite', connection: '(default sqlite path)', ssl: false },
       saved: null,
       restartRequired: false,
     });
     apiMock.factoryReset.mockResolvedValue({ success: true });
+    apiMock.getModelTokenCandidates.mockResolvedValue({ models: {} });
 
     storage = createStorage({
       auth_token: 'before-reset-token',
@@ -114,7 +118,7 @@ describe('Settings factory reset', () => {
   });
 
   it('shows a 3 second danger confirmation and clears local state after reset', async () => {
-    let root: ReturnType<typeof create> | null = null;
+    let root!: WebTestRenderer;
     try {
       await act(async () => {
         root = create(
