@@ -1,5 +1,6 @@
 ﻿import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
+import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
 import { isTokenExpiredError } from '../../services/alertRules.js';
@@ -17,7 +18,9 @@ import { getProxyAuthContext } from '../../middleware/auth.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from './downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
+import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../../proxy-core/firstByteTimeout.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import {
   buildForcedChannelUnavailableMessage,
   canRetryChannelSelection,
@@ -47,6 +50,7 @@ export async function completionsProxyRoute(app: FastifyInstance) {
     });
 
     const isStream = body.stream === true;
+    const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
 
@@ -72,66 +76,42 @@ export async function completionsProxyRoute(app: FastifyInstance) {
 
       excludeChannelIds.push(selected.channel.id);
 
-      const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/completions');
       const upstreamModel = selected.actualModel || requestedModel;
       const forwardBody = { ...body, model: upstreamModel };
       const startTime = Date.now();
-
       try {
-        const upstream = await fetch(targetUrl, withSiteRecordProxyRequestInit(selected.site, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${selected.tokenValue}`,
-          },
-          body: JSON.stringify(forwardBody),
-        }, getProxyUrlFromExtraConfig(selected.account.extraConfig)));
-
-        if (!upstream.ok) {
-          const errText = await upstream.text().catch(() => 'unknown error');
-          await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
-            status: upstream.status,
-            errorText: errText,
-            modelName: upstreamModel,
-          }));
-          logProxy(
-            selected,
-            requestedModel,
-            'failed',
-            upstream.status,
-            Date.now() - startTime,
-            errText,
-            retryCount,
-            downstreamApiKeyId,
-            0,
-            0,
-            0,
-            0,
-            null,
-            clientContext,
-            downstreamPath,
+        const { upstream, firstByteLatencyMs } = await runWithSiteApiEndpointPool(selected.site, async (target) => {
+          const attemptStartedAtMs = Date.now();
+          const targetUrl = buildUpstreamUrl(target.baseUrl, '/v1/completions');
+          const response = await fetchWithObservedFirstByte(
+            async (signal) => fetch(targetUrl, withSiteRecordProxyRequestInit(selected.site, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${selected.tokenValue}`,
+              },
+              body: JSON.stringify(forwardBody),
+              signal,
+            }, getProxyUrlFromExtraConfig(selected.account.extraConfig))),
+            {
+              firstByteTimeoutMs,
+              startedAtMs: attemptStartedAtMs,
+            },
           );
-
-          if (isTokenExpiredError({ status: upstream.status, message: errText })) {
-            await reportTokenExpired({
-              accountId: selected.account.id,
-              username: selected.account.username,
-              siteName: selected.site.name,
-              detail: `HTTP ${upstream.status}`,
+          const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
+          if (!response.ok) {
+            const errText = await response.text().catch(() => 'unknown error');
+            throw new SiteApiEndpointRequestError(errText || 'unknown error', {
+              status: response.status,
+              rawErrText: errText || null,
+              firstByteLatencyMs: observedFirstByteLatencyMs,
             });
           }
-
-          if (shouldRetryProxyRequest(upstream.status, errText) && canRetryChannelSelection(retryCount, forcedChannelId)) {
-            retryCount++;
-            continue;
-          }
-
-          await reportProxyAllFailed({
-            model: requestedModel,
-            reason: `upstream returned HTTP ${upstream.status}`,
-          });
-          return reply.code(upstream.status).send({ error: { message: errText, type: 'upstream_error' } });
-        }
+          return {
+            upstream: response,
+            firstByteLatencyMs: observedFirstByteLatencyMs,
+          };
+        });
 
         if (isStream) {
           reply.raw.writeHead(200, {
@@ -228,6 +208,8 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             billingDetails,
             clientContext,
             downstreamPath,
+            isStream,
+            firstByteLatencyMs,
           );
           return;
         }
@@ -265,6 +247,8 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             null,
             clientContext,
             downstreamPath,
+            isStream,
+            firstByteLatencyMs,
           );
 
           if (shouldRetryProxyRequest(failure.status, errText) && canRetryChannelSelection(retryCount, forcedChannelId)) {
@@ -325,21 +309,26 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           billingDetails,
           clientContext,
           downstreamPath,
+          isStream,
+          firstByteLatencyMs,
         );
         return reply.send(data);
       } catch (err: any) {
+        const status = err instanceof SiteApiEndpointRequestError ? (err.status || 0) : 0;
+        const errorText = err?.message || 'network failure';
+        const firstByteLatencyMs = err instanceof SiteApiEndpointRequestError ? err.firstByteLatencyMs : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
-          status: 0,
-          errorText: err.message,
+          status,
+          errorText,
           modelName: upstreamModel,
         }));
         logProxy(
           selected,
           requestedModel,
           'failed',
-          0,
+          status,
           Date.now() - startTime,
-          err.message,
+          errorText,
           retryCount,
           downstreamApiKeyId,
           0,
@@ -349,17 +338,27 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           null,
           clientContext,
           downstreamPath,
+          isStream,
+          firstByteLatencyMs,
         );
-        if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+        if (status > 0 && isTokenExpiredError({ status, message: errorText })) {
+          await reportTokenExpired({
+            accountId: selected.account.id,
+            username: selected.account.username,
+            siteName: selected.site.name,
+            detail: `HTTP ${status}`,
+          });
+        }
+        if ((status > 0 ? shouldRetryProxyRequest(status, errorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount++;
           continue;
         }
         await reportProxyAllFailed({
           model: requestedModel,
-          reason: err.message || 'network failure',
+          reason: errorText || 'network failure',
         });
-        return reply.code(502).send({
-          error: { message: `Upstream error: ${err.message}`, type: 'upstream_error' },
+        return reply.code(status || 502).send({
+          error: { message: status > 0 ? errorText : `Upstream error: ${errorText}`, type: 'upstream_error' },
         });
       }
     }
@@ -382,6 +381,8 @@ async function logProxy(
   billingDetails: unknown = null,
   clientContext: DownstreamClientContext | null = null,
   downstreamPath = '/v1/completions',
+  isStream: boolean,
+  firstByteLatencyMs: number | null,
 ) {
   try {
     const createdAt = formatUtcSqlDateTime(new Date());
@@ -403,6 +404,8 @@ async function logProxy(
       modelActual: selected.actualModel || modelRequested,
       status,
       httpStatus,
+      isStream,
+      firstByteLatencyMs,
       latencyMs,
       promptTokens,
       completionTokens,

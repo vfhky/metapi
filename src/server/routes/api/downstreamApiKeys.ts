@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { and, eq, inArray, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
 import { db, hasProxyLogDownstreamApiKeyIdColumn, runtimeDbDialect, schema } from '../../db/index.js';
+import { insertAndGetById } from '../../db/insertHelpers.js';
 import {
   getDownstreamApiKeyById,
   listDownstreamApiKeys,
@@ -477,34 +478,30 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
     const nowIso = new Date().toISOString();
 
     try {
-      const insertedResult = await db.insert(schema.downstreamApiKeys).values({
-        name: normalized.name,
-        key: normalized.key,
-        description: normalized.description,
-        groupName: normalized.groupName,
-        tags: toPersistenceJson(normalized.tags),
-        enabled: normalized.enabled,
-        expiresAt: normalized.expiresAt,
-        maxCost: normalized.maxCost,
-        usedCost: 0,
-        maxRequests: normalized.maxRequests,
-        usedRequests: 0,
-        supportedModels: toPersistenceJson(normalized.supportedModels),
-        allowedRouteIds: toPersistenceJson(normalized.allowedRouteIds),
-        siteWeightMultipliers: toPersistenceJson(normalized.siteWeightMultipliers),
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      }).run();
-      const insertedId = Number(insertedResult.lastInsertRowid || 0);
-      if (insertedId <= 0) {
-        return reply.code(500).send({ success: false, message: '创建失败' });
-      }
-      const inserted = await db.select().from(schema.downstreamApiKeys)
-        .where(eq(schema.downstreamApiKeys.id, insertedId))
-        .get();
-      if (!inserted) {
-        return reply.code(500).send({ success: false, message: '创建失败' });
-      }
+      const inserted = await insertAndGetById<typeof schema.downstreamApiKeys.$inferSelect>({
+        table: schema.downstreamApiKeys,
+        idColumn: schema.downstreamApiKeys.id,
+        values: {
+          name: normalized.name,
+          key: normalized.key,
+          description: normalized.description,
+          groupName: normalized.groupName,
+          tags: toPersistenceJson(normalized.tags),
+          enabled: normalized.enabled,
+          expiresAt: normalized.expiresAt,
+          maxCost: normalized.maxCost,
+          usedCost: 0,
+          maxRequests: normalized.maxRequests,
+          usedRequests: 0,
+          supportedModels: toPersistenceJson(normalized.supportedModels),
+          allowedRouteIds: toPersistenceJson(normalized.allowedRouteIds),
+          siteWeightMultipliers: toPersistenceJson(normalized.siteWeightMultipliers),
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        },
+        insertErrorMessage: '创建失败',
+        loadErrorMessage: '创建失败',
+      });
 
       return {
         success: true,
@@ -539,21 +536,22 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
 
     const existingView = toDownstreamApiKeyPolicyView(existing);
     const body = parsedBody.data;
+    const hasOwn = (key: string) => Object.prototype.hasOwnProperty.call(body, key);
     let normalized: ReturnType<typeof normalizeDownstreamApiKeyPayload>;
     try {
       normalized = normalizeDownstreamApiKeyPayload({
-        name: body.name ?? existing.name,
-        key: body.key ?? existing.key,
-        description: body.description ?? existing.description,
-        groupName: body.groupName ?? existing.groupName,
-        tags: body.tags ?? existingView.tags,
-        enabled: body.enabled ?? existing.enabled,
-        expiresAt: body.expiresAt ?? existing.expiresAt,
-        maxCost: body.maxCost ?? existing.maxCost,
-        maxRequests: body.maxRequests ?? existing.maxRequests,
-        supportedModels: body.supportedModels ?? existingView.supportedModels,
-        allowedRouteIds: body.allowedRouteIds ?? existingView.allowedRouteIds,
-        siteWeightMultipliers: body.siteWeightMultipliers ?? existingView.siteWeightMultipliers,
+        name: hasOwn('name') ? body.name : existing.name,
+        key: hasOwn('key') ? body.key : existing.key,
+        description: hasOwn('description') ? body.description : existing.description,
+        groupName: hasOwn('groupName') ? body.groupName : existing.groupName,
+        tags: hasOwn('tags') ? body.tags : existingView.tags,
+        enabled: hasOwn('enabled') ? body.enabled : existing.enabled,
+        expiresAt: hasOwn('expiresAt') ? body.expiresAt : existing.expiresAt,
+        maxCost: hasOwn('maxCost') ? body.maxCost : existing.maxCost,
+        maxRequests: hasOwn('maxRequests') ? body.maxRequests : existing.maxRequests,
+        supportedModels: hasOwn('supportedModels') ? body.supportedModels : existingView.supportedModels,
+        allowedRouteIds: hasOwn('allowedRouteIds') ? body.allowedRouteIds : existingView.allowedRouteIds,
+        siteWeightMultipliers: hasOwn('siteWeightMultipliers') ? body.siteWeightMultipliers : existingView.siteWeightMultipliers,
       });
     } catch (error: unknown) {
       return reply.code(400).send({ success: false, message: (error as Error)?.message || '参数无效' });

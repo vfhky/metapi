@@ -5,16 +5,23 @@ import { reportProxyAllFailed } from '../../services/alertService.js';
 import { hasProxyUsagePayload, mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { openAiResponsesTransformer } from '../../transformers/openai/responses/index.js';
 import {
+  extractResponsesTerminalResponseId,
+  isResponsesPreviousResponseNotFoundError,
+  shouldInferResponsesPreviousResponseId,
+  stripResponsesPreviousResponseId,
+  withResponsesPreviousResponseId,
+} from '../../transformers/openai/responses/continuation.js';
+import {
   buildUpstreamEndpointRequest,
   resolveUpstreamEndpointCandidates,
-} from '../../routes/proxy/upstreamEndpoint.js';
+} from '../../services/upstreamEndpointRuntime.js';
 import {
   getUpstreamEndpointRuntimeStateSnapshot,
   recordUpstreamEndpointFailure,
   recordUpstreamEndpointSuccess,
 } from '../../services/upstreamEndpointRuntimeMemory.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from '../../routes/proxy/downstreamPolicy.js';
-import { executeEndpointFlow, type BuiltEndpointRequest } from '../../routes/proxy/endpointFlow.js';
+import { executeEndpointFlow, type BuiltEndpointRequest } from '../orchestration/endpointFlow.js';
 import { detectProxyFailure } from '../../routes/proxy/proxyFailureJudge.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
 import { normalizeInputFileBlock } from '../../transformers/shared/inputFile.js';
@@ -37,14 +44,22 @@ import {
   unwrapGeminiCliPayload,
 } from '../../routes/proxy/geminiCliCompat.js';
 import { isCodexResponsesSurface } from '../cliProfiles/codexProfile.js';
+import { getObservedResponseMeta } from '../firstByteTimeout.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { runCodexHttpSessionTask } from '../runtime/codexHttpSessionQueue.js';
+import {
+  buildCodexSessionResponseStoreKey,
+  clearCodexSessionResponseId,
+  getCodexSessionResponseId,
+  setCodexSessionResponseId,
+} from '../runtime/codexSessionResponseStore.js';
 import {
   summarizeConversationFileInputsInOpenAiBody,
   summarizeConversationFileInputsInResponsesBody,
 } from '../capabilities/conversationFileCapabilities.js';
 import { detectDownstreamClientContext } from '../../routes/proxy/downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -70,6 +85,7 @@ import {
   safeUpdateSurfaceProxyDebugSelection,
   startSurfaceProxyDebugTrace,
 } from '../../services/proxyDebugTraceRuntime.js';
+import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import {
   buildForcedChannelUnavailableMessage,
   canRetryChannelSelection,
@@ -93,6 +109,12 @@ function isResponsesWebsocketTransportRequest(headers: Record<string, unknown>):
   return Object.entries(headers)
     .some(([rawKey, rawValue]) => rawKey.trim().toLowerCase() === 'x-metapi-responses-websocket-transport'
       && String(rawValue).trim() === '1');
+}
+
+function rememberCodexSessionResponseId(sessionId: string, payload: unknown): void {
+  const responseId = extractResponsesTerminalResponseId(payload);
+  if (!responseId) return;
+  setCodexSessionResponseId(sessionId, responseId);
 }
 
 function normalizeIncludeList(value: unknown): string[] {
@@ -344,6 +366,20 @@ export async function handleOpenAiResponsesSurfaceRequest(
       const modelName = selected.actualModel || requestedModel;
       const oauth = getOauthInfoFromAccount(selected.account);
       const isCodexSite = String(selected.site.platform || '').trim().toLowerCase() === 'codex';
+      const codexSessionId = isCodexSite
+        ? getCodexSessionHeaderValue(request.headers as Record<string, string>)
+        : '';
+      const codexSessionStoreKey = (
+        isCodexSite
+        && codexSessionId
+      )
+        ? buildCodexSessionResponseStoreKey({
+          sessionId: codexSessionId,
+          siteId: selected.site.id,
+          accountId: selected.account.id,
+          channelId: selected.channel.id,
+        })
+        : '';
       const owner = getProxyResourceOwner(request);
       let normalizedResponsesBody: Record<string, unknown> = {
         ...requestEnvelope.parsed.normalizedBody,
@@ -423,127 +459,137 @@ export async function handleOpenAiResponsesSurfaceRequest(
           downstreamHeaders: request.headers as Record<string, unknown>,
         })
       );
-      const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
-        const upstreamStream = isStream || (isCodexSite && endpoint === 'responses');
-        const endpointRequest = buildUpstreamEndpointRequest({
-          endpoint,
-          modelName,
-          stream: upstreamStream,
-          tokenValue: selected.tokenValue,
-          oauthProvider: oauth?.provider,
-          oauthProjectId: oauth?.projectId,
-          sitePlatform: selected.site.platform,
-          siteUrl: selected.site.url,
-          openaiBody: openAiBody,
-          downstreamFormat: 'responses',
-          responsesOriginalBody: normalizedResponsesBody,
-          downstreamHeaders: request.headers as Record<string, unknown>,
-          providerHeaders: buildProviderHeaders(),
-        });
-        const upstreamPath = (
-          isCompactRequest && endpoint === 'responses'
-            ? `${endpointRequest.path}/compact`
-            : endpointRequest.path
-        );
-        return {
-          endpoint,
-          path: upstreamPath,
-          headers: endpointRequest.headers,
-          body: endpointRequest.body as Record<string, unknown>,
-          runtime: endpointRequest.runtime,
-        };
-      };
-      const baseDispatchRequest = createSurfaceDispatchRequest({
-        site: selected.site,
-        accountExtraConfig: selected.account.extraConfig,
-      });
-      const dispatchRequest = (
-        endpointRequest: BuiltEndpointRequest,
-        targetUrl?: string,
-      ) => {
-        if (!isCodexSite || endpointRequest.path !== '/responses') {
-          return baseDispatchRequest(endpointRequest, targetUrl);
-        }
-        const sessionId = getCodexSessionHeaderValue(endpointRequest.headers);
-        return runCodexHttpSessionTask(
-          sessionId,
-          () => baseDispatchRequest(endpointRequest, targetUrl),
-        );
-      };
-      const endpointStrategy = openAiResponsesTransformer.compatibility.createEndpointStrategy({
-        isStream: isStream || isCodexSite,
-        requiresNativeResponsesFileUrl,
-        dispatchRequest,
-      });
-      const tryRecover = async (ctx: Parameters<NonNullable<typeof endpointStrategy.tryRecover>>[0]) => {
-        if (oauth && shouldRefreshOauthResponsesRequest({
-          oauthProvider: oauth.provider,
-          status: ctx.response.status,
-          response: ctx.response,
-          rawErrText: ctx.rawErrText || '',
-        })) {
-          const recovered = await trySurfaceOauthRefreshRecovery({
-            ctx,
-            selected,
-            siteUrl: selected.site.url,
-            buildRequest: (endpoint) => buildEndpointRequest(endpoint),
-            dispatchRequest,
+      const executeEndpointResultForSiteApiBaseUrl = async (siteApiBaseUrl: string) => {
+        const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
+          const upstreamStream = isStream || (isCodexSite && endpoint === 'responses');
+          const responsesOriginalBody = (
+            endpoint === 'responses'
+            && isCodexSite
+            && codexSessionStoreKey
+            && shouldInferResponsesPreviousResponseId(
+              normalizedResponsesBody,
+              getCodexSessionResponseId(codexSessionStoreKey),
+            )
+          )
+            ? withResponsesPreviousResponseId(
+              normalizedResponsesBody,
+              getCodexSessionResponseId(codexSessionStoreKey)!,
+            )
+            : normalizedResponsesBody;
+          const endpointRequest = buildUpstreamEndpointRequest({
+            endpoint,
+            modelName,
+            stream: upstreamStream,
+            tokenValue: selected.tokenValue,
+            oauthProvider: oauth?.provider,
+            oauthProjectId: oauth?.projectId,
+            sitePlatform: selected.site.platform,
+            siteUrl: siteApiBaseUrl,
+            openaiBody: openAiBody,
+            downstreamFormat: 'responses',
+            responsesOriginalBody,
+            downstreamHeaders: request.headers as Record<string, unknown>,
+            providerHeaders: buildProviderHeaders(),
           });
-          if (recovered?.upstream?.ok) {
-            return recovered;
+          const upstreamPath = (
+            isCompactRequest && endpoint === 'responses'
+              ? `${endpointRequest.path}/compact`
+              : endpointRequest.path
+          );
+          return {
+            endpoint,
+            path: upstreamPath,
+            headers: endpointRequest.headers,
+            body: endpointRequest.body as Record<string, unknown>,
+            runtime: endpointRequest.runtime,
+          };
+        };
+        const baseDispatchRequest = createSurfaceDispatchRequest({
+          site: selected.site,
+          siteUrl: siteApiBaseUrl,
+          accountExtraConfig: selected.account.extraConfig,
+        });
+        const dispatchRequest = (
+          endpointRequest: BuiltEndpointRequest,
+          targetUrl?: string,
+        ) => {
+          if (!isCodexSite || !endpointRequest.path.startsWith('/responses')) {
+            return baseDispatchRequest(endpointRequest, targetUrl);
           }
-        }
-        return endpointStrategy.tryRecover(ctx);
-      };
+          const sessionId = getCodexSessionHeaderValue(endpointRequest.headers);
+          return runCodexHttpSessionTask(
+            codexSessionStoreKey || sessionId,
+            () => baseDispatchRequest(endpointRequest, targetUrl),
+          );
+        };
+        const endpointStrategy = openAiResponsesTransformer.compatibility.createEndpointStrategy({
+          isStream: isStream || isCodexSite,
+          requiresNativeResponsesFileUrl,
+          dispatchRequest,
+        });
+        const tryRecover = async (ctx: Parameters<NonNullable<typeof endpointStrategy.tryRecover>>[0]) => {
+          if (oauth && shouldRefreshOauthResponsesRequest({
+            oauthProvider: oauth.provider,
+            status: ctx.response.status,
+            response: ctx.response,
+            rawErrText: ctx.rawErrText || '',
+          })) {
+            const recovered = await trySurfaceOauthRefreshRecovery({
+              ctx,
+              selected,
+              siteUrl: siteApiBaseUrl,
+              buildRequest: (endpoint) => buildEndpointRequest(endpoint),
+              dispatchRequest,
+            });
+            if (recovered?.upstream?.ok) {
+              return recovered;
+            }
+          }
+          if (
+            ctx.request.endpoint === 'responses'
+            && isResponsesPreviousResponseNotFoundError({
+              rawErrText: ctx.rawErrText,
+            })
+          ) {
+            if (codexSessionStoreKey) {
+              clearCodexSessionResponseId(codexSessionStoreKey);
+            }
+            const previousResponseRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+            if (previousResponseRecovery.removed) {
+              const recoveredRequest = {
+                ...ctx.request,
+                body: previousResponseRecovery.body,
+              };
+              const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+              if (recoveredResponse.ok) {
+                return {
+                  upstream: recoveredResponse,
+                  upstreamPath: recoveredRequest.path,
+                  request: recoveredRequest,
+                  targetUrl: ctx.targetUrl,
+                };
+              }
+              ctx.request = recoveredRequest;
+              ctx.response = recoveredResponse;
+              ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+            }
+          }
+          return endpointStrategy.tryRecover(ctx);
+        };
 
-      const startTime = Date.now();
-      const leaseResult = await acquireSurfaceChannelLease({
-        stickySessionKey,
-        selected,
-      });
-      if (leaseResult.status === 'timeout') {
-        clearSurfaceStickyChannel({
-          stickySessionKey,
-          selected,
-        });
-        const busyMessage = buildSurfaceChannelBusyMessage(leaseResult.waitMs);
-        await failureToolkit.log({
-          selected,
-          modelRequested: requestedModel,
-          status: 'failed',
-          httpStatus: 503,
-          latencyMs: leaseResult.waitMs,
-          errorMessage: busyMessage,
-          retryCount,
-        });
-        if (retryCount < maxRetries && canRetryChannelSelection(retryCount, forcedChannelId)) {
-          retryCount += 1;
-          continue;
-        }
-        await finalizeDebugFailure(503, {
-          error: {
-            message: busyMessage,
-            type: 'server_error',
-          },
-        });
-        return reply.code(503).send({
-          error: {
-            message: busyMessage,
-            type: 'server_error',
-          },
-        });
-      }
-      const channelLease = leaseResult.lease;
-
-      try {
         const debugAttemptBase = reserveSurfaceProxyDebugAttemptBase(debugTrace, endpointCandidates.length);
-        const endpointResult = await executeEndpointFlow({
-          siteUrl: selected.site.url,
+        return executeEndpointFlow({
+          siteUrl: siteApiBaseUrl,
           disableCrossProtocolFallback: config.disableCrossProtocolFallback,
+          firstByteTimeoutMs: Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000)),
           endpointCandidates,
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,
           tryRecover,
+          shouldAbortRemainingEndpoints: (ctx) => shouldAbortSameSiteEndpointFallback(
+            ctx.response.status,
+            ctx.rawErrText || ctx.errText,
+          ),
           onAttemptFailure: async (ctx) => {
             const memoryWrite = recordUpstreamEndpointFailure({
               ...endpointRuntimeContext,
@@ -611,76 +657,101 @@ export async function handleOpenAiResponsesSurfaceRequest(
             });
           },
         });
-
-        if (!endpointResult.ok) {
-          clearSurfaceStickyChannel({
-            stickySessionKey,
-            selected,
-          });
-          const failureOutcome = await failureToolkit.handleUpstreamFailure({
-            selected,
-            requestedModel,
-            modelName,
-            status: endpointResult.status || 502,
-            errText: endpointResult.errText || 'unknown error',
-            rawErrText: endpointResult.rawErrText,
-            latencyMs: Date.now() - startTime,
-            retryCount,
-          });
-          const terminalFailureOutcome = failureOutcome.action === 'retry'
-            ? (canRetryChannelSelection(retryCount, forcedChannelId)
-              ? null
-              : finalizeRetryAsUpstreamFailure(endpointResult.status || 502, endpointResult.errText || 'unknown error'))
-            : failureOutcome;
-          if (!terminalFailureOutcome) {
-            retryCount += 1;
-            continue;
-          }
-          await finalizeDebugFailure(
-            terminalFailureOutcome.status,
-            terminalFailureOutcome.payload,
-            null,
-          );
-          return reply.code(terminalFailureOutcome.status).send(terminalFailureOutcome.payload);
-        }
-
-      const upstream = endpointResult.upstream;
-      const successfulUpstreamPath = endpointResult.upstreamPath;
-      const finalizeStreamSuccess = async (
-        parsedUsage: UsageSummary,
-        latency: number,
-        streamDebugBody: unknown,
-        upstreamUsagePresent: boolean,
-      ) => {
-        try {
-          await recordSurfaceSuccess({
-            selected,
-            requestedModel,
-            modelName,
-            parsedUsage,
-            upstreamUsagePresent,
-            requestStartedAtMs: startTime,
-            latencyMs: latency,
-            retryCount,
-            upstreamPath: successfulUpstreamPath,
-            logSuccess: failureToolkit.log,
-            recordDownstreamCost: (estimatedCost) => {
-              recordDownstreamCostUsage(request, estimatedCost);
-            },
-            bestEffortMetrics: {
-              errorLabel: '[responses] post-stream bookkeeping failed:',
-            },
-          });
-        } catch (error) {
-          console.error('[responses] post-stream success logging failed:', error);
-        }
-        await finalizeDebugSuccess(
-          200,
-          successfulUpstreamPath,
-          buildSurfaceProxyDebugResponseHeaders(upstream),
-          streamDebugBody,
-        );
       };
+
+      const startTime = Date.now();
+      const leaseResult = await acquireSurfaceChannelLease({
+        stickySessionKey,
+        selected,
+      });
+      if (leaseResult.status === 'timeout') {
+        clearSurfaceStickyChannel({
+          stickySessionKey,
+          selected,
+        });
+      const busyMessage = buildSurfaceChannelBusyMessage(leaseResult.waitMs);
+      await failureToolkit.log({
+        selected,
+        modelRequested: requestedModel,
+        status: 'failed',
+        httpStatus: 503,
+        latencyMs: leaseResult.waitMs,
+        errorMessage: busyMessage,
+        retryCount,
+      });
+      if (retryCount < maxRetries && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        retryCount += 1;
+        continue;
+      }
+        await finalizeDebugFailure(503, {
+          error: {
+            message: busyMessage,
+            type: 'server_error',
+          },
+        });
+        return reply.code(503).send({
+          error: {
+            message: busyMessage,
+            type: 'server_error',
+          },
+        });
+      }
+      const channelLease = leaseResult.lease;
+
+      try {
+        const endpointResult = await runWithSiteApiEndpointPool(selected.site, async (target) => {
+          const result = await executeEndpointResultForSiteApiBaseUrl(target.baseUrl);
+          if (!result.ok) {
+            const upstreamFailure = new SiteApiEndpointRequestError(result.errText || 'unknown error', {
+              status: result.status || 502,
+              rawErrText: result.rawErrText || result.errText || 'unknown error',
+            }) as SiteApiEndpointRequestError & { siteApiEndpointUpstreamFailure?: boolean };
+            upstreamFailure.siteApiEndpointUpstreamFailure = true;
+            throw upstreamFailure;
+          }
+          return result;
+        });
+
+        const upstream = endpointResult.upstream;
+        const successfulUpstreamPath = endpointResult.upstreamPath;
+        const firstByteLatencyMs = getObservedResponseMeta(upstream)?.firstByteLatencyMs ?? null;
+        const finalizeStreamSuccess = async (
+          parsedUsage: UsageSummary,
+          latency: number,
+          streamDebugBody: unknown,
+          upstreamUsagePresent: boolean,
+        ) => {
+          try {
+            await recordSurfaceSuccess({
+              selected,
+              requestedModel,
+              modelName,
+              parsedUsage,
+              upstreamUsagePresent,
+              requestStartedAtMs: startTime,
+              isStream: true,
+              firstByteLatencyMs,
+              latencyMs: latency,
+              retryCount,
+              upstreamPath: successfulUpstreamPath,
+              logSuccess: failureToolkit.log,
+              recordDownstreamCost: (estimatedCost) => {
+                recordDownstreamCostUsage(request, estimatedCost);
+              },
+              bestEffortMetrics: {
+                errorLabel: '[responses] post-stream bookkeeping failed:',
+              },
+            });
+          } catch (error) {
+            console.error('[responses] post-stream success logging failed:', error);
+          }
+          await finalizeDebugSuccess(
+            200,
+            successfulUpstreamPath,
+            buildSurfaceProxyDebugResponseHeaders(upstream),
+            streamDebugBody,
+          );
+        };
 
         if (isStream) {
           const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
@@ -714,6 +785,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
               if (payload && typeof payload === 'object') {
                 upstreamUsagePresent = upstreamUsagePresent || hasProxyUsagePayload(payload);
                 parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(payload));
+                if (codexSessionStoreKey) {
+                  rememberCodexSessionResponseId(codexSessionStoreKey, payload);
+                }
               }
             },
             writeLines,
@@ -776,6 +850,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
             }
             if (String(selected.site.platform || '').trim().toLowerCase() === 'gemini-cli') {
               upstreamData = unwrapGeminiCliPayload(upstreamData);
+            }
+            if (codexSessionStoreKey) {
+              rememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
             }
 
             parsedUsage = parseProxyUsage(upstreamData);
@@ -882,6 +959,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   `event: ${terminalEventType}\ndata: ${JSON.stringify({ type: terminalEventType, response: collectedPayload })}\n\n`,
                   'data: [DONE]\n\n',
                 ]);
+                if (codexSessionStoreKey) {
+                  rememberCodexSessionResponseId(codexSessionStoreKey, collectedPayload);
+                }
                 reply.raw.end();
                 const latency = Date.now() - startTime;
                 await finalizeStreamSuccess(
@@ -1040,6 +1120,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
         if (String(selected.site.platform || '').trim().toLowerCase() === 'gemini-cli') {
           upstreamData = unwrapGeminiCliPayload(upstreamData);
         }
+        if (codexSessionStoreKey) {
+          rememberCodexSessionResponseId(codexSessionStoreKey, upstreamData);
+        }
         const latency = Date.now() - startTime;
         const parsedUsage = parseProxyUsage(upstreamData);
         const upstreamUsagePresent = hasProxyUsagePayload(upstreamData);
@@ -1096,6 +1179,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
             parsedUsage,
             upstreamUsagePresent,
             requestStartedAtMs: startTime,
+            isStream: false,
+            firstByteLatencyMs,
             latencyMs: latency,
             retryCount,
             upstreamPath: successfulUpstreamPath,
@@ -1126,22 +1211,58 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	          stickySessionKey,
 	          selected,
 	        });
+          const endpointFailureStatus = typeof err?.status === 'number' ? err.status : null;
+          const isSiteApiEndpointFailure = (
+            err instanceof SiteApiEndpointRequestError
+            || err?.name === 'SiteApiEndpointRequestError'
+            || err?.siteApiEndpointUpstreamFailure === true
+            || (endpointFailureStatus !== null && endpointFailureStatus >= 500)
+          );
+          if (isSiteApiEndpointFailure) {
+            const failureOutcome = await failureToolkit.handleUpstreamFailure({
+              selected,
+          requestedModel,
+          modelName,
+          status: endpointFailureStatus || 502,
+          errText: err?.message || 'unknown error',
+          rawErrText: err?.rawErrText || err?.message || 'unknown error',
+          isStream,
+          latencyMs: Date.now() - startTime,
+          retryCount,
+        });
+            const terminalFailureOutcome = failureOutcome.action === 'retry'
+              ? (canRetryChannelSelection(retryCount, forcedChannelId)
+                ? null
+                : finalizeRetryAsUpstreamFailure(endpointFailureStatus || 502, err?.message || 'unknown error'))
+              : failureOutcome;
+            if (!terminalFailureOutcome) {
+              retryCount += 1;
+              continue;
+            }
+            await finalizeDebugFailure(
+              terminalFailureOutcome.status,
+              terminalFailureOutcome.payload,
+              null,
+            );
+            return reply.code(terminalFailureOutcome.status).send(terminalFailureOutcome.payload);
+          }
 	        const failureOutcome = await failureToolkit.handleExecutionError({
 	          selected,
 	          requestedModel,
-	          modelName,
-	          errorMessage: err?.message || 'network failure',
-	          latencyMs: Date.now() - startTime,
-	          retryCount,
-	        });
-	        const terminalFailureOutcome = failureOutcome.action === 'retry'
-	          ? (canRetryChannelSelection(retryCount, forcedChannelId)
-	            ? null
-	            : finalizeRetryAsExecutionFailure(err?.message || 'network failure'))
-	          : failureOutcome;
-	        if (!terminalFailureOutcome) {
-	          retryCount += 1;
-	          continue;
+            modelName,
+            errorMessage: err?.message || 'network failure',
+            isStream,
+            latencyMs: Date.now() - startTime,
+            retryCount,
+          });
+          const terminalFailureOutcome = failureOutcome.action === 'retry'
+            ? (canRetryChannelSelection(retryCount, forcedChannelId)
+              ? null
+              : finalizeRetryAsExecutionFailure(err?.message || 'network failure'))
+            : failureOutcome;
+          if (!terminalFailureOutcome) {
+            retryCount += 1;
+            continue;
 	        }
 		        await finalizeDebugFailure(
 	            terminalFailureOutcome.status,

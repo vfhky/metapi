@@ -9,6 +9,7 @@ import { MobileCard, MobileField } from '../components/MobileCard.js';
 import ResponsiveFilterPanel from '../components/ResponsiveFilterPanel.js';
 import { useIsMobile } from '../components/useIsMobile.js';
 import { tr } from '../i18n.js';
+import { ROUTE_DECISION_REFRESH_TASK_TYPE } from '../../shared/tokenRouteContract.js';
 import {
   buildRouteModelCandidatesIndex,
   type RouteCandidateView,
@@ -24,6 +25,7 @@ import {
 import { buildVisibleRouteList } from './helpers/routeListVisibility.js';
 import { buildZeroChannelPlaceholderRoutes } from './helpers/zeroChannelRoutes.js';
 import {
+  getRouteRoutingStrategyDescription,
   getRouteRoutingStrategyLabel,
   normalizeRouteRoutingStrategyValue,
 } from './token-routes/routingStrategy.js';
@@ -42,7 +44,6 @@ import type {
   GroupRouteItem,
 } from './token-routes/types.js';
 import {
-  AUTO_ROUTE_DECISION_LIMIT,
   ROUTE_RENDER_CHUNK,
   isExplicitGroupRoute,
   isExactModelPattern,
@@ -57,7 +58,7 @@ import {
   inferEndpointTypesFromPlatform,
   getModelPatternError,
 } from './token-routes/utils.js';
-import { applyPriorityBucketDrag, splitPriorityBucketAfterChannel } from './token-routes/priorityBuckets.js';
+import { applyPriorityRailDrop, isPriorityRailNewLayerId } from './token-routes/priorityRail.js';
 import { useRouteChannels } from './token-routes/useRouteChannels.js';
 import RouteFilterBar, { type EnabledFilter } from './token-routes/RouteFilterBar.js';
 import ManualRoutePanel from './token-routes/ManualRoutePanel.js';
@@ -136,6 +137,7 @@ export default function TokenRoutes() {
   const [updatingChannel, setUpdatingChannel] = useState<Record<number, boolean>>({});
   const [savingPriorityByRoute, setSavingPriorityByRoute] = useState<Record<number, boolean>>({});
   const [updatingRoutingStrategyByRoute, setUpdatingRoutingStrategyByRoute] = useState<Record<number, boolean>>({});
+  const [clearingCooldownByRoute, setClearingCooldownByRoute] = useState<Record<number, boolean>>({});
 
   const [decisionByRoute, setDecisionByRoute] = useState<Record<number, RouteDecision | null>>({});
   const [loadingDecision, setLoadingDecision] = useState(false);
@@ -160,73 +162,8 @@ export default function TokenRoutes() {
   const candidatesPromiseRef = useRef<Promise<void> | null>(null);
   const candidatesVersionRef = useRef(0);
   const candidatesSeqRef = useRef(0);
-
-  const loadRouteDecisions = async (
-    routeRows: RouteSummaryRow[],
-    options?: { force?: boolean; refreshPricingCatalog?: boolean; persistSnapshots?: boolean },
-  ) => {
-    const rows = routeRows || [];
-    const exactRoutes = rows.filter((route) => isRouteExactModel(route));
-    const wildcardRouteIds = rows
-      .filter((route) => !isRouteExactModel(route))
-      .map((route) => route.id);
-
-    const requestedModels = Array.from(new Set<string>(exactRoutes.map((route) => route.modelPattern)));
-
-    const defaultState: Record<number, RouteDecision | null> = {};
-    for (const route of rows) defaultState[route.id] = null;
-
-    if (requestedModels.length === 0 && wildcardRouteIds.length === 0) {
-      setDecisionByRoute(defaultState);
-      setDecisionAutoSkipped(false);
-      return;
-    }
-
-    const totalDecisionRequests = requestedModels.length + wildcardRouteIds.length;
-    if (!options?.force && totalDecisionRequests > AUTO_ROUTE_DECISION_LIMIT) {
-      setDecisionByRoute(defaultState);
-      setDecisionAutoSkipped(true);
-      return;
-    }
-
-    setLoadingDecision(true);
-    try {
-      setDecisionAutoSkipped(false);
-      const decisionRequestOptions = options?.refreshPricingCatalog
-        ? {
-          refreshPricingCatalog: true as const,
-          ...(options?.persistSnapshots ? { persistSnapshots: true as const } : {}),
-        }
-        : options?.persistSnapshots
-          ? { persistSnapshots: true as const }
-          : undefined;
-      const [exactRes, wildcardRes] = await Promise.all([
-        requestedModels.length > 0
-          ? api.getRouteDecisionsBatch(requestedModels, decisionRequestOptions)
-          : Promise.resolve({ decisions: {} }),
-        wildcardRouteIds.length > 0
-          ? api.getRouteWideDecisionsBatch(wildcardRouteIds, decisionRequestOptions)
-          : Promise.resolve({ decisions: {} }),
-      ]);
-
-      const decisionMap = (exactRes?.decisions || {}) as Record<string, RouteDecision | null>;
-      const wildcardDecisionMap = (wildcardRes?.decisions || {}) as Record<string, RouteDecision | null>;
-      const next = { ...defaultState };
-      for (const route of exactRoutes) {
-        next[route.id] = decisionMap[route.modelPattern] || null;
-      }
-      for (const routeId of wildcardRouteIds) {
-        next[routeId] = wildcardDecisionMap[String(routeId)] || null;
-      }
-
-      setDecisionByRoute(next);
-    } catch {
-      setDecisionByRoute(defaultState);
-      setDecisionAutoSkipped(false);
-    } finally {
-      setLoadingDecision(false);
-    }
-  };
+  const decisionRefreshWatchSeqRef = useRef(0);
+  const mountedRef = useRef(true);
 
   const loadCandidates = (force?: boolean) => {
     if (candidatesLoadedRef.current && !force) return;
@@ -280,9 +217,97 @@ export default function TokenRoutes() {
     }
   };
 
+  const loadRef = useRef(load);
+  loadRef.current = load;
+
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+
+  const monitorRouteDecisionRefreshTask = useCallback((taskId: string) => {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) return;
+
+    const taskFetcher = (api as { getTask?: (id: string) => Promise<unknown> }).getTask;
+    if (typeof taskFetcher !== 'function') {
+      setLoadingDecision(false);
+      return;
+    }
+
+    const watchSeq = ++decisionRefreshWatchSeqRef.current;
+    setLoadingDecision(true);
+    setDecisionAutoSkipped(false);
+
+    void (async () => {
+      while (mountedRef.current && decisionRefreshWatchSeqRef.current === watchSeq) {
+        try {
+          const taskResponse = await taskFetcher(normalizedTaskId) as {
+            task?: { status?: string; message?: string; error?: string | null };
+          };
+          const task = taskResponse?.task;
+          if (!task) {
+            throw new Error('路由选中概率任务不存在');
+          }
+
+          const status = String(task.status || '').trim();
+          if (status === 'pending' || status === 'running') {
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            continue;
+          }
+
+          if (!mountedRef.current || decisionRefreshWatchSeqRef.current !== watchSeq) return;
+          await loadRef.current();
+          if (!mountedRef.current || decisionRefreshWatchSeqRef.current !== watchSeq) return;
+
+          setLoadingDecision(false);
+          if (status === 'succeeded') {
+            toastRef.current.success('路由选择概率已刷新');
+          } else {
+            toastRef.current.error(String(task.message || task.error || '刷新路由选择概率失败'));
+          }
+          return;
+        } catch (error: any) {
+          if (!mountedRef.current || decisionRefreshWatchSeqRef.current !== watchSeq) return;
+          setLoadingDecision(false);
+          toastRef.current.error(error?.message || '刷新路由选择概率失败');
+          return;
+        }
+      }
+    })();
+  }, []);
+
+  const resumeRouteDecisionRefreshTask = useCallback(async () => {
+    const tasksFetcher = (api as { getTasks?: (limit?: number) => Promise<unknown> }).getTasks;
+    if (typeof tasksFetcher !== 'function') {
+      setLoadingDecision(false);
+      return;
+    }
+
+    try {
+      const tasksResponse = await tasksFetcher(50) as {
+        tasks?: Array<{ id?: string; type?: string; status?: string }>;
+      };
+      const runningTask = Array.isArray(tasksResponse?.tasks)
+        ? tasksResponse.tasks.find((task) => (
+          String(task?.type || '').trim() === ROUTE_DECISION_REFRESH_TASK_TYPE
+          && (task?.status === 'pending' || task?.status === 'running')
+        ))
+        : null;
+      const taskId = String(runningTask?.id || '').trim();
+      if (!taskId) {
+        setLoadingDecision(false);
+        return;
+      }
+      monitorRouteDecisionRefreshTask(taskId);
+    } catch {
+      setLoadingDecision(false);
+    }
+  }, [monitorRouteDecisionRefreshTask]);
+
   useEffect(() => {
+    mountedRef.current = true;
     (async () => {
       try {
+        await resumeRouteDecisionRefreshTask();
         await load();
       } catch {
         toast.error('加载路由配置失败');
@@ -291,7 +316,11 @@ export default function TokenRoutes() {
       const scheduleIdle = typeof requestIdleCallback === 'function' ? requestIdleCallback : (cb: () => void) => setTimeout(cb, 0);
       scheduleIdle(() => loadCandidates());
     })();
-  }, []);
+    return () => {
+      mountedRef.current = false;
+      decisionRefreshWatchSeqRef.current += 1;
+    };
+  }, [resumeRouteDecisionRefreshTask, toast]);
 
   const handleRebuild = async () => {
     try {
@@ -317,10 +346,19 @@ export default function TokenRoutes() {
 
   const handleRefreshRouteDecisions = async () => {
     try {
-      await loadRouteDecisions(routeSummaries, { force: true, refreshPricingCatalog: true, persistSnapshots: true });
-      toast.success('路由选择概率已刷新');
-    } catch {
-      toast.error('刷新路由选择概率失败');
+      const response = await api.refreshRouteDecisionSnapshots() as {
+        message?: string;
+        jobId?: string;
+      };
+      const taskId = String(response?.jobId || '').trim();
+      if (!taskId) {
+        throw new Error('刷新任务未返回 taskId');
+      }
+
+      toast.info(response?.message || '已开始后台刷新路由选中概率，可稍后返回查看');
+      monitorRouteDecisionRefreshTask(taskId);
+    } catch (error: any) {
+      toast.error(error?.message || '刷新路由选择概率失败');
     }
   };
 
@@ -1003,7 +1041,18 @@ export default function TokenRoutes() {
     if (!route) return;
 
     const channels = channelsByRouteId[routeId] || [];
-    const reordered = applyPriorityBucketDrag(channels, active.id, over.id);
+    const activeChannel = channels.find((channel) => channel.id === Number(active.id));
+    if (!activeChannel) return;
+
+    const overIsNewLayer = isPriorityRailNewLayerId(over.id);
+    const targetChannel = overIsNewLayer
+      ? null
+      : channels.find((channel) => channel.id === Number(over.id));
+
+    if (!overIsNewLayer && !targetChannel) return;
+    if (!overIsNewLayer && (targetChannel?.priority ?? 0) === (activeChannel.priority ?? 0)) return;
+
+    const reordered = applyPriorityRailDrop(channels, Number(active.id), over.id);
     const changedChannels = reordered.filter((channel) => {
       const previous = channels.find((item) => item.id === channel.id);
       return (previous?.priority ?? 0) !== channel.priority;
@@ -1055,74 +1104,6 @@ export default function TokenRoutes() {
           }));
         } catch {
           // ignore route decision refresh failures after reorder
-        }
-      }
-    } catch (e: any) {
-      setChannels(routeId, previousChannels);
-      toast.error(e.message || '保存通道优先级失败，已回滚');
-    } finally {
-      setSavingPriorityByRoute((prev) => ({ ...prev, [routeId]: false }));
-    }
-  };
-
-  const handleSplitPriorityBucket = async (routeId: number, channelId: number) => {
-    if (savingPriorityByRoute[routeId]) return;
-
-    const route = routeSummaries.find((item) => item.id === routeId);
-    if (!route) return;
-
-    const channels = channelsByRouteId[routeId] || [];
-    const reordered = splitPriorityBucketAfterChannel(channels, channelId);
-    const changedChannels = reordered.filter((channel) => {
-      const previous = channels.find((item) => item.id === channel.id);
-      return (previous?.priority ?? 0) !== channel.priority;
-    });
-
-    if (changedChannels.length === 0) return;
-
-    if (isExplicitGroupRoute(route)) {
-      const changedSourceRouteIds = Array.from(new Set(
-        changedChannels
-          .map((channel) => channel.routeId)
-          .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0),
-      ));
-      if (changedSourceRouteIds.length > 0) {
-        const affectedGroups = routeSummaries.filter((candidate) => (
-          candidate.id !== route.id
-          && isExplicitGroupRoute(candidate)
-          && (candidate.sourceRouteIds || []).some((sourceRouteId) => changedSourceRouteIds.includes(sourceRouteId))
-        ));
-        if (affectedGroups.length > 0) {
-          const affectedNames = affectedGroups.map((candidate) => resolveRouteTitle(candidate));
-          const confirmFn = typeof globalThis.confirm === 'function' ? globalThis.confirm : null;
-          const confirmed = !confirmFn
-            || confirmFn(`当前群组的优先级桶会直接回写来源通道，并同步影响：${affectedNames.join('、')}。是否继续？`);
-          if (!confirmed) return;
-        }
-      }
-    }
-
-    const previousChannels = channels.map((channel) => ({ ...channel }));
-    setChannels(routeId, reordered);
-    setSavingPriorityByRoute((prev) => ({ ...prev, [routeId]: true }));
-
-    try {
-      await api.batchUpdateChannels(
-        reordered.map((channel) => ({
-          id: channel.id,
-          priority: channel.priority,
-        })),
-      );
-
-      if (route && isRouteExactModel(route)) {
-        try {
-          const res = await api.getRouteDecision(route.modelPattern);
-          setDecisionByRoute((prev) => ({
-            ...prev,
-            [routeId]: (res?.decision || null) as RouteDecision | null,
-          }));
-        } catch {
-          // ignore route decision refresh failures after split
         }
       }
     } catch (e: any) {
@@ -1185,6 +1166,41 @@ export default function TokenRoutes() {
       await load();
     } catch (e: any) {
       toast.error(e.message || '站点屏蔽模型失败');
+    }
+  };
+
+  const handleClearRouteCooldown = async (routeId: number) => {
+    if (clearingCooldownByRoute[routeId]) return;
+    setClearingCooldownByRoute((prev) => ({ ...prev, [routeId]: true }));
+    try {
+      await api.clearRouteCooldown(routeId);
+      toast.success('路由冷却已清除');
+
+      try {
+        await loadChannels(routeId, true);
+        const route = routeSummaries.find((item) => item.id === routeId);
+        if (route) {
+          if (isRouteExactModel(route)) {
+            const res = await api.getRouteDecision(route.modelPattern);
+            setDecisionByRoute((prev) => ({
+              ...prev,
+              [routeId]: (res?.decision || null) as RouteDecision | null,
+            }));
+          } else {
+            const res = await api.getRouteWideDecisionsBatch([routeId]);
+            setDecisionByRoute((prev) => ({
+              ...prev,
+              [routeId]: (res?.decisions?.[String(routeId)] || null) as RouteDecision | null,
+            }));
+          }
+        }
+      } catch {
+        toast.error('已清除，但刷新失败');
+      }
+    } catch (e: any) {
+      toast.error(e.message || '清除路由冷却失败');
+    } finally {
+      setClearingCooldownByRoute((prev) => ({ ...prev, [routeId]: false }));
     }
   };
 
@@ -1346,6 +1362,12 @@ export default function TokenRoutes() {
   handleSiteBlockModelRef.current = handleSiteBlockModel;
   const stableSiteBlockModel = useCallback(
     (channelId: number, routeId: number) => handleSiteBlockModelRef.current(channelId, routeId),
+    [],
+  );
+  const handleClearRouteCooldownRef = useRef(handleClearRouteCooldown);
+  handleClearRouteCooldownRef.current = handleClearRouteCooldown;
+  const stableClearRouteCooldown = useCallback(
+    (routeId: number) => handleClearRouteCooldownRef.current(routeId),
     [],
   );
 
@@ -1544,8 +1566,13 @@ export default function TokenRoutes() {
       />
 
       {/* Info tip */}
-      <div className="info-tip" style={{ marginBottom: 12 }}>
-        {tr('系统会根据模型可用性自动生成路由。优先级按 P0/P1 等桶管理，同一桶内可有多个通道；拖动通道或灰色分隔线即可调整。精确模型路由会自动过滤只支持该模型的账号和令牌。群组路由中的优先级调整会直接回写来源通道。选中概率表示请求到达时该通道被选中的概率。成本来源优先级为：实测成本 → 账号配置成本 → 目录参考价 → 默认回退单价。')}
+      <div className="info-tip" style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div>{tr('系统会根据模型可用性自动生成路由。优先级按 P0/P1 等桶管理，同一桶内可有多个通道；拖动通道或灰色分隔线即可调整。精确模型路由会自动过滤只支持该模型的账号和令牌。群组路由中的优先级调整会直接回写来源通道。选中概率表示请求到达时该通道被选中的概率。成本来源优先级为：实测成本 → 账号配置成本 → 目录参考价 → 默认回退单价。')}</div>
+        <div>{`${getRouteRoutingStrategyLabel('weighted')}：${getRouteRoutingStrategyDescription('weighted')}`}</div>
+        <div>{`${getRouteRoutingStrategyLabel('round_robin')}：${getRouteRoutingStrategyDescription('round_robin')}`}</div>
+        <div>{`${getRouteRoutingStrategyLabel('stable_first')}：${getRouteRoutingStrategyDescription('stable_first')}`}</div>
+        <div>{tr('选中概率用于解释当前策略下这一次请求更可能落到哪里；轮询和稳定优先更适合把它当作顺序参考。')}</div>
+        <div>{tr('成本来源优先级：实测成本 → 账号配置成本 → 目录参考价 → 默认回退单价。')}</div>
       </div>
 
       {/* Manual route panel */}
@@ -1701,6 +1728,8 @@ export default function TokenRoutes() {
                     onEdit={stableEditRoute}
                     onDelete={stableDeleteRoute}
                     onToggleEnabled={stableToggleEnabled}
+                    onClearCooldown={stableClearRouteCooldown}
+                    clearingCooldown={!!clearingCooldownByRoute[route.id]}
                     onRoutingStrategyChange={stableRoutingStrategyChange}
                     updatingRoutingStrategy={!!updatingRoutingStrategyByRoute[route.id]}
                     channels={channelsByRouteId[route.id]}
@@ -1716,7 +1745,6 @@ export default function TokenRoutes() {
                     onDeleteChannel={stableDeleteChannel}
                     onToggleChannelEnabled={stableToggleChannelEnabled}
                     onChannelDragEnd={stableChannelDragEnd}
-                    onSplitPriorityBucket={handleSplitPriorityBucket}
                     missingTokenSiteItems={getMissingTokenSiteItems(route.id)}
                     missingTokenGroupItems={getMissingTokenGroupItems(route.id)}
                     onCreateTokenForMissing={stableCreateTokenForMissing}
@@ -1740,6 +1768,8 @@ export default function TokenRoutes() {
               onEdit={stableEditRoute}
               onDelete={stableDeleteRoute}
               onToggleEnabled={stableToggleEnabled}
+              onClearCooldown={stableClearRouteCooldown}
+              clearingCooldown={!!clearingCooldownByRoute[route.id]}
               onRoutingStrategyChange={stableRoutingStrategyChange}
               updatingRoutingStrategy={!!updatingRoutingStrategyByRoute[route.id]}
               channels={channelsByRouteId[route.id]}
@@ -1755,7 +1785,6 @@ export default function TokenRoutes() {
               onDeleteChannel={stableDeleteChannel}
               onToggleChannelEnabled={stableToggleChannelEnabled}
               onChannelDragEnd={stableChannelDragEnd}
-              onSplitPriorityBucket={handleSplitPriorityBucket}
               missingTokenSiteItems={getMissingTokenSiteItems(route.id)}
               missingTokenGroupItems={getMissingTokenGroupItems(route.id)}
               onCreateTokenForMissing={stableCreateTokenForMissing}

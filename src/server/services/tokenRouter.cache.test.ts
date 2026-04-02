@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 
 type DbModule = typeof import('../db/index.js');
 type TokenRouterModule = typeof import('./tokenRouter.js');
@@ -13,10 +13,12 @@ describe('TokenRouter runtime cache', () => {
   let schema: DbModule['schema'];
   let TokenRouter: TokenRouterModule['TokenRouter'];
   let invalidateTokenRouterCache: TokenRouterModule['invalidateTokenRouterCache'];
+  let isChannelRecentlyFailed: TokenRouterModule['isChannelRecentlyFailed'];
   let resetSiteRuntimeHealthState: TokenRouterModule['resetSiteRuntimeHealthState'];
   let config: ConfigModule['config'];
   let dataDir = '';
   let originalCacheTtlMs = 0;
+  let originalFailureCooldownMaxSec = 0;
 
   beforeAll(async () => {
     dataDir = mkdtempSync(join(tmpdir(), 'metapi-token-router-cache-'));
@@ -30,9 +32,11 @@ describe('TokenRouter runtime cache', () => {
     schema = dbModule.schema;
     TokenRouter = tokenRouterModule.TokenRouter;
     invalidateTokenRouterCache = tokenRouterModule.invalidateTokenRouterCache;
+    isChannelRecentlyFailed = tokenRouterModule.isChannelRecentlyFailed;
     resetSiteRuntimeHealthState = tokenRouterModule.resetSiteRuntimeHealthState;
     config = configModule.config;
     originalCacheTtlMs = config.tokenRouterCacheTtlMs;
+    originalFailureCooldownMaxSec = config.tokenRouterFailureCooldownMaxSec;
   });
 
   beforeEach(async () => {
@@ -43,12 +47,14 @@ describe('TokenRouter runtime cache', () => {
     await db.delete(schema.accounts).run();
     await db.delete(schema.sites).run();
     config.tokenRouterCacheTtlMs = 60_000;
+    config.tokenRouterFailureCooldownMaxSec = originalFailureCooldownMaxSec;
     invalidateTokenRouterCache();
     resetSiteRuntimeHealthState();
   });
 
   afterAll(() => {
     config.tokenRouterCacheTtlMs = originalCacheTtlMs;
+    config.tokenRouterFailureCooldownMaxSec = originalFailureCooldownMaxSec;
     invalidateTokenRouterCache();
     resetSiteRuntimeHealthState();
     delete process.env.DATA_DIR;
@@ -173,6 +179,73 @@ describe('TokenRouter runtime cache', () => {
     const thirdCooldownMs = Date.parse(String(thirdRecord?.cooldownUntil || '')) - thirdStartedAt;
     expect(thirdCooldownMs).toBeGreaterThanOrEqual(25_000);
     expect(thirdCooldownMs).toBeLessThanOrEqual(35_000);
+  });
+
+  it('caps generic failure cooldowns at the configured maximum', async () => {
+    config.tokenRouterFailureCooldownMaxSec = 20;
+
+    const site = await db.insert(schema.sites).values({
+      name: 'capped-cooldown-site',
+      url: 'https://capped-cooldown.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'capped-cooldown-user',
+      accessToken: 'capped-cooldown-access-token',
+      apiToken: 'capped-cooldown-api-token',
+      status: 'active',
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'capped-cooldown-token',
+      token: 'sk-capped-cooldown-token',
+      enabled: true,
+      isDefault: true,
+    }).returning().get();
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: token.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+
+    await router.recordFailure(channel.id);
+    await router.recordFailure(channel.id);
+
+    const startedAt = Date.now();
+    await router.recordFailure(channel.id);
+
+    const record = await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, channel.id))
+      .get();
+    const cooldownMs = Date.parse(String(record?.cooldownUntil || '')) - startedAt;
+
+    expect(cooldownMs).toBeGreaterThanOrEqual(17_000);
+    expect(cooldownMs).toBeLessThanOrEqual(23_000);
+    const recentFailureCheckAt = Date.now();
+    expect(isChannelRecentlyFailed({
+      failCount: 3,
+      lastFailAt: new Date(recentFailureCheckAt - 19_000).toISOString(),
+    }, recentFailureCheckAt)).toBe(true);
+    expect(isChannelRecentlyFailed({
+      failCount: 3,
+      lastFailAt: new Date(recentFailureCheckAt - 21_000).toISOString(),
+    }, recentFailureCheckAt)).toBe(false);
   });
 
   it('uses codex oauth reset hints for usage-limit cooldowns', async () => {
@@ -540,6 +613,90 @@ describe('TokenRouter runtime cache', () => {
     expect(cooledSibling?.cooldownUntil).toBeTruthy();
     expect(cooledSibling?.failCount).toBe(0);
     expect(await router.selectChannel('gpt-4o-mini')).toBeNull();
+  });
+
+  it('clears short-window cooldown on sibling channels after a successful recovery probe', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'shared-credential-recovery-site',
+      url: 'https://shared-credential-recovery.example.com',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'shared-credential-recovery-user',
+      accessToken: 'shared-credential-recovery-access-token',
+      status: 'active',
+      oauthProvider: 'codex',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'codex',
+        },
+      }),
+    }).returning().get();
+
+    const primaryRoute = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.4',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+
+    const siblingRoute = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+
+    const primaryChannel = await db.insert(schema.routeChannels).values({
+      routeId: primaryRoute.id,
+      accountId: account.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const siblingChannel = await db.insert(schema.routeChannels).values({
+      routeId: siblingRoute.id,
+      accountId: account.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    await router.recordFailure(primaryChannel.id, {
+      status: 429,
+      errorText: JSON.stringify({
+        error: {
+          type: 'usage_limit_reached',
+          message: 'The usage limit has been reached',
+        },
+      }),
+      modelName: 'gpt-5.4',
+    });
+
+    await router.recordProbeSuccess(primaryChannel.id, 180, 'gpt-5.4');
+
+    const refreshedChannels = await db.select().from(schema.routeChannels)
+      .where(inArray(schema.routeChannels.id, [primaryChannel.id, siblingChannel.id]))
+      .all();
+
+    expect(refreshedChannels).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: primaryChannel.id,
+        cooldownUntil: null,
+        consecutiveFailCount: 0,
+        cooldownLevel: 0,
+      }),
+      expect.objectContaining({
+        id: siblingChannel.id,
+        cooldownUntil: null,
+        consecutiveFailCount: 0,
+        cooldownLevel: 0,
+      }),
+    ]));
   });
 
   it('round robins across all available channels regardless of priority', async () => {

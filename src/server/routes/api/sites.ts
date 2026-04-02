@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyReply } from 'fastify';
 import { db, schema } from '../../db/index.js';
-import { and, eq } from 'drizzle-orm';
+import { getInsertedRowId } from '../../db/insertHelpers.js';
+import { and, asc, eq, inArray } from 'drizzle-orm';
 import { detectSite } from '../../services/siteDetector.js';
 import { invalidateSiteProxyCache, normalizeSiteUrl, parseSiteProxyUrlInput } from '../../services/siteProxy.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
@@ -15,6 +16,7 @@ import {
   parseSiteUpdatePayload,
 } from '../../contracts/siteRoutePayloads.js';
 import { getSiteInitializationPreset } from '../../../shared/siteInitializationPresets.js';
+import { normalizeSiteApiEndpointBaseUrl } from '../../services/siteApiEndpointService.js';
 
 function normalizeSiteStatus(input: unknown): 'active' | 'disabled' | null {
   if (input === undefined || input === null) return null;
@@ -90,10 +92,175 @@ type ErrorLike = {
   cause?: unknown;
 };
 
-function normalizeOptionalPlatform(value: string | undefined): string | null {
+function normalizeCanonicalSiteUrl(value: string): string {
+  const trimmed = value.trim();
+  const withScheme = trimmed.includes('://') ? trimmed : `https://${trimmed}`;
+  return normalizeSiteUrl(withScheme);
+}
+
+function normalizeSitePlatform(value: string | undefined): string | null {
   if (value === undefined) return null;
-  const normalized = value.trim();
+  const normalized = value.trim().toLowerCase();
   return normalized || null;
+}
+
+type SiteApiEndpointInputRow = {
+  url: string;
+  enabled: boolean;
+  sortOrder: number;
+};
+
+function normalizeSiteApiEndpointBoolean(input: unknown): boolean | null {
+  return normalizePinnedFlag(input);
+}
+
+function normalizeSiteApiEndpointsInput(input: unknown): {
+  valid: boolean;
+  present: boolean;
+  apiEndpoints: SiteApiEndpointInputRow[];
+  error?: string;
+} {
+  if (input === undefined) {
+    return { valid: true, present: false, apiEndpoints: [] };
+  }
+  if (input === null) {
+    return { valid: true, present: true, apiEndpoints: [] };
+  }
+  if (!Array.isArray(input)) {
+    return {
+      valid: false,
+      present: true,
+      apiEndpoints: [],
+      error: 'Invalid apiEndpoints. Expected an array.',
+    };
+  }
+
+  const seenUrls = new Set<string>();
+  const apiEndpoints: SiteApiEndpointInputRow[] = [];
+
+  for (let index = 0; index < input.length; index += 1) {
+    const row = input[index];
+    if (!row || typeof row !== 'object') {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: 'Invalid apiEndpoints item. Expected an object.',
+      };
+    }
+
+    const rawUrl = typeof (row as { url?: unknown }).url === 'string'
+      ? (row as { url: string }).url
+      : '';
+    const normalizedUrl = normalizeSiteApiEndpointBaseUrl(rawUrl);
+    if (!normalizedUrl) {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: 'Invalid apiEndpoints url. Expected a valid http(s) URL.',
+      };
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(normalizedUrl);
+    } catch {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: 'Invalid apiEndpoints url. Expected a valid http(s) URL.',
+      };
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: 'Invalid apiEndpoints url. Expected a valid http(s) URL.',
+      };
+    }
+
+    if (seenUrls.has(normalizedUrl)) {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: `Duplicate apiEndpoints url: ${normalizedUrl}`,
+      };
+    }
+    seenUrls.add(normalizedUrl);
+
+    const normalizedEnabled = normalizeSiteApiEndpointBoolean((row as { enabled?: unknown }).enabled);
+    if ((row as { enabled?: unknown }).enabled !== undefined && normalizedEnabled === null) {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: 'Invalid apiEndpoints enabled value. Expected boolean.',
+      };
+    }
+
+    const normalizedSortOrder = normalizeSortOrder((row as { sortOrder?: unknown }).sortOrder);
+    if ((row as { sortOrder?: unknown }).sortOrder !== undefined && normalizedSortOrder === null) {
+      return {
+        valid: false,
+        present: true,
+        apiEndpoints: [],
+        error: 'Invalid apiEndpoints sortOrder value. Expected non-negative integer.',
+      };
+    }
+
+    apiEndpoints.push({
+      url: normalizedUrl,
+      enabled: normalizedEnabled ?? true,
+      sortOrder: normalizedSortOrder ?? index,
+    });
+  }
+
+  return { valid: true, present: true, apiEndpoints };
+}
+
+async function loadSiteApiEndpointsBySiteIds(siteIds: number[]) {
+  if (siteIds.length === 0) {
+    return new Map<number, Array<typeof schema.siteApiEndpoints.$inferSelect>>();
+  }
+
+  const rows = await db.select().from(schema.siteApiEndpoints)
+    .where(inArray(schema.siteApiEndpoints.siteId, siteIds))
+    .orderBy(
+      asc(schema.siteApiEndpoints.siteId),
+      asc(schema.siteApiEndpoints.sortOrder),
+      asc(schema.siteApiEndpoints.id),
+    )
+    .all();
+
+  const bySiteId = new Map<number, Array<typeof schema.siteApiEndpoints.$inferSelect>>();
+  for (const row of rows) {
+    const current = bySiteId.get(row.siteId) || [];
+    current.push({
+      ...row,
+      url: normalizeSiteApiEndpointBaseUrl(row.url),
+    });
+    bySiteId.set(row.siteId, current);
+  }
+  return bySiteId;
+}
+
+async function attachSiteApiEndpoints<T extends { id: number }>(siteRows: T[]) {
+  const bySiteId = await loadSiteApiEndpointsBySiteIds(siteRows.map((row) => row.id));
+  return siteRows.map((row) => ({
+    ...row,
+    apiEndpoints: bySiteId.get(row.id) || [],
+  }));
+}
+
+async function loadSiteWithApiEndpoints(siteId: number) {
+  const site = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
+  if (!site) return null;
+  const [hydrated] = await attachSiteApiEndpoints([site]);
+  return hydrated || null;
 }
 
 function getErrorChain(error: unknown): ErrorLike[] {
@@ -265,6 +432,7 @@ export async function sitesRoutes(app: FastifyInstance) {
   // List all sites
   app.get('/api/sites', async () => {
     const siteRows = await db.select().from(schema.sites).all();
+    const siteRowsWithApiEndpoints = await attachSiteApiEndpoints(siteRows);
     const accountRows = await db.select({
       siteId: schema.accounts.siteId,
       balance: schema.accounts.balance,
@@ -278,7 +446,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       subscriptionBySiteId[row.siteId] = aggregateSiteSubscription(subscriptionBySiteId[row.siteId], row.extraConfig);
     }
 
-    return siteRows.map((site) => ({
+    return siteRowsWithApiEndpoints.map((site) => ({
       ...site,
       totalBalance: Math.round((totalBalanceBySiteId[site.id] || 0) * 1_000_000) / 1_000_000,
       subscriptionSummary: subscriptionBySiteId[site.id] || null,
@@ -291,7 +459,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (!parsedBody.success) {
       return reply.code(400).send({ error: parsedBody.error });
     }
-
+    const createBody = parsedBody.data as typeof parsedBody.data & { apiEndpoints?: unknown };
     const {
       name,
       url,
@@ -305,7 +473,8 @@ export async function sitesRoutes(app: FastifyInstance) {
       isPinned,
       sortOrder,
       globalWeight,
-    } = parsedBody.data;
+      apiEndpoints,
+    } = createBody;
     const normalizedStatus = normalizeSiteStatus(status);
     if (status !== undefined && !normalizedStatus) {
       return reply.code(400).send({ error: 'Invalid site status. Expected active or disabled.' });
@@ -344,18 +513,22 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (initializationPresetId != null && initializationPresetId !== '' && !explicitInitializationPreset) {
       return reply.code(400).send({ error: 'Invalid initializationPresetId.' });
     }
+    const normalizedApiEndpoints = normalizeSiteApiEndpointsInput(apiEndpoints);
+    if (!normalizedApiEndpoints.valid) {
+      return reply.code(400).send({ error: normalizedApiEndpoints.error || 'Invalid apiEndpoints.' });
+    }
 
     const existingSites = await db.select().from(schema.sites).all();
     const maxSortOrder = existingSites.reduce((max, site) => Math.max(max, site.sortOrder || 0), -1);
-    const normalizedUrl = normalizeSiteUrl(url);
-
-    let detectedPlatform = normalizeOptionalPlatform(platform);
+    const canonicalUrl = normalizeCanonicalSiteUrl(url);
+    const canonicalPlatform = normalizeSitePlatform(platform);
+    let detectedPlatform = canonicalPlatform;
     let responseInitializationPresetId: string | null = explicitInitializationPreset?.id || null;
     if (!detectedPlatform) {
       if (explicitInitializationPreset) {
         detectedPlatform = explicitInitializationPreset.platform;
       } else {
-        const detected = await detectSite(url);
+        const detected = await detectSite(canonicalUrl);
         detectedPlatform = detected?.platform ?? null;
         responseInitializationPresetId = detected?.initializationPresetId || null;
       }
@@ -366,37 +539,51 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (!detectedPlatform) {
       return { error: 'Could not detect platform. Please specify manually.' };
     }
-    const conflictingSite = findExistingSiteBinding(existingSites, detectedPlatform, normalizedUrl);
+    const conflictingSite = findExistingSiteBinding(existingSites, detectedPlatform, canonicalUrl);
     if (conflictingSite) {
-      return sendSiteBindingConflict(reply, detectedPlatform, normalizedUrl);
+      return sendSiteBindingConflict(reply, detectedPlatform, canonicalUrl);
     }
 
     let inserted;
     try {
-      inserted = await db.insert(schema.sites).values({
-        name,
-        url: normalizedUrl,
-        platform: detectedPlatform,
-        proxyUrl: normalizedProxyUrl.proxyUrl,
-        useSystemProxy: normalizedUseSystemProxy ?? false,
-        customHeaders: normalizedCustomHeaders.customHeaders,
-        externalCheckinUrl: normalizedExternalCheckinUrl.url,
-        status: normalizedStatus ?? 'active',
-        isPinned: normalizedPinned ?? false,
-        sortOrder: normalizedSortOrder ?? (maxSortOrder + 1),
-        globalWeight: normalizedGlobalWeight ?? 1,
-      }).run();
+      inserted = await db.transaction(async (tx) => {
+        const siteInsert = await tx.insert(schema.sites).values({
+          name,
+          url: canonicalUrl,
+          platform: detectedPlatform,
+          proxyUrl: normalizedProxyUrl.proxyUrl,
+          useSystemProxy: normalizedUseSystemProxy ?? false,
+          customHeaders: normalizedCustomHeaders.customHeaders,
+          externalCheckinUrl: normalizedExternalCheckinUrl.url,
+          status: normalizedStatus ?? 'active',
+          isPinned: normalizedPinned ?? false,
+          sortOrder: normalizedSortOrder ?? (maxSortOrder + 1),
+          globalWeight: normalizedGlobalWeight ?? 1,
+        }).run();
+        const siteId = getInsertedRowId(siteInsert);
+        if (siteId && normalizedApiEndpoints.present && normalizedApiEndpoints.apiEndpoints.length > 0) {
+          await tx.insert(schema.siteApiEndpoints).values(
+            normalizedApiEndpoints.apiEndpoints.map((row) => ({
+              siteId,
+              url: row.url,
+              enabled: row.enabled,
+              sortOrder: row.sortOrder,
+            })),
+          ).run();
+        }
+        return siteInsert;
+      });
     } catch (error) {
       if (isSitesPlatformUrlConflict(error)) {
-        return sendSiteBindingConflict(reply, detectedPlatform, normalizedUrl);
+        return sendSiteBindingConflict(reply, detectedPlatform, canonicalUrl);
       }
       throw error;
     }
-    const siteId = Number(inserted.lastInsertRowid || 0);
-    if (siteId <= 0) {
+    const siteId = getInsertedRowId(inserted);
+    if (!siteId) {
       return reply.code(500).send({ error: 'Create site failed' });
     }
-    const result = await db.select().from(schema.sites).where(eq(schema.sites.id, siteId)).get();
+    const result = await loadSiteWithApiEndpoints(siteId);
     if (!result) {
       return reply.code(500).send({ error: 'Create site failed' });
     }
@@ -425,7 +612,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     }
 
     const updates: any = {};
-    const body = parsedBody.data;
+    const body = parsedBody.data as typeof parsedBody.data & { apiEndpoints?: unknown };
     const normalizedStatus = normalizeSiteStatus(body.status);
     if (body.status !== undefined && !normalizedStatus) {
       return reply.code(400).send({ error: 'Invalid site status. Expected active or disabled.' });
@@ -458,10 +645,15 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (!normalizedCustomHeaders.valid) {
       return reply.code(400).send({ error: normalizedCustomHeaders.error || 'Invalid customHeaders.' });
     }
+    const normalizedApiEndpoints = normalizeSiteApiEndpointsInput(body.apiEndpoints);
+    if (!normalizedApiEndpoints.valid) {
+      return reply.code(400).send({ error: normalizedApiEndpoints.error || 'Invalid apiEndpoints.' });
+    }
 
-    const nextUrl = body.url !== undefined ? normalizeSiteUrl(body.url) : existingSite.url;
+    const canonicalPlatform = normalizeSitePlatform(body.platform);
+    const nextUrl = body.url !== undefined ? normalizeCanonicalSiteUrl(body.url) : existingSite.url;
     const nextPlatform = body.platform !== undefined
-      ? normalizeOptionalPlatform(body.platform)
+      ? canonicalPlatform
       : existingSite.platform;
     if (body.platform !== undefined && !nextPlatform) {
       return reply.code(400).send({ error: 'Invalid platform. Expected non-empty string.' });
@@ -492,7 +684,24 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (body.globalWeight !== undefined) updates.globalWeight = normalizedGlobalWeight;
     updates.updatedAt = new Date().toISOString();
     try {
-      await db.update(schema.sites).set(updates).where(eq(schema.sites.id, id)).run();
+      await db.transaction(async (tx) => {
+        await tx.update(schema.sites).set(updates).where(eq(schema.sites.id, id)).run();
+        if (normalizedApiEndpoints.present) {
+          await tx.delete(schema.siteApiEndpoints)
+            .where(eq(schema.siteApiEndpoints.siteId, id))
+            .run();
+          if (normalizedApiEndpoints.apiEndpoints.length > 0) {
+            await tx.insert(schema.siteApiEndpoints).values(
+              normalizedApiEndpoints.apiEndpoints.map((row) => ({
+                siteId: id,
+                url: row.url,
+                enabled: row.enabled,
+                sortOrder: row.sortOrder,
+              })),
+            ).run();
+          }
+        }
+      });
     } catch (error) {
       if (isSitesPlatformUrlConflict(error)) {
         return sendSiteBindingConflict(reply, nextPlatform, nextUrl);
@@ -506,7 +715,7 @@ export async function sitesRoutes(app: FastifyInstance) {
 
     invalidateSiteCaches();
 
-    return await db.select().from(schema.sites).where(eq(schema.sites.id, id)).get();
+    return await loadSiteWithApiEndpoints(id);
   });
 
   // Delete a site

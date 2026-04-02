@@ -33,6 +33,13 @@ async function flushMicrotasks() {
   });
 }
 
+function findPrimarySiteUrlInput(root: ReactTestRenderer) {
+  return root.root.find((node) => (
+    node.type === 'input'
+    && node.props['data-testid'] === 'site-primary-url-input'
+  ));
+}
+
 function LocationProbe() {
   const location = useLocation();
   return <div>{`${location.pathname}${location.search}`}</div>;
@@ -78,7 +85,7 @@ async function createSiteAndClickModalChoice(
     const nameInput = root.root.find((node) => node.type === 'input' && node.props.placeholder === '站点名称');
     const urlInput = root.root.find((node) => (
       node.type === 'input'
-      && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
+      && node.props['data-testid'] === 'site-primary-url-input'
     ));
     const selects = root.root.findAllByType(ModernSelect);
     const platformSelect = selects.at(-1);
@@ -219,6 +226,15 @@ describe('Sites create redirect', () => {
           expect.objectContaining({ label: '阿里云 CodingPlan / Claude' }),
           expect.objectContaining({ label: '智谱 Coding Plan / OpenAI' }),
           expect.objectContaining({ label: '智谱 Coding Plan / Claude' }),
+          expect.objectContaining({ label: 'DeepSeek / OpenAI' }),
+          expect.objectContaining({ label: 'DeepSeek / Claude' }),
+          expect.objectContaining({ label: 'Moonshot(Kimi) / OpenAI' }),
+          expect.objectContaining({ label: 'Moonshot(Kimi) / Claude' }),
+          expect.objectContaining({ label: 'MiniMax / OpenAI' }),
+          expect.objectContaining({ label: 'MiniMax / Claude' }),
+          expect.objectContaining({ label: 'ModelScope / OpenAI' }),
+          expect.objectContaining({ label: 'ModelScope / Claude' }),
+          expect.objectContaining({ label: '豆包 Coding Plan / OpenAI' }),
         ]),
       );
     } finally {
@@ -298,10 +314,7 @@ describe('Sites create redirect', () => {
       });
       await flushMicrotasks();
 
-      const urlInput = root.root.find((node) => (
-        node.type === 'input'
-        && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
-      ));
+      const urlInput = findPrimarySiteUrlInput(root);
       const selects = root.root.findAllByType(ModernSelect);
       const platformSelect = selects.at(-1);
 
@@ -354,10 +367,7 @@ describe('Sites create redirect', () => {
       });
       await flushMicrotasks();
 
-      const urlInput = root.root.find((node) => (
-        node.type === 'input'
-        && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
-      ));
+      const urlInput = findPrimarySiteUrlInput(root);
       const platformSelect = root.root.findAllByType(ModernSelect).at(-1);
 
       await act(async () => {
@@ -410,10 +420,7 @@ describe('Sites create redirect', () => {
       });
       await flushMicrotasks();
 
-      const urlInput = root.root.find((node) => (
-        node.type === 'input'
-        && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
-      ));
+      const urlInput = findPrimarySiteUrlInput(root);
 
       await act(async () => {
         urlInput.props.onChange({ target: { value: 'https://coding.dashscope.aliyuncs.com/v1' } });
@@ -522,10 +529,7 @@ describe('Sites create redirect', () => {
 
     // Fill form
     const nameInput = root.root.find((node) => node.type === 'input' && node.props.placeholder === '站点名称');
-    const urlInput = root.root.find((node) => (
-      node.type === 'input'
-      && node.props.placeholder === '站点 URL (例如 https://api.example.com)'
-    ));
+    const urlInput = findPrimarySiteUrlInput(root);
     const selects = root.root.findAllByType(ModernSelect);
     const platformSelect = selects.at(-1);
     const saveButton = root.root.find((node) => (
@@ -553,5 +557,55 @@ describe('Sites create redirect', () => {
     expect(rendered).toContain('稍后配置');
 
     root.unmount();
+  });
+
+  it('re-selects the matching vendor preset when editing an existing vendor-specific site', async () => {
+    apiMock.getSites.mockResolvedValue([
+      {
+        id: 36,
+        name: 'DeepSeek Official',
+        url: 'https://api.deepseek.com/v1',
+        platform: 'openai',
+        status: 'active',
+      },
+    ]);
+
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/sites']}>
+              <Routes>
+                <Route path="/sites" element={<Sites />} />
+              </Routes>
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const editButton = root.root.find((node) => (
+        node.type === 'button'
+        && typeof node.props.onClick === 'function'
+        && collectText(node).includes('编辑')
+      ));
+
+      await act(async () => {
+        editButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      const platformSelect = root.root.findAllByType(ModernSelect).at(-1);
+      const presetAlert = root.root.find((node) => (
+        typeof node.props.className === 'string'
+        && node.props.className.includes('alert alert-info')
+      ));
+      expect(platformSelect?.props.value).toBe('preset:deepseek-openai');
+      expect(collectText(presetAlert)).toContain('已应用官方预设');
+      expect(collectText(presetAlert)).toContain('DeepSeek / OpenAI');
+    } finally {
+      root?.unmount();
+    }
   });
 });
